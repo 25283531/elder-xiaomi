@@ -418,13 +418,13 @@
           <button class="primary" @click="editAvatar(null)">新增形象</button>
         </div>
         <table v-if="avatars.length">
-          <thead><tr><th>名称</th><th>EAF 资源包</th><th>屏幕</th><th>音色</th><th>操作</th></tr></thead>
+          <thead><tr><th>名称</th><th>EAF 资源包</th><th>屏幕</th><th>灯效</th><th>操作</th></tr></thead>
           <tbody>
             <tr v-for="a in avatars" :key="a.id">
               <td>{{a.name}}<div class="muted" style="font-size:12px">{{a.description}}</div></td>
               <td><code>{{a.eaf_pack_name||'—'}}</code></td>
               <td>{{a.screen_width}}×{{a.screen_height}}</td>
-              <td>{{a.tts_voice||'—'}}</td>
+              <td>{{lightSummary(a)}}</td>
               <td class="row">
                 <button @click="editAvatar(a)">编辑</button>
                 <button class="danger" @click="removeAvatar(a)">删除</button>
@@ -442,47 +442,90 @@
           <div class="grid g2">
             <div><label>名称</label><input v-model="aForm.name" style="width:100%" /></div>
             <div><label>简介</label><input v-model="aForm.description" style="width:100%" /></div>
-            <div><label>EAF 资源包名</label><input v-model="aForm.eaf_pack_name" style="width:100%" placeholder="xiaonuan" /></div>
+          </div>
+          <div style="margin-top:10px">
+            <label>EAF 资源包名</label>
+            <input v-model="aForm.eaf_pack_name" style="width:100%" placeholder="xiaonuan" />
+            <div class="hint" style="font-size:12px;line-height:1.6">
+              ⚠️ 当前固件只把资源包名打一行日志，<b>不会自动下载安装</b>；
+              资源包下载地址、SHA256、屏幕宽高目前也<b>不参与下发</b>。
+            </div>
+          </div>
+          <div class="grid g2" style="margin-top:10px">
             <div><label>资源包下载地址</label><input v-model="aForm.eaf_pack_url" style="width:100%" /></div>
+            <div><label>SHA256（资源包校验）</label><input v-model="aForm.eaf_pack_sha256" style="width:100%" /></div>
             <div><label>屏幕宽</label><input v-model.number="aForm.screen_width" type="number" /></div>
             <div><label>屏幕高</label><input v-model.number="aForm.screen_height" type="number" /></div>
           </div>
           <div style="margin-top:10px">
-            <label>系统提示词</label><textarea v-model="aForm.system_prompt"></textarea>
+            <label>音色</label>
+            <div class="muted" style="font-size:12px;line-height:1.6">
+              已移到「人格预设」里设置（音色属于人格，不属于外观）。<br>
+              这里只保留一个兜底值：角色没设音色时才用它。
+            </div>
           </div>
-          <div class="grid g2" style="margin-top:10px">
-            <div><label>TTS 音色</label>
-              <select v-model="aForm.tts_voice" style="width:100%">
-                <option value="">（不指定 · 用 TTS 配置的音色，或厂商默认）</option>
-                <optgroup :label="voiceGroupLabel">
-                  <option v-for="v in ttsVoices" :key="v.id" :value="v.id">
-                    {{v.name}} — {{v.scene}}
-                  </option>
-                </optgroup>
-                <option value="__custom__">✎ 其他（自建服务，手填音色名）</option>
-              </select>
-              <template v-if="aForm.tts_voice==='__custom__'">
-                <input v-model="aForm.tts_voice_custom" style="width:100%;margin-top:6px"
-                       :placeholder="customVoicePlaceholder" />
-                <div style="font-size:12px;color:#888;margin-top:4px">
-                  自建 TTS 服务的音色名，各家命名不统一，无法预置。
-                </div>
-              </template>
-              <div v-else-if="voiceOf(aForm.tts_voice)" class="hint"
-                   style="margin-top:6px;font-size:12px">
-                <b>{{voiceOf(aForm.tts_voice).name}}</b>（{{voiceOf(aForm.tts_voice).gender}}）<br>
-                适合：{{voiceOf(aForm.tts_voice).scene}}
+          <div style="margin-top:10px">
+            <label>动画片段映射（设备处于某状态时播资源包里的哪段动画）</label>
+            <div class="hint" style="font-size:12px;line-height:1.6;margin:4px 0 8px">
+              左边是设备状态，右边填<b>EAF 资源包里的片段名</b>。留空则用默认同名片段。<br>
+              ⚠️ 当前固件<b>尚未消费</b>本映射（表情走内置 emote.json），保存后不会改变设备表情。
+            </div>
+            <div class="grid g2">
+              <div v-for="cs in clipStates" :key="cs.key">
+                <label style="font-size:12px">{{cs.label}}</label>
+                <input v-model="aForm.clips[cs.key]" style="width:100%" :placeholder="cs.key" />
               </div>
             </div>
-            <div><label>SHA256（资源包校验）</label><input v-model="aForm.eaf_pack_sha256" style="width:100%" /></div>
           </div>
-          <div style="margin-top:10px">
-            <label>片段映射 JSON（idle / listening / mouth_open / smile / blink ...）</label>
-            <textarea v-model="clipsText" style="min-height:76px"></textarea>
-          </div>
-          <div style="margin-top:10px">
-            <label>情绪灯效 JSON（{"happy":{"rgb":"#3AD07A","effect":"breath"}}）</label>
-            <textarea v-model="lightsText" style="min-height:76px"></textarea>
+          <div style="margin-top:14px">
+            <label>情绪灯效（每个状态一行）</label>
+            <div class="hint" style="font-size:12px;line-height:1.6;margin:4px 0 8px">
+              从预置里选一种，或用「自定义」保留当前颜色。<br>
+              ⚠️ 当前固件<b>尚未消费</b>本配置（连下发都还没有），保存后不会改变设备实际灯色。
+              配置已按最终格式落库，固件支持后自动生效。
+            </div>
+            <table>
+              <thead><tr>
+                <th style="width:130px">状态</th><th style="width:150px">灯效</th>
+                <th style="width:190px">亮度</th><th style="width:130px">间隔</th><th>颜色</th>
+              </tr></thead>
+              <tbody>
+                <tr v-for="st in lightStates" :key="st.key">
+                  <td>{{st.label}}
+                    <div class="muted" style="font-size:11px">{{st.desc}}</div></td>
+                  <td>
+                    <select :value="aForm.emotion_lights[st.key].preset"
+                            @change="pickLight(st.key,$event)" style="width:100%">
+                      <option value="">自定义</option>
+                      <option v-for="p in lightPresets" :key="p.id" :value="p.id">{{p.name}}</option>
+                    </select>
+                  </td>
+                  <td>
+                    <input type="range" :min="lightMeta.brightness.min" :max="lightMeta.brightness.max"
+                           :value="aForm.emotion_lights[st.key].brightness" style="width:120px"
+                           @input="setLight(st.key,'brightness',$event.target.value)" />
+                    <span class="muted" style="font-size:12px">{{aForm.emotion_lights[st.key].brightness}}%</span>
+                  </td>
+                  <td>
+                    <template v-if="lightHasInterval(st.key)">
+                      <input type="number" :min="lightMeta.interval_ms.min" :max="lightMeta.interval_ms.max"
+                             step="50" style="width:80px"
+                             :value="aForm.emotion_lights[st.key].interval_ms"
+                             @input="setLight(st.key,'interval_ms',$event.target.value)" />
+                      <span class="muted" style="font-size:12px">ms</span>
+                    </template>
+                    <span v-else class="muted" style="font-size:12px">—</span>
+                  </td>
+                  <td>
+                    <span :style="{display:'inline-block',width:'14px',height:'14px',
+                                   borderRadius:'50%',verticalAlign:'middle',
+                                   background:aForm.emotion_lights[st.key].rgb,
+                                   opacity:aForm.emotion_lights[st.key].brightness/100}"></span>
+                    <code style="font-size:11px">{{aForm.emotion_lights[st.key].rgb}}</code>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
           </div>
           <div class="row" style="margin-top:16px;justify-content:flex-end">
             <button @click="aBox=null">取消</button>
@@ -606,6 +649,8 @@
                           :class="{on: isBandOn(spec, o.value)}"
                           @click="setBand(spec, o.value)">{{o.label}}</button>
                 </div>
+                <div v-if="spec.kind==='multi'" class="muted" style="font-size:11px">
+                  可多选（至少选一项）</div>
                 <div class="eff">{{bandEffect(spec, pEdit.traits[spec.name])}}</div>
               </div>
             </div>
@@ -1491,7 +1536,11 @@ createApp({
       // remUserFilter 是前端过滤 —— 后端 reminders 列表不返回 creator 的用户名，
       // 只能在已知 owner 里筛，见 ownerName 的注释。
       remDeviceFilter: '', remUserFilter: '', remBusy: false,
-      aBox: null, aForm: null, clipsText:'', lightsText:'',
+      aBox: null, aForm: null,
+      // 灯效编辑器的元数据，全部由 GET /api/avatars/light-presets 下发。
+      // 不在前端硬编码状态/预置清单：加一种灯效只改后端，两个前端自动都有。
+      lightStates: [], lightPresets: [], lightEffects: [], clipStates: [],
+      lightMeta: {brightness:{min:1,max:100}, interval_ms:{min:200,max:5000}},
       pBox: null, pForm: null, paramsText:'',
       // 预置字段的「手动解锁」状态。默认全 false = 全走厂商预设（只读灰显）。
       // 只存**前端意图**，不入库：后端保存时仍以表单里的值为准。
@@ -1885,7 +1934,7 @@ createApp({
     logout(){ this.token=''; localStorage.removeItem('elder_token'); },
     async loadAll(){
       await Promise.all([this.loadDevices(), this.loadAvatars(), this.loadProviders(),
-                       this.loadVoiceCatalog()]);
+                       this.loadVoiceCatalog(), this.loadLightMeta()]);
       // 提醒页默认展示**全部设备**的规则（管理员排障的视角），不是 curDeviceId 那台。
       // remDeviceFilter 留空即全量，与 loadReminders 里的「不传 device_pk」对齐。
       this.remDeviceFilter = '';
@@ -1998,6 +2047,26 @@ createApp({
       return d ? d.name : ('设备 #' + pk);
     },
     async loadAvatars(){ const r = await this.api('/api/avatars'); if(r) this.avatars = r; },
+    // 灯效编辑器的元数据（状态清单 / 预置 / 动效 / 取值范围 / clips 状态键）。
+    // 与 loadAvatars 一起拉：形象弹窗一打开就要渲染 7 行灯效，晚到就会出现
+    // 一段空白表格，运营会以为"这台部署没有灯效配置"。
+    // ⚠️ 失败不静默：没有这份清单，弹窗里的下拉与滑杆全是空的，
+    // 而"空下拉"看起来像正常状态，不报错就没人知道是接口挂了。
+    async loadLightMeta(){
+      try{
+        const r = await this.api('/api/avatars/light-presets');
+        if (!r) return;
+        this.lightStates = r.states || [];
+        this.lightPresets = r.presets || [];
+        this.lightEffects = r.effects || [];
+        this.clipStates = r.clip_states || [];
+        this.lightMeta = r;
+        // 元数据可能比弹窗晚到（loadAll 是并行拉的）。那一刻 lightStates 已经
+        // 有值、aForm.emotion_lights 还是 {} —— 模板会在 undefined 上取 .preset
+        // 直接抛渲染错误，整个弹窗变空白。补一次归一即可，成本为零。
+        if (this.aBox && this.aForm){ this.fillClips(); this.fillLights(); }
+      }catch(e){ this.err = '灯效预置加载失败：' + e.message; }
+    },
     async loadProviders(){ const r = await this.api('/api/providers'); if(r) this.providers = r; },
     // 音色目录 + 就绪度面板。两者都**不能阻塞**页面其他部分：
     // 音色目录拉不到时音色框退化成「只有自定义输入」仍可用（宁可少功能不可报错），
@@ -2168,15 +2237,92 @@ createApp({
     // -------- 形象 --------
     blankAvatar(){
       return { name:'', description:'', eaf_pack_name:'', eaf_pack_url:'', eaf_pack_sha256:'',
-        screen_width:320, screen_height:240, clips:{}, system_prompt:'', tts_voice:'',
+        screen_width:320, screen_height:240, clips:{}, tts_voice:'',
         emotion_lights:{}, enabled:true };
     },
     editAvatar(a){
       this.aForm = a ? JSON.parse(JSON.stringify(a)) : this.blankAvatar();
       Object.assign(this.aForm, this.splitVoice(this.aForm.tts_voice));
-      this.clipsText = JSON.stringify(this.aForm.clips||{}, null, 2);
-      this.lightsText = JSON.stringify(this.aForm.emotion_lights||{}, null, 2);
+      // 必须先补全再开弹窗：模板里直接读 aForm.emotion_lights[st.key].preset，
+      // 状态或字段缺一个，Vue 首次渲染就会在 undefined 上取属性而报错。
+      this.fillClips();
+      this.fillLights();
       this.aBox = true;
+    },
+    // 保证 clips 9 个键都在：模板里直接 v-model="aForm.clips[cs.key]"，
+    // 键不存在时 v-model 会写到一个新键上但界面首次渲染是空的。
+    fillClips(){
+      // 元数据没拉到（/light-presets 失败）时**原样保留**，绝不写回空对象：
+      // 提交空对象会被后端归一成默认片段名，等于把运营配好的映射静默清掉。
+      if (!this.clipStates.length){ this.aForm.clips = this.aForm.clips || {}; return; }
+      const def = {idle:'idle', listening:'listening', thinking:'thinking',
+                   mouth_open:'mouth_open', mouth_half:'mouth_half', smile:'smile',
+                   blink:'blink', sleepy:'sleepy', alert:'alert'};
+      const src = this.aForm.clips || {};
+      const out = {};
+      this.clipStates.forEach(cs => {
+        out[cs.key] = (typeof src[cs.key] === 'string' && src[cs.key].trim())
+          ? src[cs.key] : (def[cs.key] || cs.key);
+      });
+      this.aForm.clips = out;
+    },
+    // 保证 emotion_lights 7 个状态 × 5 个字段都在（后端也会归一，
+    // 但界面首次渲染必须是完整的，否则滑杆显示空值）。
+    fillLights(){
+      // 同上：清单缺失时保留原值，避免一次保存把 7 个状态全归零。
+      if (!this.lightStates.length){
+        this.aForm.emotion_lights = this.aForm.emotion_lights || {}; return;
+      }
+      const src = this.aForm.emotion_lights || {};
+      const out = {};
+      this.lightStates.forEach(st => {
+        const d = (this.lightMeta.defaults || {})[st.key] || {};
+        const cur = src[st.key] || {};
+        out[st.key] = {
+          preset: typeof cur.preset === 'string' ? cur.preset : (d.preset || ''),
+          rgb: cur.rgb || d.rgb || '#FFFFFF',
+          effect: cur.effect || d.effect || 'solid',
+          brightness: Number(cur.brightness || d.brightness || 100),
+          interval_ms: Number(cur.interval_ms || d.interval_ms || 800),
+        };
+      });
+      this.aForm.emotion_lights = out;
+    },
+    lightHasInterval(key){
+      const eff = (this.aForm.emotion_lights[key] || {}).effect;
+      const e = (this.lightEffects || []).filter(x => x.effect === eff)[0];
+      return !!(e && e.interval);
+    },
+    pickLight(key, ev){
+      const id = ev.target.value;
+      const l = this.aForm.emotion_lights[key];
+      if (!l) return;
+      l.preset = id;
+      const p = (this.lightPresets || []).filter(x => x.id === id)[0];
+      // 选「自定义」只清 preset 锚点，**不动 rgb/effect** ——
+      // 否则用户手调好的颜色会被一次误点清成白色。
+      if (p){ l.rgb = p.rgb; l.effect = p.effect; }
+    },
+    setLight(key, field, val){
+      const l = this.aForm.emotion_lights[key];
+      if (!l) return;
+      const n = Number(val);
+      if (!isFinite(n)) return;
+      if (field === 'brightness') l.brightness = Math.max(1, Math.min(100, Math.round(n)));
+      else l.interval_ms = Math.max(200, Math.min(5000, Math.round(n)));
+    },
+    // 列表里那格「灯效」：只挑待机与提醒两个状态做摘要，不展示全 7 项
+    // （表格宽度有限，且运营扫一眼关心的是"平时什么样、出事什么样"）。
+    // 认不出 preset（自定义/存量数据）就说「自定义」，不显示空。
+    lightSummary(a){
+      const el = (a && a.emotion_lights) || {};
+      const nameOf = key => {
+        const l = el[key] || {};
+        if (!l.preset) return '自定义';
+        const p = (this.lightPresets || []).filter(x => x.id === l.preset)[0];
+        return p ? p.name : '自定义';
+      };
+      return '待机 ' + nameOf('neutral') + ' / 提醒 ' + nameOf('alert');
     },
     // 把库里存的音色值拆成「下拉框选中的项」+「自定义文本」两半。
     // 存量数据里可能有不在预置清单里的音色（自建服务），这类必须落到
@@ -2202,10 +2348,8 @@ createApp({
     },
     voiceOf(v){ return this.ttsVoices.find(x=>x.id===v) || null; },
     async saveAvatar(){
-      try{
-        this.aForm.clips = this.clipsText.trim() ? JSON.parse(this.clipsText) : {};
-        this.aForm.emotion_lights = this.lightsText.trim() ? JSON.parse(this.lightsText) : {};
-      }catch(e){ this.err = 'JSON 格式错误：'+e.message; return; }
+      // clips / emotion_lights 在表单里已经是对象（editAvatar 的 fillClips /
+      // fillLights 补全过），直接提交；后端仍会按 9 键 / 7 状态归一一次。
       if (this.aForm.tts_voice === '__custom__' && !(this.aForm.tts_voice_custom||'').trim()){
         this.err = '选了「其他」但没填音色名。请填写，或改选一个预置音色。';
         return;
@@ -2576,16 +2720,53 @@ createApp({
     // 推回给"谁也不知道 0.6 是多大"的运营。
     isBandOn(spec, value){
       const cur = this.pEdit ? this.pEdit.traits[spec.name] : undefined;
+      if (spec.kind === 'multi'){
+        return Array.isArray(cur) && cur.map(String).indexOf(String(value)) >= 0;
+      }
       return String(cur) === String(value);
     },
     setBand(spec, value){
       if(!this.pEdit) return;
+      if (spec.kind === 'multi'){
+        const cur = Array.isArray(this.pEdit.traits[spec.name])
+          ? this.pEdit.traits[spec.name].slice() : [];
+        const i = cur.map(String).indexOf(String(value));
+        // 再点一次就取消 —— 但**不允许取消到空**：空列表等于"什么话题都不许聊"，
+        // 后端会 400，而用户看到的只是一句"保存失败"。
+        if (i >= 0){
+          if (cur.length <= 1){
+            this.err = '「' + spec.label + '」至少要选一项';
+            return;
+          }
+          cur.splice(i, 1);
+        } else {
+          cur.push(value);
+        }
+        // 按 options 的声明顺序排好再写回：顺序不同会被后端当成"改过"，
+        // 且 diff 视图会显示一条毫无意义的变更。
+        // ⚠️ 取排名用显式 undefined 判断，不能写 ``|| 99``：第一个档位的
+        // 排名是 0，`0 || 99` 会把它排到最后，于是"最轻的一档"跑到了末尾。
+        const order = {};
+        (spec.options || []).forEach((o, idx) => { order[String(o.value)] = idx; });
+        const rank = v => (order[String(v)] === undefined ? 99 : order[String(v)]);
+        cur.sort((a, b) => rank(a) - rank(b));
+        this.pEdit.traits[spec.name] = cur;
+        return;
+      }
       // 原样回传，绝不四舍五入到别的档（见上方 W13 说明）
       this.pEdit.traits[spec.name] = value;
     },
     // 当前档位的行为描述。**取不到就明说取不到**，不静默显示空白 ——
     // 空白会被读成"这一维没有行为描述"，而真实原因是"当前值不在任何档位里"。
     bandEffect(spec, value){
+      if (spec.kind === 'multi'){
+        const arr = Array.isArray(value) ? value : [];
+        if (!arr.length) return '⚠️ 至少要选一项话题范围，否则机器人会拒答一切。';
+        return arr.map(v => {
+          const hit = (spec.options || []).filter(o => String(o.value) === String(v))[0];
+          return hit ? (hit.effect || hit.label) : String(v);
+        }).join(' ');
+      }
       const hit = (spec.options||[]).filter(o => String(o.value) === String(value))[0];
       if(!hit) return '⚠️ 当前值 ' + String(value) +
         ' 不在任何档位里（出厂值可能落在档位之间），保存前请选一个档位。';
@@ -2594,6 +2775,14 @@ createApp({
     traitLabel(name, value){
       const spec = (this.presetMeta.trait_specs||[]).filter(s => s.name === name)[0];
       if(!spec) return String(value);
+      if (spec.kind === 'multi'){
+        const arr = Array.isArray(value) ? value : (value ? [value] : []);
+        if (!arr.length) return '—';
+        return arr.map(v => {
+          const hit = (spec.options||[]).filter(o => String(o.value) === String(v))[0];
+          return hit ? hit.label : String(v);
+        }).join('、');
+      }
       const hit = (spec.options||[]).filter(o => String(o.value) === String(value))[0];
       return hit ? hit.label : String(value);
     },
@@ -2725,6 +2914,18 @@ createApp({
       }
       if (!(this.pEdit.name||'').trim()){
         this.err = '请填写预设名称 —— 它是家属在 APP 里看到的那一行。';
+        return;
+      }
+      // 多选维度（kind:"multi"，目前只有 topic_scope）不允许空数组：
+      // 空列表等于"什么话题都不许聊"，后端会 400，而运营看到的只有"保存失败"。
+      // 拦在这里，把"哪一维、为什么"直接说清楚。
+      const multiSpec = (this.presetMeta.trait_specs||[]).filter(s => s.kind === 'multi')
+        .filter(s => {
+          const v = (this.pEdit.traits||{})[s.name];
+          return !Array.isArray(v) || !v.length;
+        })[0];
+      if (multiSpec){
+        this.err = '「' + multiSpec.label + '」至少要选一项';
         return;
       }
       const voice = this.resolveVoice(this.pEdit.tts_voice, this.pEdit.tts_voice_custom);

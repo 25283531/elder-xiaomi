@@ -362,7 +362,15 @@ class AvatarIn(ORMBase):
     人格已统一到 AIProvider（架构 §4.2）。这里即便留着那个字段也不会有用 ——
     它对每个角色都一样，而每个角色的 system_prompt 各不相同。留着只会让
     调用方误以为改形象能改说话方式。
-    tts_voice 仍在：它是「形象的**默认**音色」，角色自带音色时以角色的为准。
+
+    ``tts_voice`` 仍在：它是「形象的**默认**音色」，角色自带音色时以角色的为准。
+    ⚠️ 2026-10-31 起形象编辑界面**不再暴露**它（音色归人格预设），但请求体
+    仍可传 —— 前端把原值原样回传，这样"藏起来不改"不会变成"保存就清空"。
+
+    clips / emotion_lights 在**序列化时也归一**：老库里只有 ``rgb``/``effect``
+    两项，不补 ``brightness``/``interval_ms`` 的话前端滑杆显示空值、保存时
+    把 undefined 写成 null。归一函数本身不抛错（缺什么补默认），所以对
+    脏数据是"降级"而不是"整个列表接口 500"。
     """
 
     name: str
@@ -372,10 +380,26 @@ class AvatarIn(ORMBase):
     eaf_pack_sha256: str = ""
     screen_width: int = 320
     screen_height: int = 240
-    clips: dict[str, str] = Field(default_factory=dict)
+    clips: dict[str, str] = Field(default_factory=dict, validate_default=True)
     tts_voice: str = ""
-    emotion_lights: dict[str, Any] = Field(default_factory=dict)
+    emotion_lights: dict[str, Any] = Field(default_factory=dict, validate_default=True)
     enabled: bool = True
+
+    # ⚠️ ``validate_default=True`` 不能省。Pydantic v2 默认**不校验默认值** ——
+    # 不传 clips 时 default_factory 直接产出 {}，validator 根本不跑，
+    # 于是"AvatarIn 的 clips 永远是完整 9 项"这条约定在"新建时不传"这条
+    # 最常见的路径上悄悄不成立（表现为设备上待机表情不动）。
+    @field_validator("clips", mode="after")
+    @classmethod
+    def _norm_clips(cls, v: dict[str, str]) -> dict[str, str]:
+        from .avatar_style import normalize_clips
+        return normalize_clips(v)
+
+    @field_validator("emotion_lights", mode="after")
+    @classmethod
+    def _norm_lights(cls, v: dict[str, Any]) -> dict[str, Any]:
+        from .avatar_style import normalize_lights
+        return normalize_lights(v)
 
 
 class AvatarOut(AvatarIn):

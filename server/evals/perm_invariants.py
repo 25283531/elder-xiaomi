@@ -143,7 +143,7 @@ class _Fixture:
             from app.persona import catalog
 
             self.preset = _role("平台预设", models.RECORD_TYPE_PRESET, None,
-                                traits=dict(catalog.DEFAULT_TRAITS))
+                                traits=catalog.default_traits())
             self.alice_role = _role("alice 的角色", models.RECORD_TYPE_ROLE,
                                     self.alice.id)
             self.bob_role = _role("bob 的角色", models.RECORD_TYPE_ROLE, self.bob.id)

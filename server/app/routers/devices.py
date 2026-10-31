@@ -249,6 +249,24 @@ def admin_unbind_device(device_pk: int, db: Session = Depends(get_db),
     mac = str(dev.device_id or "")
     dev.owner_id = None
     dev.bound_at = None
+    # ---- 清掉原家属的角色（2026-10-31）----
+    #
+    # 为什么必须清：``agent_id`` 指向的是**原家属**的角色。新家庭绑定后，
+    # 运行时 ``persona.loader._visible_to_user`` 按"设备主人"判可见性 ——
+    # 角色 owner 还是旧主人 ⇒ 判不过 ⇒ **静默回退基础口令**，而且
+    # ``voice/prompts.py`` 的回退路径以前连医疗红线都不带（已修）。
+    # 同时 ``device_api`` 下发音色时**不判可见性**，于是新家庭会继续用
+    # 旧家属角色的声音。两个后果用户都看不出来。
+    #
+    # 这不是"管理员操作失误"：普通用户把自己的角色绑到设备、解绑、再让
+    # 别人绑定激活码，就会踩到。所以清在这里，而不是指望绑定时兜。
+    dev.agent_id = None
+    # 形象同理，但**只清用户自建的那种**：平台预设（owner 为 NULL）本来就
+    # 全平台共享，换主人继续用它是对的；无谓重置只会让新家庭看到"没有形象"。
+    if dev.avatar_id:
+        _av = db.get(models.Avatar, dev.avatar_id)
+        if _av is not None and _av.record_type != models.RECORD_TYPE_PRESET:
+            dev.avatar_id = None
     # 代次 +1 ⇒ 该设备已签出的**全部** device_token 立即失效。
     # 不这样做，解绑只清了归属、没清访问权：原家属手上的 token 在 365 天
     # 有效期内仍能开 WS 读数据，等新家庭绑定后就读到**新家庭**的提醒了。
@@ -284,18 +302,49 @@ def bind_agent(device_pk: int, payload: DeviceAgentIn, db: Session = Depends(get
     于是**任何平台 LLM 配置都能被绑成角色**（kind 判空根本没查）。
     后果是 build_persona_prompt 拿到一条空 system_prompt —— 设备"绑上了角色"
     却按没有人格的方式说话，而且不报错，只是静默劣化。
-    现在统一走 deps.require_role：必须是角色行、且对当前用户可见。
+    现在统一走 deps.require_role：必须是角色行、且对**设备主人**可见。
 
-    TODO: 目前只把 agent_id 落库。设备心跳（/api/device/sync）还没有把角色
-    下发给固件，等端侧支持「按角色切换人格 / 音色」时，在 DeviceSyncOut 里
-    加一个 agent 字段、复用这里取角色的逻辑即可，不必改本接口。
+    ⚠️ **2026-10-31 修复：判据从"调用者"改成"设备主人"**。
+    原先 ``require_role(db, role_id, user)`` 判的是**调用者**：管理员能看到
+    全平台角色，于是能把别人的角色绑到自己名下的设备上 —— 绑定**成功**，
+    而运行时 ``persona.loader._visible_to_user`` 判的是**设备主人**，
+    判不过就静默回退基础口令（当时连医疗红线一起丢）。
+    生产实际发生过：``角色 id=8 不属于 user_id=1，拒绝使用其人格``，
+    而且只有服务端一条 WARNING，用户侧零提示。
+
+    现在绑不上就当场失败，并且**说清原因** —— 见下面那个 except 分支。
     """
     dev = db.get(models.Device, device_pk)
     if dev is None or (not user.is_admin and dev.owner_id != user.id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "设备不存在")
 
-    # 必须是**角色**且当前用户可见：平台配置在这里表现为"不存在"
-    role = require_role(db, payload.role_id, user)
+    # 运行时取的是"设备主人"的身份（见 persona.loader 的 user_id 入参），
+    # 所以这里必须用同一个身份判可见性，否则两层判据必然漂移。
+    owner = db.get(models.User, dev.owner_id) if dev.owner_id else None
+    if owner is None:
+        # 未归属任何账户的设备：运行时 load_agent_persona 拿到 user_id=None
+        # 会直接放弃人格，绑什么都不会生效。与其静默失效，不如当场说清楚。
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "该设备尚未绑定任何账户，人格角色无法生效。请先完成绑定再设置。")
+
+    try:
+        # 必须是**角色**且对**设备主人**可见：平台配置在这里表现为"不存在"
+        role = require_role(db, payload.role_id, owner)
+    except HTTPException:
+        # 只在"调用者看得见、但设备主人看不见"这一种情况下换成明确报错。
+        # 这时调用者本来就能在自己的角色列表里看到它，所以不构成新的信息泄露；
+        # 而其它情况（角色不存在 / 不是角色行 / 已下架）继续沿用 404，
+        # 保持与全仓其它角色接口一致，不泄露主键是否存在。
+        row = db.get(models.AIProvider, payload.role_id)
+        if (row is not None and row.is_role() and row.is_visible_to(user)
+                and not row.is_visible_to(owner)):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "该角色属于其他账户，这台设备的主人在对话时用不了它"
+                "（人格会被静默忽略、且音色不会跟随）。"
+                "请改选平台预设角色，或让设备主人自己创建角色。")
+        raise
     if role.deleted_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "角色不存在")
 
@@ -522,6 +571,29 @@ def bind_device(request: Request, payload: BindIn, db: Session = Depends(get_db)
         db.commit()
         _fail(status.HTTP_409_CONFLICT,
               "该设备已绑定其他账户，请先在原账户中解绑后再试")
+
+    # ---- 兜底再清一次角色/形象（2026-10-31）----
+    #
+    # ⚠️ **必须在把 owner_id 写成新主人之前判**：走到这里还有两种情形 ——
+    #   * ``dev.owner_id is None``：从未绑定 / 已解绑 ⇒ 这是一次**全新归属**，
+    #     不该继承任何人的角色，清掉；
+    #   * ``dev.owner_id == user.id``：同一个用户重复扫自己的码 ⇒ 保留他
+    #     自己绑的角色，**不能清**（清了等于"重新绑一次码，人格就没了"）。
+    # 先清后写、且只在 None 时清，两个情形才分得开。
+    #
+    # 为什么这里还要兜一遍（正常路径上 ``admin_unbind_device`` 已经清过）：
+    #   * 老版本解绑只清 owner_id，``agent_id`` 原样留在行上；
+    #   * 生产上当前那台设备就是这样（owner=1、agent_id=8 指向用户 2 的角色）。
+    #
+    # 不清的后果不是"报错"，而是**静默劣化**：人格按设备主人判权限被拒、
+    # 回退基础口令（红线在 2026-10-31 之前也一起丢了），而音色照旧用
+    # 原家属角色的。用户侧零提示，只有服务端一条 WARNING。
+    if dev.owner_id is None:
+        dev.agent_id = None
+        if dev.avatar_id:
+            _av = db.get(models.Avatar, dev.avatar_id)
+            if _av is not None and _av.record_type != models.RECORD_TYPE_PRESET:
+                dev.avatar_id = None
 
     dev.owner_id = user.id
     # 绑定时间 = 当前归属的起始时刻。放在这里而不是上面「现场建档」分支里：

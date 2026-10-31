@@ -117,10 +117,13 @@ export interface Avatar {
   name: string
   description: string
   eaf_pack_name: string
+  eaf_pack_url: string
   screen_width: number
   screen_height: number
   clips: Record<string, string>
-  system_prompt: string
+  // ⚠️ 2026-10-31 起形象**不再带 system_prompt**（后端 AvatarIn 已移除该字段），
+  // 音色也归到人格预设，这里保留 tts_voice 只是因为它仍是"角色没设音色"时的兜底值，
+  // 界面上**不要**再展示成"形象的音色"。
   tts_voice: string
   emotion_lights: Record<string, any>
 }

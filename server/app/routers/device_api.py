@@ -354,6 +354,20 @@ def sync(request: Request, fw_version: str = "", hw_model: str = "",
     if role is not None and (not role.is_role() or role.deleted_at is not None
                             or role.archived_at is not None):
         role = None
+    # ⚠️ 可见性判据必须与人格那条路**完全一致**（2026-10-31）。
+    #
+    # 原先这里只判"是不是角色 / 删没删 / 下没下架"，不判归属。于是设备可能
+    # 用着**别人角色**的音色、却按基础口令说话（人格在 persona.loader 里被
+    # 按设备主人拒绝）。两件事一个被拒、一个照用，用户完全看不出矛盾 ——
+    # 生产上 ``角色 id=8 不属于 user_id=1`` 那条 WARNING 就是这种状态。
+    #
+    # 判据复用 persona.loader.visible_to_user，不在这里重写条件：
+    # 写两份必然漂移，漏一处就是"人格和声音不是同一个角色"的怪状态。
+    if role is not None:
+        from ..persona.loader import visible_to_user
+
+        if not visible_to_user(role, dev.owner_id or 0):
+            role = None
 
     db.refresh(dev)
     # 规划文档 7.3：心跳时顺带下发当日陪聊统计（已用秒数 / 空闲切断 / 服药关键词）。
