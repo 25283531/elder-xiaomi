@@ -190,11 +190,12 @@ def build_system_prompt(db, user_id: int, agent_id: int | None,
     （内部 ``build_persona_prompt``）注入在 ``memory_ctx`` 里，再传一次就是
     同一段话在 prompt 里出现两遍 —— 白烧 token，还会让模型照着复读。
 
-    ``spec is None``（未绑角色 / 角色取不到 / 数据非法）时**原样回退**到
-    ``BASE_VOICE_PROMPT + memory_ctx`` —— 文案与接入人格之前完全一致，
-    只是不再有编译器那几段。
+    ``spec is None``（未绑角色 / 角色取不到 / 数据非法）时回退到
+    ``BASE_VOICE_PROMPT + memory_ctx`` —— 文案与接入人格之前一致，
+    只是不再有编译器那几段。**但红线照旧注入**，见 :func:`_append_redline`。
     """
-    fallback = BASE_VOICE_PROMPT + (("\n\n" + memory_ctx) if memory_ctx else "")
+    fallback = _with_redlines(
+        BASE_VOICE_PROMPT + (("\n\n" + memory_ctx) if memory_ctx else ""))
     try:
         # 延迟导入：无人格路径（未绑角色）完全不必付 persona 包的导入成本，
         # 也避免 voice 包在 import 阶段就与 persona/memory 绑死。
@@ -221,3 +222,46 @@ def build_system_prompt(db, user_id: int, agent_id: int | None,
         log.warning("角色口令编译失败，回退基础口令：%s: %s",
                     type(exc).__name__, exc)
         return fallback
+
+
+def _with_redlines(body: str) -> str:
+    """给一段 prompt 补上**首尾各一次**的硬红线。**与是否绑了角色完全无关。**
+
+    为什么需要它：原先只有"有人格"那条路注入红线（走
+    ``PromptCompiler.compile`` → ``guardrails.render_head/render_tail``），
+    而回退路径只返回 ``BASE_VOICE_PROMPT``。可是 ``BASE_VOICE_PROMPT`` 里
+    只有语气、表情、提醒工具的规矩，**一条医疗安全约束都没有**。
+
+    于是出现一个反直觉的结论：**最该兜底的那条路，是唯一没有红线的路**。
+    走到回退路径的情形恰恰都是"配置出了问题"——未绑角色、角色被权限拒绝、
+    角色数据非法、编译抛异常——而这时设备却在没有任何医疗约束的情况下
+    跟老人说话。
+
+    2026-10-31 生产实报的
+    ``WARNING elder.persona.loader | 角色 id=8 不属于 user_id=1，拒绝使用其人格``
+    就落在这条路上：设备既没有人格、也没有红线，而且没有任何提示。
+
+    为什么首尾都要：与 :func:`PromptCompiler.compile` 同一口径（开头给框架、
+    结尾给复述，LLM 对末尾注意力更高）。只补尾段会被
+    ``guardrails.assert_present`` 判为"开头缺少红线声明"而拒绝 —— 那个断言
+    要求首尾各出现一次，这里必须与它对齐，否则两条路产物形态不一致，
+    断言就成了只在一条路上成立的摆设。
+
+    红线取自 :func:`guardrails.regenerate_locked`，**只读代码常量、不读 DB**，
+    所以这里不需要任何角色上下文，也不存在"用户把红线清空"的路径。
+    """
+    try:
+        from ..persona import guardrails
+
+        hard = guardrails.regenerate_locked(None)
+        head = guardrails.render_head(hard)
+        tail = guardrails.render_tail(hard)
+    except Exception as exc:  # noqa: BLE001  persona 包异常不该让对话起不来
+        log.warning("红线渲染失败（persona 包异常），本次无红线：%s: %s",
+                    type(exc).__name__, exc)
+        return body
+    if not head or not tail:
+        # 常量里一条红线都没有 = 代码被改坏了，比"没绑角色"严重得多。
+        log.warning("硬红线清单为空，prompt 未注入任何医疗约束（检查 catalog）")
+        return body
+    return "\n\n".join(p for p in (head, body.strip(), tail) if p)

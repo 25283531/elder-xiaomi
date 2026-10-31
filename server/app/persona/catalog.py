@@ -43,11 +43,12 @@ class TraitSpec:
       * 行为描述**直接进prompt**，是这个档位的全部实际效果。
 
     ``kind`` 为 'enum' 时用levels；为 'number' 时用 min/max，
-    行为描述由 to_prompt_sentence 按阈值分档生成。
+    行为描述由 to_prompt_sentence 按阈值分档生成；
+    为 'multi' 时用 levels 但值是**列表**（可多选，至少一项）。
     """
     name: str
     label: str
-    kind: str  # 'enum' | 'number' | 'bool'
+    kind: str  # 'enum' | 'number' | 'bool' | 'multi'
     levels: tuple[tuple[str, str, str], ...] = ()
     min: float = 0.0
     max: float = 1.0
@@ -58,9 +59,38 @@ class TraitSpec:
     true_text: str = ""
     false_text: str = ""
 
+    def coerce(self, value: Any) -> Any:
+        """把**历史值**归一到当前 kind 的形状。非 multi 原样返回。
+
+        存在的唯一理由：``topic_scope`` 从单选的 ``"medicine"`` 改成了多选的
+        ``["medicine"]``，而库里存着大量老的单选字符串。不兼容的话
+        ``is_valid`` 会把它们判成非法 —— 后果是 ``known_valid_traits``
+        把这条维度**丢掉**、``RoleSpec.validate()`` 直接抛错让整个角色编译失败。
+        表现是"升级完所有老角色的说话方式全变了"，而且日志里只有一行
+        "未知/非法 trait"。所以兼容必须做在这里，而不是要求用户去改数据。
+        """
+        if self.kind != "multi":
+            return value
+        if isinstance(value, str):
+            return [value] if value else []
+        if isinstance(value, (list, tuple)):
+            return [str(v) for v in value]
+        return value
+
+    def normalize(self, value: Any) -> Any:
+        """去重 + 按 levels 声明顺序排序。多选存进 DB 前必须过这一道 ——
+        否则 ``["news","daily"]`` 与 ``["daily","news"]`` 会被当成两个不同的值
+        （"偏离默认"误报、prompt 字符串断言抖动）。"""
+        value = self.coerce(value)
+        if self.kind != "multi" or not isinstance(value, list):
+            return value
+        order = {v: i for i, (v, _lab, _tx) in enumerate(self.levels)}
+        return sorted({v for v in value if v in order}, key=lambda v: order[v])
+
     def is_valid(self, value: Any) -> bool:
         """值是否合法。非法值**必须报错而不是静默丢弃** ——
         静默丢弃意味着用户以为自己改了"话多程度"，实际没生效。"""
+        value = self.coerce(value)
         if self.kind == "enum":
             return isinstance(value, str) and any(v == value for v, _, _ in self.levels)
         if self.kind == "bool":
@@ -69,6 +99,13 @@ class TraitSpec:
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 return False
             return self.min <= float(value) <= self.max
+        if self.kind == "multi":
+            # 空列表 = 什么都不许聊，等于让机器人拒答一切。这不是"用户的选择"，
+            # 是一个会让设备变得没法用的状态，必须判非法而不是放过。
+            if not isinstance(value, list) or not value:
+                return False
+            allowed = {v for v, _, _ in self.levels}
+            return all(isinstance(v, str) and v in allowed for v in value)
         return False
 
     def to_prompt_sentence(self, value: Any) -> str:
@@ -87,6 +124,12 @@ class TraitSpec:
                 if v == value:
                     return text
             return ""
+        if self.kind == "multi":
+            texts = [text for v, _label, text in self.levels
+                     if v in self.normalize(value)]
+            # 逐条都写进 prompt，而不是只写"可以聊这些"这类概括 ——
+            # 每个档位的文案本身就是可执行的行为描述，概括掉就没了。
+            return "".join(texts)
         if self.kind == "bool":
             return self.true_text if value else self.false_text
         # number：按 bands 找第一个上界 >= value 的档位
@@ -98,7 +141,7 @@ class TraitSpec:
 
     def describe_range(self) -> str:
         """给报错文案用的人话取值范围。"""
-        if self.kind == "enum":
+        if self.kind in ("enum", "multi"):
             return "/".join(v for v, _, _ in self.levels)
         if self.kind == "bool":
             return "true/false"
@@ -106,12 +149,19 @@ class TraitSpec:
 
     def as_option(self) -> dict[str, Any]:
         """给 APP 渲染档位按钮用的结构（含后果说明）。"""
-        if self.kind == "enum":
-            return {
+        if self.kind in ("enum", "multi"):
+            out = {
                 "name": self.name, "label": self.label, "kind": self.kind,
                 "options": [{"value": v, "label": lab, "effect": tx}
                             for v, lab, tx in self.levels],
             }
+            if self.kind == "multi":
+                # multiple 是给前端的显式开关：只靠 kind 判断也行，但前端有
+                # 两套（网页 + uni-app）各自渲染，多一个布尔字段就少一处
+                # "kind 拼错就静默退化成单选"的隐患。
+                out["multiple"] = True
+                out["default"] = list(self.default or ())
+            return out
         if self.kind == "bool":
             return {
                 "name": self.name, "label": self.label, "kind": self.kind,
@@ -189,10 +239,16 @@ TRAIT_SPECS: Final[dict[str, TraitSpec]] = {
         ),
     ),
     "topic_scope": TraitSpec(
-        name="topic_scope", label="话题范围", kind="enum", default="daily",
+        # 2026-10-31 用户要求改多选：真实家庭里"只说用药"和"能聊家常"经常要
+        # 同时成立（既要盯吃药，又不能除了吃药啥都不聊），单选逼人二选一。
+        # 存储从 str 变成 list[str]；老库里的 str 由 TraitSpec.coerce() 兼容。
+        name="topic_scope", label="话题范围", kind="multi",
+        default=["daily"],
         levels=(
-            ("medicine", "只说用药", "只聊吃药、看病、用药提醒相关内容。"),
-            ("health", "健康", "可以聊健康、饮食、作息。"),
+            # ⚠️ 文案必须**能并列**：多选时这些句子会被直接拼在一起进 prompt，
+            # 所以不能写"只聊…"这种排他表述 —— 选了"用药"+"家常"会自相矛盾。
+            ("medicine", "用药健康", "可以聊吃药、看病、用药这些和健康有关的事。"),
+            ("health", "健康养生", "可以聊健康、饮食、作息。"),
             ("daily", "日常家常", "聊家常、天气、饮食、邻里这些日常话题。"),
             ("news", "新闻时事", "可以聊新闻和时事。"),
             ("entertainment", "娱乐", "可以聊戏曲、节目等轻松内容。"),
@@ -218,9 +274,21 @@ TRAIT_NAMES: Final[tuple[str, ...]] = tuple(TRAIT_SPECS.keys())
 # 平台预设角色「小智」的默认性格。取的是"偏保守"的一组：
 # 宁可话少一点、别开玩笑，也不要过度主动 —— 对陌生老人第一次交互时，
 # 过于热情比冷淡更容易被当成推销。
-DEFAULT_TRAITS: Final[dict[str, Any]] = {
-    spec.name: spec.default for spec in TRAIT_SPECS.values()
-}
+def default_traits() -> dict[str, Any]:
+    """每次返回**全新一份**默认 traits。
+
+    为什么是函数而不是让调用方 ``dict(DEFAULT_TRAITS)``：``topic_scope`` 改多选后
+    默认值是一个 **list**，而 ``dict()`` 是浅拷贝 —— 两个角色会共享同一个 list 对象。
+    哪天有人对某个角色的 traits 就地 append，另一个角色跟着变，
+    且这种 bug 只在"改过话题范围之后"才出现，极难定位。
+    """
+    out: dict[str, Any] = {}
+    for spec in TRAIT_SPECS.values():
+        out[spec.name] = list(spec.default) if isinstance(spec.default, list) else spec.default
+    return out
+
+
+DEFAULT_TRAITS: Final[dict[str, Any]] = default_traits()
 
 
 # ================================================================ 硬红线

@@ -1,7 +1,16 @@
-"""形象管理：EAF 序列帧资源 + 默认音色 + 情绪灯效。
+"""形象管理：EAF 序列帧资源 + 片段映射 + 情绪灯效 + 资源包。
 
 ⚠️ 形象已**退化为纯形象**（架构 §4.2）：人格与角色级音色搬到了 AIProvider，
 这里不再暴露 system_prompt。设备侧「换外观」与「换人格」从此互不影响。
+
+⚠️ 2026-10-31 职责重划（用户定调）：
+    形象主管 = 灯效 / EAF 资源 / clips（动画片段映射）/ 资源包
+    人格预设主管 = 声音（音色）/ 定义（system_prompt + traits）
+两处**不许出现同一个可编辑项** —— 否则用户改了不生效的那一处，会以为改错了。
+
+``tts_voice`` 列**保留但不再暴露在形象编辑界面**：它是角色没设音色时的兜底
+（device_api.sync 里 ``role.tts_voice or avatar.tts_voice``），删列做不到
+（没有 Alembic），留着当兜底比清空更安全。
 """
 from __future__ import annotations
 
@@ -10,34 +19,16 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import models
+from ..avatar_style import (  # noqa: F401  (DEFAULT_CLIPS 等被 main.py 复用)
+    BRIGHTNESS_MAX, BRIGHTNESS_MIN, CLIP_STATES, DEFAULT_CLIPS, DEFAULT_LIGHTS,
+    INTERVAL_MAX, INTERVAL_MIN, LIGHT_EFFECTS, LIGHT_PRESETS, LIGHT_STATES,
+    normalize_clips, normalize_lights,
+)
 from ..db import get_db
 from ..deps import get_current_user, require_avatar
 from ..schemas import AvatarIn, AvatarOut
 
 router = APIRouter(prefix="/api/avatars", tags=["avatars"])
-
-# 端侧约定的语义片段名，作为默认映射，便于管理页一键填充
-DEFAULT_CLIPS = {
-    "idle": "idle",
-    "listening": "listening",
-    "thinking": "thinking",
-    "mouth_open": "mouth_open",
-    "mouth_half": "mouth_half",
-    "smile": "smile",
-    "blink": "blink",
-    "sleepy": "sleepy",
-    "alert": "alert",
-}
-
-DEFAULT_LIGHTS = {
-    "neutral": {"rgb": "#4A90D9", "effect": "breath"},
-    "happy": {"rgb": "#3AD07A", "effect": "breath"},
-    "sad": {"rgb": "#5B6B8C", "effect": "solid"},
-    "angry": {"rgb": "#E4573D", "effect": "blink"},
-    "alert": {"rgb": "#FF2020", "effect": "solid"},
-    "speaking": {"rgb": "#7FD3FF", "effect": "breath"},
-    "listening": {"rgb": "#FFD24A", "effect": "breath"},
-}
 
 
 @router.post("", response_model=AvatarOut, status_code=status.HTTP_201_CREATED)
@@ -53,6 +44,8 @@ def create_avatar(payload: AvatarIn, db: Session = Depends(get_db),
         av.clips = dict(DEFAULT_CLIPS)
     if not av.emotion_lights:
         av.emotion_lights = dict(DEFAULT_LIGHTS)
+    av.clips = normalize_clips(av.clips)
+    av.emotion_lights = normalize_lights(av.emotion_lights)
     av.record_type = models.RECORD_TYPE_ROLE
     av.owner_id = user.id
     db.add(av)
@@ -78,6 +71,34 @@ def list_avatars(db: Session = Depends(get_db),
     return list(db.scalars(q.order_by(models.Avatar.id.desc())).all())
 
 
+# ⚠️ 这个路由**必须**注册在 ``/{avatar_pk}`` 之前。
+# FastAPI 按注册顺序匹配：放后面的话 ``GET /api/avatars/light-presets``
+# 会先命中 ``/{avatar_pk}``，``"light-presets"`` 转 int 失败 → 422，
+# 前端表现为"灯效下拉永远是空的"，而日志里只有一条 validation error，
+# 跟"路由写错"看起来毫无关系。
+@router.get("/light-presets")
+def light_presets(user: models.User = Depends(get_current_user)):
+    """灯效编辑器要的元数据：状态清单 + 预置灯效 + 动效清单 + 取值范围。
+
+    **由后端下发而不是前端硬编码**：加一种灯效只改这里的 LIGHT_PRESETS，
+    管理端与用户端两个前端自动都有；硬编码则必然出现"两端清单不一致"。
+
+    仍然要登录：内容本身不敏感（纯常量），但本仓的约定是"业务接口一律先认人" ——
+    留一个匿名端点，将来谁往里塞一句"当前生效的设备列表"就没人拦得住了。
+    """
+    _ = user  # 只为鉴权，不参与逻辑
+    return {
+        "states": [{"key": k, "label": lab, "desc": desc} for k, lab, desc in LIGHT_STATES],
+        "presets": [dict(p) for p in LIGHT_PRESETS],
+        "effects": [{"effect": e, "label": lab, "interval": iv}
+                    for e, lab, iv in LIGHT_EFFECTS],
+        "defaults": {k: dict(v) for k, v in DEFAULT_LIGHTS.items()},
+        "clip_states": [{"key": k, "label": lab} for k, lab in CLIP_STATES],
+        "brightness": {"min": BRIGHTNESS_MIN, "max": BRIGHTNESS_MAX},
+        "interval_ms": {"min": INTERVAL_MIN, "max": INTERVAL_MAX},
+    }
+
+
 @router.get("/{avatar_pk}", response_model=AvatarOut)
 def get_avatar(avatar_pk: int, db: Session = Depends(get_db),
                user: models.User = Depends(get_current_user)):
@@ -93,7 +114,19 @@ def update_avatar(avatar_pk: int, payload: AvatarIn, db: Session = Depends(get_d
     等于让全平台所有设备的屏幕表现被人为改变。
     """
     av = require_avatar(db, avatar_pk, user, write=True)
-    for k, v in payload.model_dump().items():
+    # exclude_unset：只改请求里**真的带了**的字段。
+    # 用全量 model_dump 的后果是"前端没渲染某个字段 ⇒ 该字段被重置成默认值"，
+    # 而形象里恰好有一个不再暴露在界面上的 tts_voice（音色兜底）——
+    # 那样每保存一次外观，就会把兜底音色悄悄清空。
+    data = payload.model_dump(exclude_unset=True)
+    # clips / emotion_lights 走归一而不是原样落库：这两个字段在界面上是
+    # "每状态一行"的固定表单，前端漏传一个状态就会让该状态在库里消失，
+    # 而设备按 key 查表取不到 → 该状态下灯不亮、表情不动，且没有任何报错。
+    if "clips" in data:
+        data["clips"] = normalize_clips(data["clips"])
+    if "emotion_lights" in data:
+        data["emotion_lights"] = normalize_lights(data["emotion_lights"])
+    for k, v in data.items():
         setattr(av, k, v)
     # 归属信息不接受请求体覆写：改了就等于"把平台形象变成我的"
     # 或"把我的形象公开"，两者都必须走显式的归属变更路径。

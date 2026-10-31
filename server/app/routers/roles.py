@@ -488,6 +488,7 @@ def create_role(payload: RoleIn, db: Session = Depends(get_db),
     try:
         # 先校验再落库：非法 trait 绝不能进库，否则角色列表会因一条脏数据
         # 整个打不开（_role_out 里每行都要 validate）。
+        traits_norm: dict[str, Any] = {}
         if payload.traits:
             for name, value in payload.traits.items():
                 spec = catalog.TRAIT_SPECS.get(name)
@@ -500,6 +501,9 @@ def create_role(payload: RoleIn, db: Session = Depends(get_db),
                         status.HTTP_400_BAD_REQUEST,
                         f"性格维度 {name!r}（{spec.label}）取值非法：{value!r}；"
                         f"合法范围 {spec.describe_range()}")
+                # normalize 后再存：多选维度要落成"去重 + 声明顺序"的 list，
+                # 否则 ["news","daily"] 与 ["daily","news"] 在库里是两个值。
+                traits_norm[name] = spec.normalize(value)
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001  兜底：校验层不该把 500 抛给调用方
@@ -515,7 +519,7 @@ def create_role(payload: RoleIn, db: Session = Depends(get_db),
         record_type=models.RECORD_TYPE_ROLE,
         owner_id=user.id,             # 归属当前用户，不接受请求体指定
         parent_id=None,               # 原创
-        traits=dict(payload.traits or {}),
+        traits=traits_norm,
         guardrails=guardrails.merge_stored(None),
         enabled=True,
     )
@@ -615,6 +619,7 @@ def update_role(role_pk: int, payload: RoleIn, db: Session = Depends(get_db),
     row.tts_voice = _clamp_voice(db, payload.tts_voice)
     row.avatar_id = payload.avatar_id
     if payload.traits:
+        traits_norm: dict[str, Any] = {}
         for name, value in payload.traits.items():
             spec = catalog.TRAIT_SPECS.get(name)
             if spec is None:
@@ -626,7 +631,8 @@ def update_role(role_pk: int, payload: RoleIn, db: Session = Depends(get_db),
                     status.HTTP_400_BAD_REQUEST,
                     f"性格维度 {name!r}（{spec.label}）取值非法：{value!r}；"
                     f"合法范围 {spec.describe_range()}")
-        row.traits = dict(payload.traits)
+            traits_norm[name] = spec.normalize(value)
+        row.traits = traits_norm
     # record_type / owner_id / parent_id **刻意不改**：它们是归属与派生关系，
     # 改归属必须走显式的路径（P0 安全边界不能靠 PATCH 顺手改掉）。
     db.commit()
@@ -872,7 +878,13 @@ def role_diff(role_pk: int, db: Session = Depends(get_db),
     for name in catalog.TRAIT_NAMES:
         in_overlay = name in overlay
         parent_value = parent_traits.get(name)
-        if in_overlay and overlay[name] != parent_value:
+        # 比较前必须归一：topic_scope 改多选后，母版里可能还是单选字符串
+        # "daily"，而 overlay 里已经是 ["daily"] —— 直接 != 会把"完全没改"
+        # 报成"你改了 1 项"，而用户看着两个一模一样的值无从下手。
+        spec_obj = catalog.TRAIT_SPECS[name]
+        same = (spec_obj.normalize(overlay[name]) == spec_obj.normalize(parent_value)
+                if in_overlay else False)
+        if in_overlay and not same:
             items.append(RoleDiffItem(
                 field=f"traits.{name}",
                 label=catalog.TRAIT_SPECS[name].label,

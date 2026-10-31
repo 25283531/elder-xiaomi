@@ -52,6 +52,21 @@ function clipCount(a: Avatar) {
   return Object.keys(a.clips || {}).length
 }
 
+// 灯效摘要：只取"待机"和"提醒"两个用户最能感知的状态。
+// ⚠️ 当前固件尚未消费 emotion_lights，所以这里只是**如实展示配置**，
+// 不能写成"设备的灯会是这样" —— 那是还没兑现的承诺。
+function lightSummary(a: Avatar) {
+  const L: Record<string, any> = a.emotion_lights || {}
+  const pick = (k: string) => {
+    const it = L[k]
+    if (!it) return '—'
+    const eff = String(it.effect || '')
+    const map: Record<string, string> = { off: '关闭', solid: '常亮', breath: '呼吸', blink: '闪烁', starlight: '星光' }
+    return (map[eff] || eff) + ' ' + String(it.rgb || '')
+  }
+  return '待机 ' + pick('neutral') + ' · 提醒 ' + pick('alert')
+}
+
 onLoad((options: any) => {
   devicePk.value = Number(options?.devicePk || 0)
   browseOnly.value = devicePk.value <= 0
@@ -75,11 +90,19 @@ onShow(() => { refresh() })
         <text v-if="currentId === a.id" class="tag ok">使用中</text>
       </view>
       <text class="sub">{{ a.description || '暂无描述' }}</text>
-      <text class="sub">资源包 {{ a.eaf_pack_name || '—' }} · 片段 {{ clipCount(a) }} 个 · {{ a.screen_width }}×{{ a.screen_height }}</text>
-      <text v-if="a.tts_voice" class="sub">音色 {{ a.tts_voice }}</text>
+      <text class="sub">{{ lightSummary(a) }}</text>
+      <!-- 资源包 / 片段 / 分辨率这三项固件当前**都不消费**，
+           所以只在下面用小字如实说明，不放在主信息行里冒充"生效中"。 -->
+      <text class="sub dim">
+        资源包 {{ a.eaf_pack_name || '—' }} · 片段 {{ clipCount(a) }} 个 · {{ a.screen_width }}×{{ a.screen_height }}
+      </text>
+      <text class="sub dim">以上三项当前固件尚未消费，暂不影响设备显示</text>
     </view>
 
     <view v-if="avatars.length === 0" class="tip">还没有形象，请先到 WEB 管理后台添加</view>
+    <view v-if="!browseOnly" class="tip">
+      音色属于人格，请在「我的 → 角色」里设置
+    </view>
     <button v-if="!browseOnly" class="btn ghost" @click="onClear">清除形象</button>
   </view>
 </template>
@@ -89,6 +112,7 @@ onShow(() => { refresh() })
 .head { margin-bottom: 16rpx; }
 .dname { font-size: 32rpx; font-weight: 600; }
 .sub { font-size: 24rpx; color: #8a8f99; margin-top: 6rpx; display: block; }
+.sub.dim { color: #b0b5bd; font-size: 22rpx; }
 .card { background: #fff; border-radius: 16rpx; padding: 24rpx; margin-bottom: 20rpx; }
 .title { font-size: 30rpx; font-weight: 600; }
 .row { display: flex; flex-direction: row; align-items: center; }

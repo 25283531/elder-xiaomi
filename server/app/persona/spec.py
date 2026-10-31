@@ -143,7 +143,11 @@ def known_valid_traits(traits: Any) -> tuple[dict[str, Any], list[str]]:
         elif not spec.is_valid(value):
             dropped.append(f"{name}={value!r}（合法范围 {spec.describe_range()}）")
         else:
-            kept[name] = value
+            # normalize 而不是原样回传：多选维度（topic_scope）在库里可能还是
+            # 老的单选字符串，也可能是 ["news","daily"] 这种乱序 —— 前端拿到的
+            # 必须永远是"去重 + 按声明顺序"的 list，否则勾选框回显不全、
+            # 而"偏离默认"会把顺序差异误报成用户改过。
+            kept[name] = spec.normalize(value)
     return kept, dropped
 
 
@@ -219,7 +223,7 @@ def default_spec(name: str = catalog.PRESET_ROLE_NAME,
         role_id=role_id,
         name=name,
         system_prompt=catalog.DEFAULT_PRESET_PROMPT,
-        traits_declared=dict(catalog.DEFAULT_TRAITS),
+        traits_declared=catalog.default_traits(),
         guardrails_hard=[],
         guardrails_soft=[],
         is_preset=True,

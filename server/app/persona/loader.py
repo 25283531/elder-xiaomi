@@ -57,12 +57,21 @@ def _parent_traits(db: Session, row: models.AIProvider) -> dict[str, Any]:
     return guardrails.as_dict(parent.traits)
 
 
-def _visible_to_user(row: models.AIProvider, user_id: int) -> bool:
+def visible_to_user(row: models.AIProvider, user_id: int) -> bool:
     """读权限：preset 全平台可用，role 只属于 owner。
 
     设备上的 ``agent_id`` 是绑定时由家属选定的，理论上不会指向别人的角色；
     但这道判据很便宜，而「用别人的角色人格跟自家老人说话」是隐私事故，
     值得在每次对话前多判一次（判不过就走基础口令，不报错）。
+
+    ⚠️ **公开函数，不是私有工具**（2026-10-31 从 ``_visible_to_user`` 改名）。
+    原因：``routers/device_api.py`` 下发音色时也必须用**同一套**判据 ——
+    原先那里只判"角色存在/未删/未下架"，于是出现"人格被拒、音色照用"：
+    设备用着别人角色的声音、却按基础口令说话。判据散成两份必然漂移，
+    所以这里对外暴露，让所有需要判"这个角色这台设备能不能用"的地方都调它。
+
+    注意它**不给管理员例外**：管理员能*管理*全平台角色，但设备运行时用的是
+    设备主人的身份，管理员名下的设备同样不该"借用"别人的角色人格。
     """
     if row.is_preset():
         return True
@@ -93,7 +102,7 @@ def load_agent_persona(db: Session, user_id: int, agent_id: int | None
         if not row.is_alive():
             log.info("角色 id=%s 已软删/下架，语音按无人格回答", agent_id)
             return None, {}
-        if not _visible_to_user(row, user_id):
+        if not visible_to_user(row, user_id):
             log.warning("角色 id=%s 不属于 user_id=%s，拒绝使用其人格",
                         agent_id, user_id)
             return None, {}

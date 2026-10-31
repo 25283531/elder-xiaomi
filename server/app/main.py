@@ -138,7 +138,8 @@ def _seed() -> None:
     """
     from . import models
     from .persona import catalog, guardrails
-    from .routers.avatars import DEFAULT_CLIPS, DEFAULT_LIGHTS
+    from .routers.avatars import (DEFAULT_CLIPS, normalize_clips,
+                                  normalize_lights)
 
     with SessionLocal() as db:
         if db.query(models.User).count() == 0:
@@ -209,7 +210,7 @@ def _seed() -> None:
                 # 幂等性与判据正确性论证见 docs/架构设计-人格预设运营后台.md §9.2：
                 # 判据一个字符未改、建行条件未改，故**不改任何业务数据**。
                 tts_voice=catalog.DEFAULT_PRESET_TTS_VOICE,
-                traits=dict(catalog.DEFAULT_TRAITS),
+                traits=catalog.default_traits(),
                 guardrails=guardrails.merge_stored(None),
                 enabled=True,
             )
@@ -249,11 +250,16 @@ def _seed() -> None:
                 eaf_pack_name="xiaonuan",
                 screen_width=320,
                 screen_height=240,
-                clips=dict(DEFAULT_CLIPS),
+                # 归一而不是 dict(DEFAULT_LIGHTS)：DEFAULT_LIGHTS 的值是嵌套 dict，
+                # dict() 只拷外层，seed 出来的这一行会和模块常量**共享内层对象**，
+                # 之后任何一次就地修改都会污染"出厂默认"。
+                clips=normalize_clips(dict(DEFAULT_CLIPS)),
                 # 音色：这是**形象的默认音色**；角色自带音色时以角色的为准
                 # （见 routers/device_api.py 的 voice fallback）。
+                # ⚠️ 2026-10-31 起形象编辑界面**不再暴露音色**（音色归人格预设），
+                # 这一列只作为"角色没设音色"时的兜底保留。
                 tts_voice="zh-CN-XiaoxiaoNeural",
-                emotion_lights=dict(DEFAULT_LIGHTS),
+                emotion_lights=normalize_lights(None),
             )
             db.add(av)
             log.info("seed: created default avatar")
@@ -377,7 +383,7 @@ def _seed_migration() -> None:
                 parent_id=None,
                 system_prompt="",
                 tts_voice="",
-                traits=dict(catalog.DEFAULT_TRAITS),
+                traits=catalog.default_traits(),
                 guardrails=guardrails.merge_stored(None),
                 enabled=True,
             )
