@@ -363,9 +363,10 @@ class AvatarIn(ORMBase):
     它对每个角色都一样，而每个角色的 system_prompt 各不相同。留着只会让
     调用方误以为改形象能改说话方式。
 
-    ``tts_voice`` 仍在：它是「形象的**默认**音色」，角色自带音色时以角色的为准。
-    ⚠️ 2026-10-31 起形象编辑界面**不再暴露**它（音色归人格预设），但请求体
-    仍可传 —— 前端把原值原样回传，这样"藏起来不改"不会变成"保存就清空"。
+    ``tts_voice`` **已彻底摘除**（2026-10-31 用户定调）：音色归人格预设，
+    形象侧既不读也不写。库里那一列还在（没有 Alembic，删不掉），但
+    device_api.sync 只取 ``role.tts_voice``，形象编辑表单也不再带这个字段 ——
+    "角色优先、形象兜底"那条兼容路径已按"开发测试阶段不留兼容代码"拆掉。
 
     clips / emotion_lights 在**序列化时也归一**：老库里只有 ``rgb``/``effect``
     两项，不补 ``brightness``/``interval_ms`` 的话前端滑杆显示空值、保存时
@@ -381,7 +382,6 @@ class AvatarIn(ORMBase):
     screen_width: int = 320
     screen_height: int = 240
     clips: dict[str, str] = Field(default_factory=dict, validate_default=True)
-    tts_voice: str = ""
     emotion_lights: dict[str, Any] = Field(default_factory=dict, validate_default=True)
     enabled: bool = True
 
@@ -1369,9 +1369,9 @@ class DeviceSyncOut(ORMBase):
     sync_interval_sec: int = 300
     # 新增字段：缺省为 None，老版本设备忽略即可（也可单独调 GET /api/device/quota）
     quota: DeviceQuotaOut | None = None
-    # 本次生效的音色（架构 §4.2）：角色自带音色优先，没有才回落到形象的默认音色。
-    # 放在顶层而不是 avatar 里，因为音色随**角色**变、而 avatar 段描述的是外观 ——
-    # 老固件读 avatar.tts_voice 仍然可用（那是形象的默认值），新固件读这里。
+    # 本次生效的音色（架构 §4.2）：**只来自角色**，形象不再持有音色。
+    # 放在顶层而不是 avatar 里，因为音色随**角色**变、而 avatar 段描述的是外观。
+    # 角色缺失/已删时为空串 ⇒ 固件按厂商默认音色播。
     tts_voice: str = ""
     # 设备该用哪个时区来解释「几点响」（2026-10-21 起下发，见 DEPLOY.md §1.15）
     #
@@ -1402,6 +1402,17 @@ class DeviceSyncOut(ORMBase):
     #: **必须是带默认空列表的顶层数组**：老固件按 key 取值，不认识就忽略，
     #: 不需要动协议版本；写成必填会让所有既有调用方反序列化失败。
     remote_confirms: list[RemoteConfirmOut] = Field(default_factory=list)
+    #: 灯效表（2026-10-31）：7 个状态 → {effect, rgb, brightness, interval_ms}。
+    #:
+    #: 为什么放顶层而不是塞进 avatar 段：avatar 段描述的是"这个形象长什么样"，
+    #: 而灯效是"设备此刻该怎么亮" —— 换形象会变，但设备没有形象时也得有灯效，
+    #: 那时 avatar 为 null，塞进去就没地方放了。
+    #:
+    #: 为什么**不带 preset id**：preset 是"给人挑的那一项"，下发前已经展开成
+    #: 具体颜色/动效。设备存一个 id 只会引入第二份清单，加个预置就两边不一致。
+    #:
+    #: 默认 None：老固件不认识这个键，按"没有配置"处理，继续用内置默认灯效。
+    lights: dict[str, Any] | None = None
 
 
 # ============================================================ 陪聊时长上报

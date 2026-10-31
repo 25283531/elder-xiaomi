@@ -8,9 +8,10 @@
     人格预设主管 = 声音（音色）/ 定义（system_prompt + traits）
 两处**不许出现同一个可编辑项** —— 否则用户改了不生效的那一处，会以为改错了。
 
-``tts_voice`` 列**保留但不再暴露在形象编辑界面**：它是角色没设音色时的兜底
-（device_api.sync 里 ``role.tts_voice or avatar.tts_voice``），删列做不到
-（没有 Alembic），留着当兜底比清空更安全。
+``tts_voice`` 列**保留但不读不写**：本项目没有 Alembic，schema_patch 只能
+ADD COLUMN、删不掉列，所以列还留在库里。但它已经**不再参与任何下发**
+（device_api.sync 的音色只取角色的），形象表单也不带它 ——
+让 PATCH 走 exclude_unset 根本不碰这一列，是"列在、语义已死"的最省事写法。
 """
 from __future__ import annotations
 
@@ -116,8 +117,8 @@ def update_avatar(avatar_pk: int, payload: AvatarIn, db: Session = Depends(get_d
     av = require_avatar(db, avatar_pk, user, write=True)
     # exclude_unset：只改请求里**真的带了**的字段。
     # 用全量 model_dump 的后果是"前端没渲染某个字段 ⇒ 该字段被重置成默认值"，
-    # 而形象里恰好有一个不再暴露在界面上的 tts_voice（音色兜底）——
-    # 那样每保存一次外观，就会把兜底音色悄悄清空。
+    # 而形象表单里 `enabled` 这类开关并不总在弹窗里出现 —— 那样每保存一次外观，
+    # 就会把"是否启用"悄悄重置成 true。
     data = payload.model_dump(exclude_unset=True)
     # clips / emotion_lights 走归一而不是原样落库：这两个字段在界面上是
     # "每状态一行"的固定表单，前端漏传一个状态就会让该状态在库里消失，

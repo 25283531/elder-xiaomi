@@ -2077,7 +2077,6 @@ createApp({
           // 目录到达后要重新拆分：openPreset/editAvatar/openProvider 可能在
           // 目录还空时就把存量音色判成了「不在清单里」，落进自定义框。
           if (this.pEdit) Object.assign(this.pEdit, this.splitVoice(this.pEdit.tts_voice));
-          if (this.aForm) Object.assign(this.aForm, this.splitVoice(this.aForm.tts_voice));
         }
       }catch(e){ /* 目录缺失不致命：自定义输入仍然可用 */ }
       // 再取一次「当前生效厂商的音色」。
@@ -2097,7 +2096,6 @@ createApp({
           // 清单变了要重新拆分：原本判成「自定义」的 Edge 音色，
           // 现在应该显示成「不在清单里」，而不是被静默当成合法值。
           if (this.pEdit) Object.assign(this.pEdit, this.splitVoice(this.pEdit.tts_voice));
-          if (this.aForm) Object.assign(this.aForm, this.splitVoice(this.aForm.tts_voice));
         }
       }catch(e){ /* 拿不到就沿用 Edge 清单，至少不空白 */ }
     },
@@ -2216,12 +2214,16 @@ createApp({
     // -------- 形象 --------
     blankAvatar(){
       return { name:'', description:'', eaf_pack_name:'', eaf_pack_url:'', eaf_pack_sha256:'',
-        screen_width:320, screen_height:240, clips:{}, tts_voice:'',
+        screen_width:320, screen_height:240, clips:{},
         emotion_lights:{}, enabled:true };
     },
     editAvatar(a){
       this.aForm = a ? JSON.parse(JSON.stringify(a)) : this.blankAvatar();
-      Object.assign(this.aForm, this.splitVoice(this.aForm.tts_voice));
+      // 音色归人格预设，形象不再持有。这里把它从表单里摘掉，让 PATCH 走
+      // exclude_unset **根本不碰这一列**（后端仍保留该列做角色缺音色时的兜底）。
+      // 留着它来回搬运，等于为"曾经的形象有音色"在代码里长期养一条旁路。
+      delete this.aForm.tts_voice;
+      delete this.aForm.tts_voice_custom;
       // 必须先补全再开弹窗：模板里直接读 aForm.emotion_lights[st.key].preset，
       // 状态或字段缺一个，Vue 首次渲染就会在 undefined 上取属性而报错。
       this.fillClips();
@@ -2329,12 +2331,7 @@ createApp({
     async saveAvatar(){
       // clips / emotion_lights 在表单里已经是对象（editAvatar 的 fillClips /
       // fillLights 补全过），直接提交；后端仍会按 9 键 / 7 状态归一一次。
-      if (this.aForm.tts_voice === '__custom__' && !(this.aForm.tts_voice_custom||'').trim()){
-        this.err = '选了「其他」但没填音色名。请填写，或改选一个预置音色。';
-        return;
-      }
-      this.aForm.tts_voice = this.resolveVoice(this.aForm.tts_voice, this.aForm.tts_voice_custom);
-      delete this.aForm.tts_voice_custom;
+      // 形象不含音色：editAvatar 已把它从表单摘掉，这里不再做任何音色收敛。
       const body = JSON.parse(JSON.stringify(this.aForm));
       delete body.id; delete body.created_at;
       try{

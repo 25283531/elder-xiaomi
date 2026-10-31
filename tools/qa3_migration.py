@@ -342,9 +342,13 @@ print("###JSON###" + json.dumps({"first": s1, "second": s2},
         check("T3 人格已迁入 preset 角色（Avatar 的老 system_prompt）",
               "你是小暖" in (preset.get("system_prompt") or ""),
               repr(preset.get("system_prompt"))[:50])
-        check("T3 音色已迁入 preset 角色",
-              preset.get("tts_voice") == "zh-CN-XiaoxiaoNeural",
-              str(preset.get("tts_voice")))
+        # 2026-10-31 用户定调「开发测试阶段不留兼容代码」后，形象侧的音色
+        # **不再**往 preset 搬：音色归角色，形象那列已死（device_api 只读
+        # role.tts_voice）。所以老库 avatars.tts_voice 有值、preset 仍为空。
+        # 这条断言是**反向**的：它守的是"没人又把兜底搬回来"。
+        check("T3 形象音色**不再**迁入 preset（形象已不持有音色）",
+              not (preset.get("tts_voice") or "").strip(),
+              repr(preset.get("tts_voice")))
         # 老库里的 kind=='' 行被回填为 preset —— 它的 traits 是**空**的，
         # 因为那是历史角色、不是代码 seed 出来的平台预设（traits 默认值
         # 只在 _seed()新建行时写入）。这里断言"不为None"，不是"有10 项"。

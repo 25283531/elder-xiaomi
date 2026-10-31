@@ -59,29 +59,10 @@ class TraitSpec:
     true_text: str = ""
     false_text: str = ""
 
-    def coerce(self, value: Any) -> Any:
-        """把**历史值**归一到当前 kind 的形状。非 multi 原样返回。
-
-        存在的唯一理由：``topic_scope`` 从单选的 ``"medicine"`` 改成了多选的
-        ``["medicine"]``，而库里存着大量老的单选字符串。不兼容的话
-        ``is_valid`` 会把它们判成非法 —— 后果是 ``known_valid_traits``
-        把这条维度**丢掉**、``RoleSpec.validate()`` 直接抛错让整个角色编译失败。
-        表现是"升级完所有老角色的说话方式全变了"，而且日志里只有一行
-        "未知/非法 trait"。所以兼容必须做在这里，而不是要求用户去改数据。
-        """
-        if self.kind != "multi":
-            return value
-        if isinstance(value, str):
-            return [value] if value else []
-        if isinstance(value, (list, tuple)):
-            return [str(v) for v in value]
-        return value
-
     def normalize(self, value: Any) -> Any:
-        """去重 + 按 levels 声明顺序排序。多选存进 DB 前必须过这一道 ——
+        """去重 + 按 levels 声明顺序排序。多选值写进 DB 前必须过这一道 ——
         否则 ``["news","daily"]`` 与 ``["daily","news"]`` 会被当成两个不同的值
-        （"偏离默认"误报、prompt 字符串断言抖动）。"""
-        value = self.coerce(value)
+        （"偏离默认"误报、prompt 字符串断言抖动）。非多选原样返回。"""
         if self.kind != "multi" or not isinstance(value, list):
             return value
         order = {v: i for i, (v, _lab, _tx) in enumerate(self.levels)}
@@ -90,7 +71,6 @@ class TraitSpec:
     def is_valid(self, value: Any) -> bool:
         """值是否合法。非法值**必须报错而不是静默丢弃** ——
         静默丢弃意味着用户以为自己改了"话多程度"，实际没生效。"""
-        value = self.coerce(value)
         if self.kind == "enum":
             return isinstance(value, str) and any(v == value for v, _, _ in self.levels)
         if self.kind == "bool":
@@ -125,8 +105,7 @@ class TraitSpec:
                     return text
             return ""
         if self.kind == "multi":
-            texts = [text for v, _label, text in self.levels
-                     if v in self.normalize(value)]
+            texts = [text for v, _label, text in self.levels if v in value]
             # 逐条都写进 prompt，而不是只写"可以聊这些"这类概括 ——
             # 每个档位的文案本身就是可执行的行为描述，概括掉就没了。
             return "".join(texts)

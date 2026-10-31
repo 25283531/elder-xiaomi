@@ -254,11 +254,9 @@ def _seed() -> None:
                 # dict() 只拷外层，seed 出来的这一行会和模块常量**共享内层对象**，
                 # 之后任何一次就地修改都会污染"出厂默认"。
                 clips=normalize_clips(dict(DEFAULT_CLIPS)),
-                # 音色：这是**形象的默认音色**；角色自带音色时以角色的为准
-                # （见 routers/device_api.py 的 voice fallback）。
-                # ⚠️ 2026-10-31 起形象编辑界面**不再暴露音色**（音色归人格预设），
-                # 这一列只作为"角色没设音色"时的兜底保留。
-                tts_voice="zh-CN-XiaoxiaoNeural",
+                # 音色**不在这里设**：形象已不持有音色，音色只来自角色
+                # （device_api.sync 只读 role.tts_voice）。种子形象不写这一列，
+                # 免得下次有人看到库里有值又把它当兜底捡回来。
                 emotion_lights=normalize_lights(None),
             )
             db.add(av)
@@ -354,7 +352,7 @@ def _seed_migration() -> None:
 
     四步：
       1. 建母版：不存在 kind=='' 的 AIProvider 行时，建一条 preset 角色；
-      2. 迁人格：把 Avatar.system_prompt / tts_voice 写进preset 角色行
+      2. 迁人格：把 Avatar.system_prompt 写进 preset 角色行
          （**仅当目标为空时**才写，保证重复启动不会覆盖后来的运营修改）；
       3. 收权：Avatar.system_prompt 置空（不是删列 —— 本项目没有 Alembic，
          schema_patch 只能 ADD COLUMN，删列做不到；停用 + 迁移是唯一安全路径）；
@@ -392,15 +390,15 @@ def _seed_migration() -> None:
             log.info("migrate: created preset role id=%s", preset.id)
 
         # ---- 步骤 2：迁人格（仅当目标为空，避免覆盖后来的运营修改）----
+        # 只迁 system_prompt。形象侧的 tts_voice 已彻底停用（音色归角色），
+        # 不再从形象往 preset 搬 —— 搬过来只会让"形象里那个已经删不掉的老值"
+        # 继续影响设备发什么音色。
         migrated = 0
         for av in db.scalars(select(Avatar)).all():
             prompt = (av.system_prompt or "").strip()
             if prompt and not (preset.system_prompt or "").strip():
                 preset.system_prompt = prompt
                 migrated += 1
-            voice = (av.tts_voice or "").strip()
-            if voice and not (preset.tts_voice or "").strip():
-                preset.tts_voice = voice
 
         # ---- 步骤 4：绑定回填（先做，置空放在后面）----
         # 设备侧当前只下发 avatar（device_api.sync），不绑角色就拿不到 spec

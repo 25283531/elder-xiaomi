@@ -1891,15 +1891,11 @@ createApp({
       else l.interval_ms = Math.max(200, Math.min(5000, Math.round(n)));
     },
     editAvatar(a){
+      // 形象不含音色：音色归人格预设。这里不再对 tts_voice 做任何回落/回传，
+      // 提交时也不会带上它 —— 让后端 PATCH 走 exclude_unset 根本不碰那一列。
       this.aForm = a ? JSON.parse(JSON.stringify(a))
-                     : {name:'', description:'', tts_voice:'', clips:{}, emotion_lights:{}};
-      // tts_voice 仍要原样回传（后端拿它做兜底音色），所以这里保留回落逻辑；
-      // 只是弹窗里不再给编辑入口。
-      const old = this.aForm.tts_voice || '';
-      if (this.clampVoice(this.aForm)){
-        this.setFlash('原音色「' + old + '」已不在当前语音服务的清单里，'
-                    + '已自动改为默认音色「' + this.voiceLabel(this.aForm.tts_voice) + '」，保存后生效。');
-      }
+                     : {name:'', description:'', clips:{}, emotion_lights:{}};
+      delete this.aForm.tts_voice;
       // 必须在 aBox=true 之前补齐：模板里直接读 emotion_lights[st.key].preset，
       // 晚一步就会在首帧拿到 undefined 而报错。
       this.fillClips();
@@ -1914,9 +1910,6 @@ createApp({
       // 库里已有的 clips / emotion_lights。宁可这一项不带，也不能拿空值覆盖。
       if (!body.clips || !Object.keys(body.clips).length) delete body.clips;
       if (!body.emotion_lights || !Object.keys(body.emotion_lights).length) delete body.emotion_lights;
-      // tts_voice 必须原样回传：弹窗里已经没有它的编辑入口了，但后端拿它做兜底音色，
-      // 漏传等于把兜底音色清空。
-      body.tts_voice = this.aForm.tts_voice || '';
       try{
         if (this.aForm.id) await this.api('/api/avatars/'+this.aForm.id, {method:'PATCH', body:JSON.stringify(body)});
         else await this.api('/api/avatars', {method:'POST', body:JSON.stringify(body)});

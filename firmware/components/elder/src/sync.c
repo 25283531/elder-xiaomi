@@ -22,6 +22,7 @@
 #include "elder_net.h"
 #include "elder_reminder.h"
 #include "elder_rtc.h"
+#include "elder_rgb.h"           /* 灯效表：服务端下发的 7 个状态灯效 */
 #include "elder_wifi_change.h"   /* 远程改 WiFi：试连/回滚 + 终态回报 */
 
 static const char *TAG = "elder.sync";
@@ -1217,6 +1218,152 @@ static void apply_remote_confirms(cJSON *root)
     }
 }
 
+/* ================================================================ 灯效表
+ *
+ * 服务端 `server/app/avatar_style.py` 是预置清单的唯一真源，下发时已经把
+ * "预置 id" 展开成 effect/rgb/亮度/间隔 —— 设备不需要知道那个预置叫什么名字，
+ * 也就不会出现"固件里的预置清单和服务端不一致"。
+ *
+ * 下发的 JSON 形如：
+ *   "lights": {
+ *     "neutral":  {"effect":"starlight","rgb":"#4A90D9","brightness":60,"interval_ms":800},
+ *     "listening":{...}, "speaking":{...}, "happy":{...},
+ *     "sad":{...}, "angry":{...}, "alert":{...}
+ *   }
+ *
+ * 键名必须与 elder_rgb_state_t 一一对应。这张表放在**文件级静态区**而不是
+ * 函数栈：84 字节，够小，但同步任务的栈本来就只有几 KB，
+ * 而"数组上栈"在本仓已经出过事（见 ELDER_REMINDER_MAX 那条教训）。
+ */
+static elder_rgb_cfg_item_t s_light_cfg[ELDER_RGB_ST_COUNT];
+
+static const struct {
+    const char      *key;
+    elder_rgb_state_t st;
+} k_light_keys[] = {
+    { "neutral",   ELDER_RGB_ST_NEUTRAL   },
+    { "listening", ELDER_RGB_ST_LISTENING },
+    { "speaking",  ELDER_RGB_ST_SPEAKING  },
+    { "happy",     ELDER_RGB_ST_HAPPY     },
+    { "sad",       ELDER_RGB_ST_SAD       },
+    { "angry",     ELDER_RGB_ST_ANGRY     },
+    { "alert",     ELDER_RGB_ST_ALERT     },
+};
+
+/* 键表项数必须与枚举项数严格相等：少一项 = 那个状态永远拿不到下发值
+ * （表现是"只有某一种状态改了不生效"）；多一项 = 写 s_light_cfg 越界。
+ * 编译期钉死 —— 键名和枚举是两份手写清单，靠 review 数不出来的。 */
+_Static_assert(sizeof(k_light_keys) / sizeof(k_light_keys[0]) == ELDER_RGB_ST_COUNT,
+               "k_light_keys 必须与 elder_rgb_state_t 一一对应（7 项）");
+
+/* effect 解析的"没认出来"哨兵。
+ *
+ * **绝不能**用 0 当哨兵：0 就是 ELDER_FX_SOLID，服务端把 "breath" 拼成
+ * "breathh"、或者哪天加了个固件还不认识的新灯效，用户看到的就从"呼吸"
+ * 静默变成"一直亮着"，而日志里一切正常 —— 这种"配置拼错一个词 = 灯常亮"
+ * 的降级方向是最坏的（夜里刺眼，且没人能排查出来）。
+ * 取值避开 ELDER_FX_*（0~7）与 ELDER_RGB_EFFECT_OFF（0xFF）。 */
+#define LIGHT_EFFECT_KEEP 0xFEu
+
+/** 服务端 5 个 effect 字符串 → 固件灯效枚举。认不出返回 LIGHT_EFFECT_KEEP（保留默认）。 */
+static uint8_t light_effect_from_str(const char *s)
+{
+    if (!s) return LIGHT_EFFECT_KEEP;
+    if (strcmp(s, "off") == 0)       return ELDER_RGB_EFFECT_OFF;
+    if (strcmp(s, "solid") == 0)     return (uint8_t)ELDER_FX_SOLID;
+    if (strcmp(s, "breath") == 0)    return (uint8_t)ELDER_FX_BREATH;
+    if (strcmp(s, "blink") == 0)     return (uint8_t)ELDER_FX_BLINK_FAST;
+    if (strcmp(s, "starlight") == 0) return (uint8_t)ELDER_FX_TWINKLE;
+    return LIGHT_EFFECT_KEEP;
+}
+
+/** "RRGGBB" / "#RRGGBB" → 0xRRGGBB。
+ *
+ * 格式不对返回 0（= 灯效自定色，不写死一个错误颜色）。
+ * '#' 前缀**可选**：服务端现在带 #，但少一个 # 就把常亮变成"黑色"（灯灭）
+ * 是毫无道理的降级 —— 两个都是同一个颜色，没理由只认一种写法。
+ * 长度必须**正好** 6 位：短的（"#F00"）和长的（"#FF00000"）都当非法，
+ * 免得把 #F00 读成 0x0F0000 这种既不是用户选的、也不报错的颜色。 */
+static uint32_t light_rgb_from_str(const char *s)
+{
+    if (!s) return 0u;
+    if (s[0] == '#') s++;
+    uint32_t v = 0u;
+    for (int i = 0; i < 6; i++) {
+        const char ch = s[i];
+        uint32_t d;
+        if (ch >= '0' && ch <= '9')      d = (uint32_t)(ch - '0');
+        else if (ch >= 'a' && ch <= 'f') d = (uint32_t)(ch - 'a' + 10);
+        else if (ch >= 'A' && ch <= 'F') d = (uint32_t)(ch - 'A' + 10);
+        else return 0u;                  /* 含 '\0'：串短于 6 位 */
+        v = (v << 4) | d;
+    }
+    return (s[6] == '\0') ? v : 0u;      /* 串长于 6 位也算非法 */
+}
+
+/** 解析并应用下发的灯效表。缺项回落内置默认，整表要么全换要么不换。 */
+static void apply_lights(cJSON *lights)
+{
+    if (!cJSON_IsObject(lights)) return;
+
+    elder_rgb_get_default_config(s_light_cfg);
+    int seen = 0;
+
+    for (size_t i = 0; i < sizeof(k_light_keys) / sizeof(k_light_keys[0]); i++) {
+        cJSON *it = cJSON_GetObjectItem(lights, k_light_keys[i].key);
+        if (!cJSON_IsObject(it)) continue;
+        elder_rgb_cfg_item_t *dst = &s_light_cfg[k_light_keys[i].st];
+
+        cJSON *eff = cJSON_GetObjectItem(it, "effect");
+        if (cJSON_IsString(eff)) {
+            const uint8_t fx = light_effect_from_str(eff->valuestring);
+            if (fx != LIGHT_EFFECT_KEEP) {
+                dst->effect = fx;
+            } else {
+                /* 认不出的 effect 保留内置默认，**不退回常亮** */
+                ESP_LOGW(TAG, "状态 %s 的 effect=\"%s\" 不认识，保留默认灯效",
+                         k_light_keys[i].key, eff->valuestring);
+            }
+        }
+
+        cJSON *rgb = cJSON_GetObjectItem(it, "rgb");
+        if (cJSON_IsString(rgb)) dst->color = light_rgb_from_str(rgb->valuestring);
+
+        /* brightness 是 1~100 的百分比，固件要 0~255 的感知亮度。
+         * 下限钳到 20（≈8%）：低于它 gamma 表里直接是 0，灯根本不亮，
+         * 用户会以为"设了个亮度反而灯坏了"。硬件下限，不是我们在偷懒。 */
+        cJSON *br = cJSON_GetObjectItem(it, "brightness");
+        if (cJSON_IsNumber(br)) {
+            int b = br->valueint;
+            if (b < 1) b = 1;
+            if (b > 100) b = 100;
+            int lv = b * 255 / 100;
+            if (lv < 20) lv = 20;
+            dst->level = (uint8_t)lv;
+        }
+
+        cJSON *iv = cJSON_GetObjectItem(it, "interval_ms");
+        if (cJSON_IsNumber(iv)) {
+            int p = iv->valueint;
+            if (p < 0) p = 0;
+            if (p > 65535) p = 65535;
+            dst->period_ms = (uint16_t)p;
+        }
+        seen++;
+    }
+
+    if (!seen) {
+        /* 一个都没认出来 ⇒ 大概率是键名改过。这时候**不要**把默认表应用下去，
+         * 那等于把用户已经调好的灯效悄悄恢复出厂，而且日志里只有一行"应用了"。 */
+        ESP_LOGW(TAG, "lights 下发里没有可识别的状态键，本次忽略（沿用上一份配置）");
+        return;
+    }
+
+    elder_rgb_apply_config(s_light_cfg);
+    ESP_LOGI(TAG, "灯效表：收到 %d/%d 项，已应用", seen,
+             (int)(sizeof(k_light_keys) / sizeof(k_light_keys[0])));
+}
+
 static esp_err_t do_sync(void)
 {
     static char *resp = NULL;
@@ -1428,6 +1575,11 @@ static esp_err_t do_sync(void)
                  cJSON_IsString(nm) ? nm->valuestring : "-",
                  cJSON_IsString(pack) ? pack->valuestring : "-");
     }
+
+    /* 6b) 灯效表。**必须在这里**（cJSON_Delete 之前）。
+     *     放在 avatar 之后而不是之前：形象名先打日志，灯效应用会打自己的
+     *     日志，两行顺序与"先看是谁、再看它长什么样"的排查习惯一致。 */
+    apply_lights(cJSON_GetObjectItem(root, "lights"));
     cJSON *ws = cJSON_GetObjectItem(root, "ws_url");
     if (cJSON_IsString(ws)) ESP_LOGD(TAG, "xiaozhi ws=%s", ws->valuestring);
 

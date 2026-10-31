@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from .. import models
 from .. import geo
 from .. import reminder_audit
+from ..avatar_style import normalize_lights
 from ..config import (
     PUBLIC_BASE_URL,
     SCHEDULE_AHEAD_HOURS,
@@ -375,12 +376,29 @@ def sync(request: Request, fw_version: str = "", hw_model: str = "",
     quota = DeviceQuotaOut(**quota_snapshot(db, device_ids=[dev.id],
                                             authorized=dev.owner_id is not None))
     ws_url, ota_url = _voice_endpoints(request)
-    # 音色回落：**角色优先，形象兜底**（架构 §4.2）。
-    # 角色有自己选定的音色时用它；没选（或角色缺失/已删）才用形象的默认音色。
-    # 放在这里而不是存储层，是为了让 avatar 段保持"这个形象长什么样"的语义，
-    # 而音色是"这台设备现在该用谁的声音" —— 随角色变，不随形象变。
-    voice = (role.tts_voice if role is not None else "") or \
-            (avatar.tts_voice if avatar is not None else "")
+    # 音色**只来自角色**（架构 §4.2）。形象不再持有音色 —— 之前那条
+    # 「角色优先、形象兜底」是为了让老数据平滑过渡，现在形象侧的音色已彻底
+    # 摘掉（表单不下发、列不再被读），留着兜底只会让"改了角色没变声"多一个
+    # 无法排查的来源。角色缺失/已删 ⇒ 空串，设备按厂商默认音色播。
+    voice = role.tts_voice if role is not None else ""
+
+    # ---- 灯效表（2026-10-31）----
+    # 形象上配的 7 个状态灯效，展开成设备能直接用的 4 个字段。
+    # 形象缺失（没绑 / 已软删）时**用出厂默认**而不是不下发 —— 设备没有形象
+    # 也得亮灯，不下发会让它退回内置默认，两边就悄悄不一致了。
+    #
+    # preset 刻意丢掉：它是"给人挑的那一项"，下发前已经展开成具体值。
+    # 设备存一个预置 id 只会引入第二份清单（加个预置就两边不一致）。
+    lights = {
+        key: {
+            "effect": v["effect"],
+            "rgb": v["rgb"],
+            "brightness": v["brightness"],
+            "interval_ms": v["interval_ms"],
+        }
+        for key, v in normalize_lights(
+            avatar.emotion_lights if avatar is not None else None).items()
+    }
 
     # ---- 改 WiFi 下发（契约见 build-out/_wifi-spec.md §一）----
     #
@@ -415,6 +433,7 @@ def sync(request: Request, fw_version: str = "", hw_model: str = "",
         ota_url=ota_url,
         quota=quota,
         tts_voice=voice,
+        lights=lights,
         timezone=tz_name,
         tz_offset_minutes=tz_offset,
         wifi_change=wifi_change,

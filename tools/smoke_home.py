@@ -376,6 +376,53 @@ def main() -> int:
         check("device_time 与 last_seen_at 一致", d3.get("device_time") == d3.get("last_seen_at"),
               f"{d3.get('device_time')} vs {d3.get('last_seen_at')}")
 
+        # ==================================================== 3.5 灯效下发
+        # 2026-10-31：形象上配的 7 个状态灯效开始由 device.sync 下发。
+        # 在此之前 `emotion_lights` 在服务端只有 CRUD、固件也没人消费 ——
+        # 用户在界面上调完灯效、点了保存，设备一点变化都没有，而且**全链路
+        # 没有任何报错**。这类"写了不跑"的缺陷只能靠端到端断言挡住。
+        lights = (sync or {}).get("lights")
+        check("心跳返回体带 lights 段", isinstance(lights, dict), type(lights).__name__)
+        # 键名必须与固件 elder_rgb_state_t / sync.c 的 k_light_keys 一一对应。
+        # 少一个键 ⇒ 那个状态永远拿不到下发值（表现是"只有某一种状态改了不生效"）。
+        want_states = {"neutral", "listening", "speaking", "happy", "sad", "angry", "alert"}
+        check("lights 恰好 7 个状态且键名与固件一致",
+              set(lights or {}) == want_states,
+              ",".join(sorted(lights or {})))
+        # preset 刻意不下发：它是"给人挑的那一项"，下发前已展开成具体值。
+        # 设备存预置 id 只会引入第二份清单（加一个预置就两边不一致）。
+        check("lights 每项只有 4 个字段（不下发 preset）",
+              all(set(v or {}) == {"effect", "rgb", "brightness", "interval_ms"}
+                  for v in (lights or {}).values()),
+              str(next(iter((lights or {}).values()), {})))
+
+        # 改形象上的灯效 → 再心跳，必须原样出现在下发里。
+        # 只断言"字段齐"是不够的：那样把 normalize 写成"永远返回默认表"也能过，
+        # 而用户改了灯效不生效正是这个现象。
+        code, av = req("POST", "/api/avatars", {
+            "name": "灯效测试形象",
+            "emotion_lights": {
+                "neutral": {"preset": "", "rgb": "#123456", "effect": "blink",
+                            "brightness": 42, "interval_ms": 1500},
+            },
+        }, u1)
+        av_pk = av.get("id", 0)
+        check("u1 能建自己的形象（灯效夹具）", code == 201 and bool(av_pk), f"code={code}")
+        code, _ = req("PATCH", f"/api/devices/{dev_pk}", {"avatar_id": av_pk}, u1)
+        check("把形象应用到设备", code == 200, str(code))
+        code, sync2 = req("POST", "/api/device/sync?fw_version=0.1.0", {}, dev_token)
+        l2 = ((sync2 or {}).get("lights") or {}).get("neutral") or {}
+        check("★ 改过的灯效真的下发了（neutral 四项逐字段相等）",
+              code == 200
+              and l2.get("effect") == "blink" and l2.get("rgb") == "#123456"
+              and l2.get("brightness") == 42 and l2.get("interval_ms") == 1500,
+              str(l2))
+        # 没配的状态要给默认值而不是缺项 —— 缺项在固件里等于"该状态没有灯效"。
+        l2sad = ((sync2 or {}).get("lights") or {}).get("sad") or {}
+        check("未配置的状态也下发了（补默认，不缺项）",
+              l2sad.get("effect") in {"off", "solid", "breath", "blink", "starlight"},
+              str(l2sad))
+
         # ==================================================== 4. agent 角色字段
         # 角色走 /api/roles（平台配置走 /api/providers，两者已彻底拆分：
         # /api/providers 只接受带 kind 的平台配置，角色建在它上面会被 422）。

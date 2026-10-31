@@ -878,13 +878,7 @@ def role_diff(role_pk: int, db: Session = Depends(get_db),
     for name in catalog.TRAIT_NAMES:
         in_overlay = name in overlay
         parent_value = parent_traits.get(name)
-        # 比较前必须归一：topic_scope 改多选后，母版里可能还是单选字符串
-        # "daily"，而 overlay 里已经是 ["daily"] —— 直接 != 会把"完全没改"
-        # 报成"你改了 1 项"，而用户看着两个一模一样的值无从下手。
-        spec_obj = catalog.TRAIT_SPECS[name]
-        same = (spec_obj.normalize(overlay[name]) == spec_obj.normalize(parent_value)
-                if in_overlay else False)
-        if in_overlay and not same:
+        if in_overlay and overlay[name] != parent_value:
             items.append(RoleDiffItem(
                 field=f"traits.{name}",
                 label=catalog.TRAIT_SPECS[name].label,

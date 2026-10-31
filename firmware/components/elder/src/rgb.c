@@ -26,6 +26,13 @@ typedef struct {
     elder_rgb_fx_t  fx;
     uint32_t        color;
     uint8_t         level;       /* 0~255 统一亮度，见 elder_rgb_request_ex */
+    /* 呼吸 / 闪烁 / 星光的周期，0 = 用该灯效的内置默认。
+     *
+     * 为什么周期跟着**槽位**走而不是从配置表里现查：槽位是"这一次渲染要
+     * 用的参数"的快照。若在 fx_pixel 里回查配置表，用户改配置的那一瞬间
+     * 正在播的灯效周期会突变（呼吸从 2.4s 跳到 5s），看着像卡了一下。
+     * 快照进槽位则"新配置从下一次 request 起生效"，边界清晰。 */
+    uint16_t        period_ms;
     uint32_t        expire_ms;   /* 0 = 常驻 */
 } slot_t;
 
@@ -189,6 +196,20 @@ static struct {
     bool                  idle_dim;
     uint32_t              idle_since_ms;
 
+    /* ---- 服务端下发的灯效表（2026-10-31，见 elder_rgb.h）----
+     *
+     * cfg_valid 为假时所有状态走内置默认值（= 服务端从没下发过，
+     * 或者下发的内容不完整）。这两个字段合起来是"有没有配置"的**唯一**
+     * 判据，不要再用"某项 period 是不是 0"之类的推断 —— 0 是合法的
+     * "用默认"语义，推断会把它当成没配置。
+     */
+    elder_rgb_cfg_item_t  cfg[ELDER_RGB_ST_COUNT];
+    bool                  cfg_valid;
+    /* 当前状态。apply_config 收到新配置时要按它重放一次，
+     * 否则新配置得等用户再说一句话才生效，看起来像"保存没反应"。 */
+    elder_rgb_state_t     cur_state;
+    bool                  cur_valid;
+
     /* #1 按键指示灯状态机 */
     btn_mode_t            btn_mode;
     bool                  btn_pending;    /* 存在待确认提醒（吸引注意态的真源） */
@@ -210,6 +231,34 @@ static struct {
     uint32_t              btn_anim_ms;    /* 渲染时钟：只在真的渲染时前进 */
     uint32_t              btn_last_step_ms; /* 上次步进时的墙上时钟，用于算 dt */
 } g;
+
+/* ---- 内置默认灯效表（服务端从没下发过时用）----
+ *
+ * 数值全部沿用 2026-10-27 / 10-28 定下的产品观感，改它们等于改产品行为。
+ * 这张表**只是默认值**，不是第二份真源：一旦服务端下发，整表被替换
+ * （见 elder_rgb_apply_config），此后判断只看 g.cfg_valid。
+ */
+static const elder_rgb_cfg_item_t k_default_cfg[ELDER_RGB_ST_COUNT] = {
+    /* 待机：闪烁星光，60% 起步（1 分钟后由 rgb_task 相对降半） */
+    [ELDER_RGB_ST_NEUTRAL]   = { ELDER_FX_TWINKLE, 0u,
+                                 ELDER_UI_LEVEL_IDLE_BOOST, ELDER_TWINKLE_PERIOD_MS },
+    [ELDER_RGB_ST_LISTENING] = { ELDER_FX_SOLID, ELDER_UI_COLOR_LISTENING,
+                                 ELDER_UI_LEVEL_LISTENING, 0u },
+    [ELDER_RGB_ST_SPEAKING]  = { ELDER_FX_SOLID, ELDER_UI_COLOR_SPEAKING,
+                                 ELDER_UI_LEVEL_SPEAKING, 0u },
+    [ELDER_RGB_ST_HAPPY]     = { ELDER_FX_SOLID, 0x00C853u, ELDER_UI_FULL_LEVEL, 0u },
+    [ELDER_RGB_ST_SAD]       = { ELDER_FX_SOLID, 0x2962FFu, ELDER_UI_FULL_LEVEL, 0u },
+    [ELDER_RGB_ST_ANGRY]     = { ELDER_FX_SOLID, 0xD50000u, ELDER_UI_FULL_LEVEL, 0u },
+    /* 提醒警示：红色 + 500ms 周期（闪灯节奏用它，见 rgb_task 的 nag 分支） */
+    [ELDER_RGB_ST_ALERT]     = { ELDER_FX_SOLID, 0xFF0000u, ELDER_UI_FULL_LEVEL, 500u },
+};
+
+/* 取某个状态的**生效**配置：有下发用下发的，没有用内置默认。 */
+static elder_rgb_cfg_item_t cfg_of(elder_rgb_state_t st)
+{
+    if (st < 0 || st >= ELDER_RGB_ST_COUNT) st = ELDER_RGB_ST_NEUTRAL;
+    return g.cfg_valid ? g.cfg[st] : k_default_cfg[st];
+}
 
 static uint32_t now_ms(void)
 {
@@ -381,15 +430,30 @@ static uint32_t fx_pixel(const slot_t *s, uint32_t t_ms, int led_idx)
 
     switch (s->fx) {
     case ELDER_FX_BREATH: {
-        /* 2.4s 一个呼吸周期（三角波） */
-        uint32_t phase = t_ms % 2400u;
-        mod = (phase < 1200u) ? (phase * 255u / 1200u)
-                              : ((2400u - phase) * 255u / 1200u);
+        /* 默认 2.4s 一个呼吸周期（三角波）；周期由槽位带，
+         * 服务端把"间隔"配成多少就呼吸多慢。
+         *
+         * 下限 100ms 是**除零保护**，不是审美：per=1 时 half=0，下面两个
+         * 除法会直接触发 IntegerDivideByZero panic（真机表现是重启一次）。
+         * 周期来自网络，不能假设服务端一定钳在 200ms 以上。 */
+        uint32_t per = s->period_ms ? s->period_ms : 2400u;
+        if (per < 100u) per = 100u;
+        const uint32_t half = per / 2u;
+        uint32_t phase = t_ms % per;
+        mod = (phase < half) ? (phase * 255u / half)
+                             : ((per - phase) * 255u / half);
         break;
     }
-    case ELDER_FX_BLINK_FAST:
-        mod = ((t_ms % 500u) < 250u) ? 255u : 0u;
+    case ELDER_FX_BLINK_FAST: {
+        /* 默认 500ms 一个周期（亮一半灭一半）。周期同样由槽位带。
+         * ⚠️ 亮灭各占一半是**产品语义**（"闪"要能看出节奏），
+         *    不是随手写的：改成一亮多灭会变成"偶尔亮一下"，
+         *    老人会当成设备抽风。 */
+        uint32_t per = s->period_ms ? s->period_ms : 500u;
+        if (per < 100u) per = 100u;   /* 同上：per<2 时 per/2=0 ⇒ 恒灭，看起来像灯坏了 */
+        mod = ((t_ms % per) < (per / 2u)) ? 255u : 0u;
         break;
+    }
     case ELDER_FX_CHASE: {
         /* **从 #2 到 #9 轮流亮起**：同一时刻只有一颗亮，位置每
          * ELDER_CHASE_STEP_MS 前进一格，8 颗循环。
@@ -425,7 +489,22 @@ static uint32_t fx_pixel(const slot_t *s, uint32_t t_ms, int led_idx)
          *
          * 位段选取（0x3FF/0xFF/0x1FF 之类）只是取模，散列已经雪崩过，
          * 取任意段都独立。 */
-        const uint32_t cyc = t_ms / ELDER_TWINKLE_PERIOD_MS;   /* 第几闪 */
+        /* 节拍：默认 2 秒一格（2026-10-29 用户二次调整，原来 4 秒一格）。
+         * 2026-10-31 起周期可由服务端配（"星光的闪烁间隔"），槽位带过来。 */
+        uint32_t per = s->period_ms ? s->period_ms : ELDER_TWINKLE_PERIOD_MS;
+        /* 下限 200ms（= 服务端 INTERVAL_MIN）：既保证下面的除法不为 0，
+         * 也保证"格内抖动 + 点亮时长"仍然装得进一格。 */
+        if (per < 200u) per = 200u;
+        /* 抖动上限、单次点亮时长都按周期**等比**缩放，否则把周期配成
+         * 200ms 时抖动仍是 1000ms（跨了 5 格）会算出一堆负的 dt，
+         * 表现为"配了快闪反而不闪"。 */
+        const uint32_t jit_max = per / 2u;
+        uint32_t on_ms = per / 8u;
+        if (on_ms < 100u) on_ms = 100u;      /* 再短人眼只看到一下亮 */
+        if (on_ms > 600u) on_ms = 600u;      /* 再长就不像"一闪"了 */
+        if (on_ms > jit_max) on_ms = jit_max;/* 守住不变量：jit + on < per */
+
+        const uint32_t cyc = t_ms / per;                       /* 第几闪 */
         const uint32_t h   = hash32(cyc);
 
         /* 谁亮：#2~#9 里挑一颗（led_idx 的有效段是 1..ELDER_RGB_LEDS-1）。
@@ -449,17 +528,24 @@ static uint32_t fx_pixel(const slot_t *s, uint32_t t_ms, int led_idx)
 
         /* 格内抖动：决定这一闪的起始时刻。上限 + ON 必须 < PERIOD，
          * 否则会跨格、出现两闪重叠或某格不闪。 */
-        const uint32_t jit   = (h >> 10) % ELDER_TWINKLE_JITTER_MS;
-        const uint32_t start = cyc * ELDER_TWINKLE_PERIOD_MS + jit;
+        const uint32_t jit   = (h >> 10) % (jit_max ? jit_max : 1u);
+        const uint32_t start = cyc * per + jit;
 
         int32_t dt = (int32_t)(t_ms - start);
-        if (dt < 0 || dt >= (int32_t)ELDER_TWINKLE_ON_MS) return 0u;  /* 其余时间灭 */
+        if (dt < 0 || dt >= (int32_t)on_ms) return 0u;  /* 其余时间灭 */
 
-        mod = 255u - (uint32_t)dt * 255u / ELDER_TWINKLE_ON_MS;  /* 亮起最亮，线性渐隐 */
+        mod = 255u - (uint32_t)dt * 255u / on_ms;  /* 亮起最亮，线性渐隐 */
 
-        /* 颜色：饱和度 220（不是 255）—— 纯饱和彩点在暗环境里仍然刺眼，
+        /* 颜色：服务端配了颜色就用它（"星光·紫"这种预置要能看出来），
+         * 没配（color == 0）才走随机彩点。
+         *
+         * 随机色时饱和度取 220（不是 255）—— 纯饱和彩点在暗环境里仍然刺眼，
          * 略降一点更像"星光"。色相取 h 的高段，与 who/jit 用的低段无关。 */
-        c = hsv2rgb((uint16_t)((h >> 20) % 360u), 220, 255);
+        if (s->color) {
+            c = s->color;
+        } else {
+            c = hsv2rgb((uint16_t)((h >> 20) % 360u), 220, 255);
+        }
         break;
     }
     case ELDER_FX_METEOR: {
@@ -656,17 +742,23 @@ static void rgb_task(void *arg)
             int prio = -1;
             has_fx = active_slot(&s, t_ms, &prio);
 
-            /* 待机降亮：进待机的前 ELDER_IDLE_BOOST_MS 用 60%，之后 30%。
+            /* 待机降亮：进待机的前 ELDER_IDLE_BOOST_MS 用满亮度，之后减半。
              *
              * 为什么在这里改 s.level 而不是让上层再调一次 set_ui_state：
              *   待机期间**没有任何上层任务在跑**（会话已结束、唤醒词还没来），
              *   没人能来改。放在渲染循环里是唯一的做法，且不引入定时器/新任务。
              *
              * 只认"待机星光"这一种：条件里带 s.fx == ELDER_FX_TWINKLE，
-             * 这样别人用 TWINKLE 做别的灯效时不会被误降亮。 */
+             * 这样别人用 TWINKLE 做别的灯效时不会被误降亮。
+             *
+             * 2026-10-31：改成**相对**降亮（×1/2），不再是写死成
+             * ELDER_UI_LEVEL_IDLE。因为亮度现在由服务端配 —— 写死的话
+             * 用户把待机亮度调到 80%，一分钟后灯还是掉到 30%，看起来像
+             * "设了不生效"。相对降亮两个诉求都满足：配置说了算，
+             * 夜里也不会刺眼。 */
             if (g.idle_dim && has_fx && s.fx == ELDER_FX_TWINKLE
                 && (int32_t)(t_ms - g.idle_since_ms) >= (int32_t)ELDER_IDLE_BOOST_MS) {
-                s.level = ELDER_UI_LEVEL_IDLE;
+                s.level = (uint8_t)((uint32_t)s.level / 2u);
             }
 
             /* 需求 8：提醒闪灯（每 10 分钟的前 10 秒，共 2 小时）。
@@ -683,9 +775,13 @@ static void rgb_task(void *arg)
                     g.nag_active = false;
                     ESP_LOGI(TAG, "提醒闪灯已满 2 小时，熄灭");
                 } else if ((el % ELDER_NAG_PERIOD_MS) < ELDER_NAG_BLINK_MS) {
-                    /* 0.5s 亮 / 0.5s 灭，10 秒共 10 个周期 */
+                    /* 0.5s 亮 / 0.5s 灭，10 秒共 10 个周期。
+                     * 颜色与周期都取"提醒警示"那一项配置 —— 用户在形象页
+                     * 给"提醒警示"选了什么，闪灯就是什么。 */
+                    const elder_rgb_cfg_item_t ac = cfg_of(ELDER_RGB_ST_ALERT);
+                    const uint32_t nper = ac.period_ms ? ac.period_ms : 500u;
                     has_nag = true;
-                    nag_color = ((t_ms % 500u) < 250u) ? 0xFF0000u : 0u;
+                    nag_color = ((t_ms % nper) < (nper / 2u)) ? ac.color : 0u;
                 }
             }
 
@@ -783,6 +879,9 @@ esp_err_t elder_rgb_request_ex(elder_rgb_prio_t prio, elder_rgb_fx_t fx,
     dst->fx = fx;
     dst->color = color;
     dst->level = level;
+    /* 这个入口不带周期（周期是"状态灯效表"的属性，见 request_state）。
+     * 必须显式清零：槽位是复用的，不清零就会沿用上一任留下的周期。 */
+    dst->period_ms = 0;
     dst->expire_ms = ttl_ms ? t_ms + ttl_ms : 0;
     xSemaphoreGive(g.lock);
     return ESP_OK;
@@ -807,6 +906,69 @@ void elder_rgb_release(elder_rgb_prio_t prio)
 }
 
 /* ---- 对话四态（2026-10-28 用户最终定义，见 elder_rgb.h） ---- */
+
+/* 按"状态灯效表"里的某一项发起请求。
+ *
+ * 2026-10-31 之前这里是 switch 里逐条写死 rgb/亮度，服务端下发的配置
+ * 完全用不上。现在所有状态都从这里出，只有一个出口 ⇒ 不可能出现
+ * "某个状态忘了接配置"（那种 bug 表现为"只有开心是新的颜色，别的没变"，
+ * 极难联想到配置没接上）。
+ *
+ * effect 为 OFF 时**不是**发一个黑色常亮，而是 release：常亮黑会让
+ * 那一路灯占着槽位，把更高优先级的提醒顶下去。 */
+static void request_state_at(elder_rgb_prio_t prio, elder_rgb_state_t st)
+{
+    const elder_rgb_cfg_item_t c = cfg_of(st);
+
+    /* 记录当前状态，供 apply_config 收到新配置时重放。
+     * 只记 EMOTION 那一路：MED_PEND / ALARM 由提醒模块自己的时序驱动，
+     * 配置到达时重放它们等于"把正在响的提醒又点亮一次"，没有意义。 */
+    if (g.ready && prio == ELDER_RGB_PRIO_EMOTION) {
+        xSemaphoreTake(g.lock, portMAX_DELAY);
+        g.cur_state = st;
+        g.cur_valid = true;
+        /* 待机降亮的计时基准跟着状态走：非待机一律算"刚活动过"。
+         * 不在这里清的话，开心/难过/生气走的是本函数、不经过
+         * elder_rgb_set_ui_state，g.idle_dim 会一直是 true；等回到待机时
+         * set_ui_state 认为"本来就已待机"而不重置 idle_since_ms，
+         * 灯会**立刻**减半，看不到那 1 分钟的满亮度确认窗口。 */
+        if (st != ELDER_RGB_ST_NEUTRAL) g.idle_dim = false;
+        xSemaphoreGive(g.lock);
+    }
+
+    if (c.effect == ELDER_RGB_EFFECT_OFF) {
+        elder_rgb_release(prio);
+        return;
+    }
+
+    if (!g.ready) return;
+    /* 直接写槽位而不是复用 elder_rgb_request_ex：周期是这张表的属性，
+     * request_ex 的签名里没有它，而给公开接口加参数会牵连所有调用方。 */
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    slot_t *dst = NULL;
+    for (int i = 0; i < ELDER_RGB_SLOTS; i++) {
+        if (g.slots[i].used && g.slots[i].prio == (int)prio) {
+            dst = &g.slots[i]; break;
+        }
+        if (!g.slots[i].used && !dst) dst = &g.slots[i];
+    }
+    if (dst) {
+        dst->used      = true;
+        dst->prio      = (int)prio;
+        dst->fx        = (elder_rgb_fx_t)c.effect;
+        dst->color     = c.color;
+        dst->level     = c.level;
+        dst->period_ms = c.period_ms;
+        dst->expire_ms = 0;      /* 常驻：待机是长期状态，灯不能自己灭 */
+    }
+    xSemaphoreGive(g.lock);
+}
+
+static void request_state(elder_rgb_state_t st)
+{
+    request_state_at(ELDER_RGB_PRIO_EMOTION, st);
+}
+
 void elder_rgb_set_ui_state(elder_rgb_ui_t st)
 {
     /* 四个状态共用一个槽位（ELDER_RGB_PRIO_EMOTION）⇒ 切换就是替换。
@@ -818,8 +980,8 @@ void elder_rgb_set_ui_state(elder_rgb_ui_t st)
     if (g.ready) {
         xSemaphoreTake(g.lock, portMAX_DELAY);
         /* 待机降亮的计时基准：**每次从别的状态回到待机都重新起算**。
-         * 这样"老人刚说完话、放下设备"时灯是亮的（60%），他能确认设备
-         * 已经回到待机；1 分钟后才悄悄降到 30%，夜里不刺眼。 */
+         * 这样"老人刚说完话、放下设备"时灯是亮的，他能确认设备
+         * 已经回到待机；1 分钟后才悄悄降半，夜里不刺眼。 */
         if (st == ELDER_RGB_UI_IDLE) {
             if (!g.idle_dim) g.idle_since_ms = now_ms();
             g.idle_dim = true;
@@ -830,42 +992,30 @@ void elder_rgb_set_ui_state(elder_rgb_ui_t st)
     }
 
     switch (st) {
-    case ELDER_RGB_UI_LISTENING:
-        /* 深天蓝 #00BFFF，55%，常亮。色相是语义（蓝 = 正在听），
-         * 觉得亮就调 ELDER_UI_LEVEL_LISTENING，别改颜色。 */
-        elder_rgb_request_ex(ELDER_RGB_PRIO_EMOTION, ELDER_FX_SOLID,
-                             ELDER_UI_COLOR_LISTENING, ELDER_UI_LEVEL_LISTENING, 0);
-        break;
+    case ELDER_RGB_UI_LISTENING:  request_state(ELDER_RGB_ST_LISTENING); break;
+    case ELDER_RGB_UI_SPEAKING:   request_state(ELDER_RGB_ST_SPEAKING);  break;
     case ELDER_RGB_UI_CONNECTING:
         /* 流星：颜色由 METEOR 自己按"第几颗流星"算（单颗同色、颗与颗换色），
-         * 这里的 color 参数不用（传 0 明确表示"灯效自定色"）。 */
+         * 这里的 color 参数不用（传 0 明确表示"灯效自定色"）。
+         *
+         * 这一态**没有**对应的服务端状态 —— 形象页的 7 个状态里没有
+         * "网络传输中"。刻意不为它造一个：给用户一个看不懂的开关，
+         * 不如让固件自己定。
+         *
+         * 因此把 cur_valid 清掉：这一态不来自灯效表，若这期间正好来一次
+         * 同步，apply_config 会按"上一个表内状态"重放，把流星顶成常亮。 */
+        if (g.ready) {
+            xSemaphoreTake(g.lock, portMAX_DELAY);
+            g.cur_valid = false;
+            xSemaphoreGive(g.lock);
+        }
         elder_rgb_request_ex(ELDER_RGB_PRIO_EMOTION, ELDER_FX_METEOR,
                              0u, ELDER_UI_LEVEL_METEOR, 0);
         break;
-    case ELDER_RGB_UI_SPEAKING:
-        /* 深橙 #FF8C00，70%，常亮。 */
-        elder_rgb_request_ex(ELDER_RGB_PRIO_EMOTION, ELDER_FX_SOLID,
-                             ELDER_UI_COLOR_SPEAKING, ELDER_UI_LEVEL_SPEAKING, 0);
-        break;
     case ELDER_RGB_UI_IDLE:
     default:
-        /* 闪烁星光（随机彩色）。颜色由 TWINKLE 自己每闪一次换一个，
-         * 所以这里 color 传 0。
-         * level 先给 60%（刚进待机）；1 分钟后由 rgb_task 自动降到 30%
-         * （见 g.idle_dim / ELDER_IDLE_BOOST_MS），上层不需要再调一次。 */
-        elder_rgb_request_ex(ELDER_RGB_PRIO_EMOTION, ELDER_FX_TWINKLE,
-                             0u, ELDER_UI_LEVEL_IDLE_BOOST, 0);
+        request_state(ELDER_RGB_ST_NEUTRAL);
         break;
-    }
-}
-
-static uint32_t emotion_color(elder_emotion_t emo)
-{
-    switch (emo) {
-    case ELDER_EMO_HAPPY:     return 0x00C853;   /* 绿 */
-    case ELDER_EMO_SAD:       return 0x2962FF;   /* 蓝 */
-    case ELDER_EMO_ANGRY:     return 0xD50000;   /* 红 */
-    default:                  return 0x8E24AA;   /* 紫 */
     }
 }
 
@@ -876,15 +1026,54 @@ void elder_rgb_set_emotion(elder_emotion_t emo)
     case ELDER_EMO_NEUTRAL:   elder_rgb_set_ui_state(ELDER_RGB_UI_IDLE);      return;
     case ELDER_EMO_LISTENING: elder_rgb_set_ui_state(ELDER_RGB_UI_LISTENING); return;
     case ELDER_EMO_SPEAKING:  elder_rgb_set_ui_state(ELDER_RGB_UI_SPEAKING);  return;
+    case ELDER_EMO_HAPPY:     request_state(ELDER_RGB_ST_HAPPY);              return;
+    case ELDER_EMO_SAD:       request_state(ELDER_RGB_ST_SAD);                return;
+    case ELDER_EMO_ANGRY:     request_state(ELDER_RGB_ST_ANGRY);              return;
     default: break;
     }
-    elder_rgb_request(ELDER_RGB_PRIO_EMOTION, ELDER_FX_SOLID, emotion_color(emo), 0);
+    request_state(ELDER_RGB_ST_NEUTRAL);
+}
+
+/* ---- 服务端下发的灯效表 ---- */
+void elder_rgb_get_default_config(elder_rgb_cfg_item_t *out)
+{
+    if (!out) return;
+    memcpy(out, k_default_cfg, sizeof(k_default_cfg));
+}
+
+void elder_rgb_apply_config(const elder_rgb_cfg_item_t *items)
+{
+    if (!g.ready) return;
+
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    if (items) {
+        memcpy(g.cfg, items, sizeof(g.cfg));
+        g.cfg_valid = true;
+    } else {
+        memset(g.cfg, 0, sizeof(g.cfg));
+        g.cfg_valid = false;
+    }
+    const bool replay = g.cur_valid;
+    const elder_rgb_state_t st = g.cur_state;
+    xSemaphoreGive(g.lock);
+
+    if (replay) {
+        /* 立刻按新配置重放当前状态。不重放的话，新配置要等用户
+         * 再说一句话（下一次 set_ui_state）才生效 —— 用户刚在网页上
+         * 点了保存，盯着灯看没变化，只会认为"保存没用"。 */
+        request_state(st);
+    }
+    ESP_LOGI(TAG, "灯效表已应用（%s），当前状态 %d 已重放",
+             items ? "服务端下发" : "回落内置默认", (int)st);
 }
 
 /* ---- 需求 11：服药状态灯 ---- */
 void elder_rgb_med_pending(void)
 {
-    elder_rgb_request(ELDER_RGB_PRIO_MED_PEND, ELDER_FX_SOLID, 0xFF0000, 0);
+    /* 用"提醒警示"那一项配置：用户在形象页给它选了什么颜色/亮度，
+     * 服药未确认时就是什么。以前写死 0xFF0000 100% 常亮，
+     * 与服务端那份灯效表并存 = 同一件事两份真源。 */
+    request_state_at(ELDER_RGB_PRIO_MED_PEND, ELDER_RGB_ST_ALERT);
 }
 void elder_rgb_med_done(void)
 {

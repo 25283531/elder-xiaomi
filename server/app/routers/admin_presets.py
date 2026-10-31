@@ -152,20 +152,6 @@ def _preset_out(db: Session, row: models.AIProvider) -> PresetOut:
     )
 
 
-def _norm_traits(traits: dict[str, Any] | None) -> dict[str, Any]:
-    """按每个维度的 TraitSpec 归一，用于「与出厂默认比较」。
-
-    只影响比较口径，不改库里的值 —— 归一的目的就是让"等价的两种写法"
-    在比较时相等（``"daily"`` == ``["daily"]``，``["news","daily"]`` ==
-    ``["daily","news"]``）。
-    """
-    out: dict[str, Any] = {}
-    for name, value in (traits or {}).items():
-        spec = catalog.TRAIT_SPECS.get(name)
-        out[name] = spec.normalize(value) if spec is not None else value
-    return out
-
-
 def _dirty_fields(db: Session, row: models.AIProvider,
                   traits: dict[str, Any]) -> list[str]:
     """与出厂默认不一致的字段（**后端算**，前端不做比较）。
@@ -184,11 +170,7 @@ def _dirty_fields(db: Session, row: models.AIProvider,
     dirty: list[str] = []
     if str(row.system_prompt or "") != catalog.DEFAULT_PRESET_PROMPT:
         dirty.append("system_prompt")
-    # 必须两边都过一遍 normalize 再比：topic_scope 改成多选后，老库里存的是
-    # 单选字符串 "daily"，而默认值是 ["daily"] —— 直接 != 会让**每一个**
-    # 老预设永久显示"偏离默认"，而"恢复默认"点了也没变化（值本来就等价）。
-    # badge 与 reset 判据不同源，就是「点了恢复默认但看起来没恢复」。
-    if _norm_traits(traits) != _norm_traits(catalog.default_traits()):
+    if traits != catalog.default_traits():
         dirty.append("traits")
     default_voice = str(voice_catalog.options_for(db).get("default_voice") or "")
     if default_voice and str(row.tts_voice or "") != default_voice:
