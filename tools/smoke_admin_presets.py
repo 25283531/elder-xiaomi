@@ -559,9 +559,13 @@ def main() -> int:
         kinds = sorted({s.get("kind") for s in specs})
         check("T28 meta 返回恰好 10 个 trait 维度",
               code == 200 and len(specs) == 10, f"{len(specs)} 维")
-        check("T28 kind 齐备enum/number/bool 三类都有"
+        # 2026-10-31：话题范围从单选改成多选，kind 新增 "multi"。
+        # 这条断言的本意是「每一类渲染分支都有真实数据覆盖」，不是"只有三类" ——
+        # 所以清单跟着加一项，而不是把 multi 从 kinds 里过滤掉（过滤掉就等于
+        # 前端多了一个分支却没有任何用例经过它）。
+        check("T28 kind 齐备enum/number/bool/multi 四类都有"
               "（前端按 kind 分派渲染，缺一类就渲染错一类）",
-              kinds == ["bool", "enum", "number"], str(kinds))
+              kinds == ["bool", "enum", "multi", "number"], str(kinds))
         check("T28 7 条软约束白名单",
               len((meta or {}).get("soft_guardrails", [])) == 7,
               str(len((meta or {}).get("soft_guardrails", []))))
