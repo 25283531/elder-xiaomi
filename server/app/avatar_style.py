@@ -127,28 +127,12 @@ DEFAULT_LIGHTS: dict[str, dict] = {
 }
 
 
-def _infer_preset(rgb: str, effect: str) -> str:
-    """按 (rgb, effect) 反查预置 id；查不到返回空串（前端显示"自定义"）。
-
-    为什么要反查而不是留空：老库里的 emotion_lights 只有 rgb/effect 两项，
-    没有 preset。留空的话用户打开编辑页看到的下拉是"未选择"，而旁边颜色
-    明明有值 —— 他会以为配置丢了，于是重选一遍，把 brightness 一起重置。
-    反查能把"和某个预置完全一致"的老数据无损对上号。
-    """
-    want = str(rgb or "").strip().lower()
-    for p in LIGHT_PRESETS:
-        if p["rgb"].lower() == want and p["effect"] == effect:
-            return p["id"]
-    return ""
-
-
 def normalize_lights(raw: object) -> dict[str, dict]:
     """把 ``emotion_lights`` 归一成 7 个状态 × 固定字段的形状。
 
     为什么要归一而不是"存什么读什么"：这个字段在界面上是一个
     "每状态一行"的表单，缺行 = 该状态没有灯效 = 设备行为未定义。
-    老数据（只有 rgb/effect 两项）必须能补全成带 brightness/interval_ms
-    的完整结构，否则前端滑杆显示空值、保存时把 undefined 写成 null。
+    前端漏传一个状态时，这里补成默认值，设备侧就不会因为查不到 key 而灭灯。
     """
     src = raw if isinstance(raw, dict) else {}
     out: dict[str, dict] = {}
@@ -171,14 +155,20 @@ def normalize_lights(raw: object) -> dict[str, dict]:
             interval = base["interval_ms"]
         interval = max(INTERVAL_MIN, min(INTERVAL_MAX, interval))
         preset = str(item.get("preset") or "")
-        # preset 与实际 rgb/effect 对不上时**以实际值为准**、preset 置空：
+        # 整项缺失（新建形象 / 老数据里没这一行）时，rgb/effect/brightness
+        # 全部取自 DEFAULT_LIGHTS —— 那 preset 也必须取默认表里的那个 id，
+        # 否则新建形象的 7 个状态在界面上全显示「自定义」，而它实际就是
+        # "呼吸·蓝"这些出厂预置。注意这**不是**反查：没有从 rgb+effect 猜 id。
+        if not item:
+            preset = base["preset"]
+        # preset 与 rgb/effect 对不上时**以实际值为准**、preset 置空：
         # 反过来（以 preset 为准）会把用户手改的颜色悄悄改回去。
-        # 注意这里必须校验"一致"而不只是"id 存在" —— 存了 preset=solid_red
-        # 但 rgb 被改成别的颜色时，如果只查 id 存在，下拉会一直显示"常亮·红"
+        # 注意必须校验"一致"而不只是"id 存在" —— 存了 preset=solid_red
+        # 但 rgb 被改成别的颜色时，若只查 id 存在，下拉会一直显示"常亮·红"
         # 而实际颜色是别的，用户改了颜色却看到"没改"。
         p = LIGHT_PRESET_BY_ID.get(preset)
         if p is None or p["rgb"].lower() != rgb.lower() or p["effect"] != effect:
-            preset = _infer_preset(rgb, effect)
+            preset = ""
         out[key] = {
             "preset": preset, "rgb": rgb, "effect": effect,
             "brightness": brightness, "interval_ms": interval,

@@ -4,8 +4,9 @@
 --------
 1. 设备离线也能响铃（需求 8），所以提醒规则会**下发到设备**，
    提醒事件（ReminderEvent）由设备本地产生、联网后回传对账。
-2. 形象（Avatar）与提示词、TTS 音色、情绪灯效映射绑定在一起，
-   一台设备同一时刻只有一个生效形象，便于端侧只维护一份资源。
+2. 形象（Avatar）只管**外观**：屏幕外观、资源包、片段映射、灯效。
+   人格与音色都在 AIProvider（角色）上，一台设备同一时刻只有一个生效形象、
+   一个生效角色，便于端侧只维护一份资源。
 3. AI 供应商（AIProvider）按能力拆行（asr / llm / llm_main / llm_light /
    embedding / rerank / tts / vad ...），同一用途可配多条并靠 priority 决定主备，
    满足需求 15「多平台接入」。详细的分层口径与「旧 llm 值如何平滑过渡」见
@@ -163,8 +164,8 @@ class Device(Base):
     owner_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     avatar_id: Mapped[int | None] = mapped_column(ForeignKey("avatars.id"), nullable=True)
     # 生效的 agent 角色（对应 ai_providers 里的一条记录，APP「创建我的 agent 角色」
-    # 走的也是 POST /api/providers）。形象（avatar_id）管的是屏幕上的外观与音色，
-    # 角色（agent_id）管的是人格与提示词，两者互不影响、可各选一个。
+    # 走的也是 POST /api/providers）。形象（avatar_id）管屏幕上的外观，
+    # 角色（agent_id）管人格、提示词**和音色**，两者互不影响、可各选一个。
     # TODO: 目前只落库，/api/device/sync 还没有把 agent 下发给设备；
     #       等设备侧支持按角色切换人格时，在 DeviceSyncOut 里补一个 agent 字段即可。
     agent_id: Mapped[int | None] = mapped_column(ForeignKey("ai_providers.id"), nullable=True)
@@ -289,7 +290,7 @@ class ActivationCode(Base):
 
 # ================================================================ 形象 / 角色
 class Avatar(Base):
-    """形象 = **纯形象**（屏幕外观 + 资源包 + 灯效 + 默认音色）。
+    """形象 = **纯形象**（屏幕外观 + 资源包 + 灯效）。
 
     ⚠️ 决策变更（docs/架构设计-角色模型与人格能力.md §4.2）：人格（system_prompt）
     与角色级音色已**迁移到 AIProvider**，Avatar 退化为"这个角色长什么样"。
@@ -297,12 +298,12 @@ class Avatar(Base):
     家属 wanting 的粒度完全不同。
 
     ``system_prompt`` / ``tts_voice`` **本轮不删列**（本项目没有 Alembic，
-    schema_patch 只能 ADD COLUMN，删列做不到），但语义已降级：
+    schema_patch 只能 ADD COLUMN，删列做不到），但**两列都已死**：
       * ``system_prompt`` —— 停用。启动迁移会把老库里的值搬到 preset 角色行
         然后置空（main._seed_migration），AvatarIn/Out 也**不再暴露**它。
-      * ``tts_voice`` —— 保留为「形象的**默认**音色」。角色自己有音色时
-        用角色的，没有才回落到形象（device_api.sync 里做这个 fallback）。
-    这样既拿到了"人格与形象解耦"，又没有为一次重构付"删列"的代价。
+      * ``tts_voice`` —— 停用。音色**只来自角色**（device_api.sync 只读
+        ``role.tts_voice``），形象侧既不读也不写。原先那条"角色优先、形象兜底"
+        已按"开发测试阶段不留兼容代码"的要求拆掉。
 
     clips 约定（对应端侧 EAF 资源包内的片段名）：
         idle        待机
@@ -346,7 +347,8 @@ class Avatar(Base):
 
     # ---- 已降级的人格字段（保留列，不再对外暴露，理由见类注释）----
     system_prompt: Mapped[str] = mapped_column(Text, default="")
-    # 形象的**默认**音色；角色自带音色时以角色的为准
+    # **已停用**（2026-10-31）：音色只来自角色。列还在是因为删不掉，
+    # 但没有任何读路径会看它 —— device_api.sync 只取 role.tts_voice。
     tts_voice: Mapped[str] = mapped_column(String(64), default="")
 
     # 情绪 -> RGB 灯效，键为情绪名，值为 {"rgb":"#RRGGBB","effect":"breath|blink|solid|rainbow"}
@@ -444,7 +446,8 @@ class AIProvider(Base):
     description: Mapped[str] = mapped_column(String(255), default="")
     # 角色人格 / 系统提示词（用户可编辑的**软性**部分；硬红线由代码常量注入）
     system_prompt: Mapped[str] = mapped_column(Text, default="")
-    # 角色音色，如 zh-CN-XiaoxiaoNeural。为空时回落到所绑定形象的 tts_voice
+    # 角色音色，如 zh-CN-XiaoxiaoNeural。**这是音色的唯一真源**：
+    # 为空即"跟随厂商默认音色"，不再回落到形象（形象侧那列已停用）。
     tts_voice: Mapped[str] = mapped_column(String(64), default="")
     # 是否默认角色（APP 新建角色时可选中）
     is_default: Mapped[bool] = mapped_column(Boolean, default=False)

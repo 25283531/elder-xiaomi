@@ -139,9 +139,65 @@ void elder_rgb_set_ui_state(elder_rgb_ui_t st);
  * @brief 设置对话情绪（内部映射到 ELDER_RGB_PRIO_EMOTION）
  *
  * NEUTRAL/LISTENING/SPEAKING 三个会转成对应的 UI 四态；
- * HAPPY/SAD/ANGRY 保留原来的颜色，100% 常亮。
+ * HAPPY/SAD/ANGRY 走"状态灯效表"里的同名项。
  */
 void elder_rgb_set_emotion(elder_emotion_t emo);
+
+/* ---------------------------------------------------------- 灯效配置表
+ *
+ * 2026-10-31：灯效从"固件里写死"改成"服务端下发"。
+ *
+ * 为什么改：用户要「每种状态下拉选灯效、可设亮度、星光可设闪烁间隔」。
+ * 写死在固件里的话，改一次就要重刷固件 —— 而本仓固件一律走 CI 编译，
+ * 一次改动的代价是十几分钟加一次刷机，根本没法当配置项用。
+ *
+ * 谁是真源：服务端 `server/app/avatar_style.py` 的 LIGHT_PRESETS。
+ * 设备只认下面 5 个 effect 字符串，不认预置 id —— 预置是"给人挑的"，
+ * 下发时已经展开成 rgb/effect/亮度/间隔，设备不需要知道它叫什么名字。
+ */
+typedef enum {
+    ELDER_RGB_ST_NEUTRAL = 0,   /* 待机 */
+    ELDER_RGB_ST_LISTENING,     /* 聆听中 */
+    ELDER_RGB_ST_SPEAKING,      /* 说话中 */
+    ELDER_RGB_ST_HAPPY,         /* 开心 */
+    ELDER_RGB_ST_SAD,           /* 难过 */
+    ELDER_RGB_ST_ANGRY,         /* 生气 */
+    ELDER_RGB_ST_ALERT,         /* 提醒警示（待办 / 用药） */
+    ELDER_RGB_ST_COUNT
+} elder_rgb_state_t;
+
+/** effect 取值：与 elder_rgb_fx_t 的编号对齐，另加一个"关闭" */
+#define ELDER_RGB_EFFECT_OFF 0xFF
+
+typedef struct {
+    uint8_t  effect;      /* elder_rgb_fx_t 或 ELDER_RGB_EFFECT_OFF */
+    uint32_t color;       /* 0xRRGGBB；0 = 灯效自定色（星光随机色） */
+    uint8_t  level;       /* 0~255 感知亮度，见 elder_rgb_request_ex */
+    uint16_t period_ms;   /* 呼吸/闪烁/星光的周期；0 = 用内置默认 */
+} elder_rgb_cfg_item_t;
+
+/**
+ * @brief 应用服务端下发的灯效表。**整表替换**，不合并。
+ *
+ * @param items 长度必须是 ELDER_RGB_ST_COUNT；传 NULL 表示整表回落内置默认。
+ *
+ * 为什么整表替换而不是逐项覆盖：合并语义下"服务端把某个状态删了"就永远
+ * 回不到默认值，而用户看到的界面是"7 个状态都在"，两边对不上。
+ *
+ * 线程安全：内部加锁。**会自动重放当前状态**，所以心跳到达后不需要上层
+ * 再调一次 set_ui_state —— 否则新配置要等下一次状态切换才生效，
+ * 用户会以为"保存了没用"。
+ */
+void elder_rgb_apply_config(const elder_rgb_cfg_item_t *items);
+
+/**
+ * @brief 取一份**内置默认**灯效表（长度 ELDER_RGB_ST_COUNT）。
+ *
+ * 用途只有一个：服务端下发的 JSON 若缺了某个状态，固件要从"默认"而不是
+ * 从"全零"开始 —— 全零意味着 effect=SOLID、color=黑、level=0，表现是
+ * 那个状态下灯彻底不亮，而服务端界面上它明明是有配置的。
+ */
+void elder_rgb_get_default_config(elder_rgb_cfg_item_t *out);
 
 /* 需求 11 的语义封装 */
 void elder_rgb_med_pending(void);   /* 长亮红 */
