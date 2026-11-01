@@ -17,6 +17,13 @@
 
 #include "board.h"
 
+/* 防烧屏屏保必须知道「设备是不是待机」：熊猫是待机指示灯，不是普通屏保。
+ * 两个头都在 main 组件内（与 main/display/ 同级目录），直接 include 即可，
+ * elder_bridge.cc 用的也是这两个。这里只读广播出来的 DeviceState，
+ * 不碰 Application 本身，所以不构成"显示层反向依赖业务层"。 */
+#include "device_state_event.h"
+#include "device_state.h"
+
 
 // >>> BEGIN elder-companion overlay (由 tools/merge_to_xiaozhi.py 注入，勿手改) >>>
 // LVGL 9.3.0 把 lv_image_cache_resize() 藏在内部头文件里，lvgl.h 未暴露，
@@ -1194,6 +1201,28 @@ void LcdDisplay::StartAntiBurnInTimer() {
      * Init() 幂等，且帧数据缺失时只是 Available()=false，不影响静态轮播。 */
     AnimEmojiPlayer::Get().Init();
     last_ui_change_tick_ = lv_tick_get();
+
+    /* 订阅设备状态：屏保只在待机态跑（见 AntiBurnInStep 开头的 2026-11-01
+     * 事故注释）。放在这里而不是构造函数里，是因为本函数已有
+     * `if (anti_burn_timer_ != nullptr || emoji_image_ == nullptr) return;`
+     * 的幂等保护 —— 回调只会注册一次，不会因为 SetupUI 重跑而重复注册。
+     *
+     * 线程：PostStateChangeEvent() 走 esp_event 默认事件循环，回调在
+     * sys_evt 任务里执行；AntiBurnInStep() 在 LVGL 定时器任务里执行。
+     * 两个任务之间只共享一个 bool，所以成员声明为 volatile（见头文件）。
+     * 不在这里做任何 LVGL 操作：事件循环任务里碰 LVGL 必须拿锁，
+     * 而本回调要做的只是记一个标志位，没必要引入锁和潜在的锁序问题。
+     *
+     * 事件是异步投递的，标志位可能比真实状态晚一个事件循环周期。防烧屏
+     * 20 秒才查一次、判据是 60 秒静止，这点延迟完全不影响语义。
+     *
+     * 回调里捕获的 this 不会悬空：LcdDisplay 与进程同生命周期（只在重启时
+     * 销毁），而注销回调的路径根本不存在 —— 与 elder_bridge.cc 的用法一致。 */
+    DeviceStateEventManager::GetInstance().RegisterStateChangeCallback(
+        [this](DeviceState /*prev*/, DeviceState cur) {
+            device_idle_ = (cur == kDeviceStateIdle);
+        });
+
     /* lv_timer 回调必须是裸函数指针，所以用 user_data 带回 this。 */
     anti_burn_timer_ = lv_timer_create([](lv_timer_t* t) {
         static_cast<LcdDisplay*>(lv_timer_get_user_data(t))->AntiBurnInStep();
@@ -1204,6 +1233,39 @@ void LcdDisplay::StartAntiBurnInTimer() {
 }
 
 void LcdDisplay::AntiBurnInStep() {
+    /* ★ 第一道闸：非待机态一律不动屏。★
+     *
+     * 2026-11-01 真机事故：老人唤醒后不说话（或一轮对话播报完设备自动回到
+     * 聆听态），屏幕中央换成了待机动态熊猫，而字幕还是「聆听中」、状态灯
+     * 还是蓝色常亮 —— 三处互相打架。老人看到熊猫以为设备回待机了，喊唤醒词
+     * 反而打断当前这轮，越急越乱。
+     *
+     * 根因就是这个函数**只看界面静止了多久，不看设备在干什么**：本机
+     * CONFIG_USE_DEVICE_AEC=y ⇒ 走 kListeningModeRealtime 连续对话，一轮
+     * 说完自动回 kDeviceStateListening，而这一态唤醒词是关的；老人一沉默
+     * 就停在那儿，直到服务端 120 秒无有效内容才下发待机。这 120 秒里界面
+     * 静止满 60 秒，于是防烧屏把待机熊猫播了上去。
+     *
+     * 为什么必须在这里判、不能只在 PlayIdleAnimation() 里播：熊猫的产品
+     * 语义是「待机指示灯」（2026-10-22 用户原话：「进入待机状态强制切换到
+     * 待机动态熊猫图案，以便区分硬件是否在监听声音，让用户知道是否需要
+     * 唤醒词进行唤醒」）。非待机态播它 = 对老人撒谎，属于功能错误而不是
+     * 视觉瑕疵，所以判据必须挡在所有播图路径的最前面（含下面的静态兜底
+     * 轮播：聆听中把表情图换成随机一张，同样会让人以为状态变了）。
+     *
+     * 为什么不能只靠 PlayIdleAnimation()、把这条兜底删掉：待机态下老人
+     * 中途说一句话，SetEmotion() 会 Stop() 掉动图并换成语境图标；如果这句
+     * 话没有让状态离开待机（识别为空/被丢弃），屏上就再没有熊猫了 ——
+     * 而「有没有熊猫」是老人判断"要不要喊唤醒词"的唯一依据。所以待机态
+     * 仍然需要防烧屏这条兜底把熊猫接回来；非待机态则必须一步都不许动。
+     *
+     * 代价：聆听/播报态长时间静止确实有烧屏风险。但这两个态本来就有
+     * 字幕、状态栏、灯效在变，且它们是"正在工作"的短时态；把待机指示灯
+     * 播到工作态上换来的误导，远比残影严重。 */
+    if (!device_idle_) {
+        return;
+    }
+
     /* 界面刚刚变过（有人在对话/收到通知）⇒ 现在换图就是捣乱，跳过。
      * 只在真正长时间静止时才轮换。 */
     if (lv_tick_elaps(last_ui_change_tick_) < ANTI_BURN_IDLE_MS) {
