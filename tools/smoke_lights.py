@@ -47,8 +47,8 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 from app.avatar_style import (  # noqa: E402
-    DEFAULT_LIGHTS, LIGHT_COLORS, LIGHT_EFFECTS, LIGHT_STATES, RANDOM_EFFECTS,
-    RANDOM_RGB, normalize_lights,
+    DEFAULT_LIGHTS, FALLBACK_RGB, LIGHT_COLORS, LIGHT_EFFECTS, LIGHT_STATES,
+    RANDOM_EFFECTS, RANDOM_RGB, normalize_lights,
 )
 
 PASS = 0
@@ -191,10 +191,13 @@ def group_c() -> None:
 # ============================================================ D 颜色归一
 def group_d() -> None:
     print("\n[D] 颜色归一（拼错一个字符 = 灯不亮，必须在服务端拦住）")
-    base = DEFAULT_LIGHTS["neutral"]["rgb"]
+    # ⚠️ 基准**不能**用 neutral：它的默认色就是 #000000（星光随机哨兵），
+    # 拿它当"非法输入应退回的期望值"会得到"退回一个哨兵"，断言等于没写。
+    # listening 是默认 solid + 固定色，最干净。
+    base = DEFAULT_LIGHTS["listening"]["rgb"]
 
-    def rgb_of(raw: str, eff: str = "breath") -> str:
-        return normalize_lights({"neutral": {"effect": eff, "rgb": raw}})["neutral"]["rgb"]
+    def rgb_of(raw: str, eff: str = "solid") -> str:
+        return normalize_lights({"listening": {"effect": eff, "rgb": raw}})["listening"]["rgb"]
 
     check("合法 6 位 hex 原样保留", rgb_of("#123456") == "#123456", rgb_of("#123456"))
     check("小写归一成大写", rgb_of("#4a90d9") == "#4A90D9", rgb_of("#4a90d9"))
@@ -205,6 +208,12 @@ def group_d() -> None:
               got == base, f"{got} != {base}")
     check("默认色本身是合法 hex（否则默认值会被自己的校验打回）",
           re.fullmatch(r"#[0-9A-F]{6}", base) is not None, base)
+    # 待机的默认色**就是**哨兵，改效果时必须换成能亮的颜色，不能把 #000000 留着。
+    got = normalize_lights({"neutral": {"effect": "breath", "rgb": RANDOM_RGB}})["neutral"]
+    check("★ 待机（默认随机色）改成呼吸时换成安全色，而不是留下 #000000（= 灯灭）",
+          got["rgb"] == FALLBACK_RGB, str(got))
+    check("★ 兜底色本身不是哨兵、也不是纯白", 
+          FALLBACK_RGB != RANDOM_RGB and FALLBACK_RGB.upper() != "#FFFFFF", FALLBACK_RGB)
 
 
 # ============================================================ E 固件流水
@@ -288,11 +297,110 @@ def group_h() -> None:
           all(c["rgb"].upper() != "#FFFFFF" for c in LIGHT_COLORS), "")
     check("★ 色板里没有黑色 #000000（它是「随机」哨兵，不能当普通色选）",
           all(c["rgb"].upper() != RANDOM_RGB for c in LIGHT_COLORS), "")
+    # 出厂色必须在色板里 —— 否则颜色列只能显示裸 hex（"#00BFFF"），
+    # 用户既看不懂、也没法从色板里把它选回来。这是 2026-11-01 真机上
+    # 看到的现象，不是假设。
+    palette = {c["rgb"].upper() for c in LIGHT_COLORS}
+    missing = sorted(k for k, v in DEFAULT_LIGHTS.items()
+                     if v["rgb"] != RANDOM_RGB and v["rgb"].upper() not in palette)
+    check("★ 每个状态的出厂色都在色板里（否则颜色列显示裸 hex 且选不回来）",
+          not missing, str(missing))
+    check("★ 兜底色也在色板里", FALLBACK_RGB.upper() in palette, FALLBACK_RGB)
+    check("★ 色板第一项就是兜底色（前端「换效果时替换随机色」取的是 colors[0]）",
+          LIGHT_COLORS[0]["rgb"].upper() == FALLBACK_RGB.upper(),
+          f"{LIGHT_COLORS[0]['rgb']} vs {FALLBACK_RGB}")
+
+
+# ============================================================ I 兜底两表一致
+#: 固件 elder_rgb_fx_t 枚举 → 服务端 effect 字符串。
+_FX = {
+    "ELDER_FX_SOLID": "solid",
+    "ELDER_FX_BREATH": "breath",
+    "ELDER_FX_BLINK_FAST": "blink",
+    "ELDER_FX_TWINKLE": "starlight",
+    "ELDER_FX_FLOW": "flow",
+    "ELDER_FX_RAINBOW": "rainbow",
+    "ELDER_FX_CHASE": "chase",
+    "ELDER_FX_METEOR": "meteor",
+    "ELDER_RGB_EFFECT_OFF": "off",
+}
+
+
+def _resolve(tok: str, macros: dict[str, int]) -> int | None:
+    tok = tok.strip()
+    if tok in macros:
+        return macros[tok]
+    m = re.fullmatch(r"(0[xX][0-9A-Fa-f]+|\d+)[uUlL]*", tok)
+    return int(m.group(1), 0) if m else None
+
+
+def parse_firmware_default() -> dict[str, dict]:
+    """解析 rgb.c 的 ``k_default_cfg``，还原成服务端同形状的 7 条默认灯效。
+
+    这是「兜底灯效两端必须一致」这条不变量的**唯一机器证据**。
+    设备在**第一次心跳成功之前**只能按这张编译进二进制的表亮；服务端每次
+    心跳又会下发 ``DEFAULT_LIGHTS``。两张表只要有一项不同，新设备就会在
+    联网那一刻**自己变色** —— 用户看到的是"设备乱改灯"，而两端都不报错。
+    """
+    src = (ROOT / "firmware/components/elder/src/rgb.c").read_text(
+        encoding="utf-8", errors="replace")
+    code = strip_c_comments(src)
+    macros: dict[str, int] = {}
+    for m in re.finditer(r"^#define\s+(\w+)\s+(0[xX][0-9A-Fa-f]+|\d+)[uUlL]*\s*$",
+                         code, re.M):
+        macros[m.group(1)] = int(m.group(2), 0)
+    body = brace_body(code, "static const elder_rgb_cfg_item_t k_default_cfg")
+    out: dict[str, dict] = {}
+    for m in re.finditer(r"\[ELDER_RGB_ST_(\w+)\]\s*=\s*\{([^}]*)\}", body):
+        state = m.group(1).lower()
+        fields = [f.strip() for f in m.group(2).split(",") if f.strip()]
+        if len(fields) != 4:
+            raise AssertionError(f"{state} 的初始化项不是 4 个字段：{fields}")
+        fx_name, color_tok, level_tok, period_tok = fields
+        color = _resolve(color_tok, macros)
+        level = _resolve(level_tok, macros)
+        period = _resolve(period_tok, macros)
+        if color is None or level is None or period is None:
+            raise AssertionError(f"{state} 有无法解析的字段：{fields}")
+        out[state] = {
+            "effect": _FX.get(fx_name, fx_name),
+            # 固件 color==0 就是"随机"（TWINKLE/FLOW 分支），服务端用 #000000 表达
+            "rgb": RANDOM_RGB if color == 0 else f"#{color:06X}",
+            # level 是 0~255 感知亮度，服务端是 1~100 百分比；
+            # 固件下发时按 b*255/100 反算，两边必须能往返。
+            "brightness": round(level * 100 / 255),
+            "interval_ms": period,
+        }
+    return out
+
+
+def group_i() -> None:
+    print("\n[I] 兜底灯效两端一致（固件 k_default_cfg vs 服务端 DEFAULT_LIGHTS）")
+    fw = parse_firmware_default()
+    check("解析出固件 7 个状态的默认灯效", len(fw) == 7, str(sorted(fw)))
+    check("★ 状态键与服务端一致（少一个 = 那个状态联网前后会变色）",
+          set(fw) == set(DEFAULT_LIGHTS), f"{sorted(fw)} vs {sorted(DEFAULT_LIGHTS)}")
+    for key, _lab, _desc in LIGHT_STATES:
+        f, s = fw.get(key, {}), DEFAULT_LIGHTS[key]
+        check(f"★ {key}: 效果一致（固件 {f.get('effect')} / 服务端 {s['effect']}）",
+              f.get("effect") == s["effect"], str(f))
+        check(f"★ {key}: 颜色一致（固件 {f.get('rgb')} / 服务端 {s['rgb']}）",
+              f.get("rgb") == s["rgb"], str(f))
+        check(f"★ {key}: 亮度一致（固件 {f.get('brightness')}% / 服务端 {s['brightness']}%）",
+              f.get("brightness") == s["brightness"], str(f))
+        # period_ms=0 的（常亮类）固件根本不读，不参与比较。
+        if f.get("interval_ms"):
+            check(f"★ {key}: 间隔一致（固件 {f.get('interval_ms')} / 服务端 {s['interval_ms']}）",
+                  f.get("interval_ms") == s["interval_ms"], str(f))
+    # 出厂观感本身也要对：待机必须是"星光 + 随机色"，这是本产品的标志性灯效。
+    n = DEFAULT_LIGHTS["neutral"]
+    check("★ 待机兜底 = 星光 + 颜色随机（用户明确说这是重要效果）",
+          n["effect"] == "starlight" and n["rgb"] == RANDOM_RGB, str(n))
 
 
 def main() -> int:
     print("=" * 64)
-    print("灯效契约冒烟（效果 5 种 / 安全色 / 颜色随机）")
+    print("灯效契约冒烟（效果 5 种 / 安全色 / 颜色随机 / 兜底两表一致）")
     print("=" * 64)
     group_a()
     group_b()
@@ -302,6 +410,7 @@ def main() -> int:
     group_f()
     group_g()
     group_h()
+    group_i()
     print("\n" + "=" * 64)
     print(f"共 {PASS + FAIL} 条：通过 {PASS}，失败 {FAIL}")
     if FAILED:
