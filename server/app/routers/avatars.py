@@ -22,8 +22,8 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..avatar_style import (  # noqa: F401  (DEFAULT_CLIPS 等被 main.py 复用)
     BRIGHTNESS_MAX, BRIGHTNESS_MIN, CLIP_STATES, DEFAULT_CLIPS, DEFAULT_LIGHTS,
-    INTERVAL_MAX, INTERVAL_MIN, LIGHT_EFFECTS, LIGHT_PRESETS, LIGHT_STATES,
-    normalize_clips, normalize_lights,
+    INTERVAL_MAX, INTERVAL_MIN, LIGHT_COLORS, LIGHT_EFFECTS, LIGHT_STATES,
+    RANDOM_EFFECTS, RANDOM_RGB, normalize_clips, normalize_lights,
 )
 from ..db import get_db
 from ..deps import get_current_user, require_avatar
@@ -79,10 +79,15 @@ def list_avatars(db: Session = Depends(get_db),
 # 跟"路由写错"看起来毫无关系。
 @router.get("/light-presets")
 def light_presets(user: models.User = Depends(get_current_user)):
-    """灯效编辑器要的元数据：状态清单 + 预置灯效 + 动效清单 + 取值范围。
+    """灯效编辑器要的元数据：状态清单 + 动效清单 + 安全色板 + 取值范围。
 
-    **由后端下发而不是前端硬编码**：加一种灯效只改这里的 LIGHT_PRESETS，
-    管理端与用户端两个前端自动都有；硬编码则必然出现"两端清单不一致"。
+    **由后端下发而不是前端硬编码**：加一种灯效只改这里的 ``LIGHT_EFFECTS``，
+    管理端 / 用户端 / APP 三套前端自动都有；硬编码则必然出现"三端清单不一致"。
+
+    2026-11-01 改版：原来下发的是 15 条 ``presets``（效果+颜色焊死），
+    现在拆成 ``effects``（5 种）与 ``colors``（安全色板）两个独立维度，
+    外加 ``random`` 说明"哪些动效能选随机色"。路由路径沿用 ``light-presets``
+    是为了不动前端调用点（改名收益为零，风险是漏改一处就 404）。
 
     仍然要登录：内容本身不敏感（纯常量），但本仓的约定是"业务接口一律先认人" ——
     留一个匿名端点，将来谁往里塞一句"当前生效的设备列表"就没人拦得住了。
@@ -90,9 +95,13 @@ def light_presets(user: models.User = Depends(get_current_user)):
     _ = user  # 只为鉴权，不参与逻辑
     return {
         "states": [{"key": k, "label": lab, "desc": desc} for k, lab, desc in LIGHT_STATES],
-        "presets": [dict(p) for p in LIGHT_PRESETS],
         "effects": [{"effect": e, "label": lab, "interval": iv}
                     for e, lab, iv in LIGHT_EFFECTS],
+        "colors": [dict(c) for c in LIGHT_COLORS],
+        # 随机色的两个事实：哨兵值是什么、哪些动效支持。
+        # 前端据此决定"随机"色块是否可点 —— 但**不要**指望前端拦住，
+        # normalize_lights() 会二次校验（API 直连、APP 旧版本都绕过界面）。
+        "random": {"rgb": RANDOM_RGB, "effects": list(RANDOM_EFFECTS)},
         "defaults": {k: dict(v) for k, v in DEFAULT_LIGHTS.items()},
         "clip_states": [{"key": k, "label": lab} for k, lab in CLIP_STATES],
         "brightness": {"min": BRIGHTNESS_MIN, "max": BRIGHTNESS_MAX},

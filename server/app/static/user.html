@@ -689,8 +689,10 @@
           <div style="margin-top:14px">
             <label>情绪灯效（每个状态一行）</label>
             <div class="muted" style="font-size:12px;line-height:1.6;margin:4px 0 8px">
-              从预置里选一种，或用「自定义」保留当前颜色。<br>
-              ⚠️ 当前固件<b>尚未消费</b>本配置（连下发都还没有），保存后不会改变设备实际灯色。
+              每个状态选一个<b>效果</b>和一个<b>颜色</b>，两者独立。保存后随心跳下发到设备，
+              最长约 5 分钟生效（重启设备可立即生效）。<br>
+              <b>星光</b>与<b>流水</b>支持「颜色随机」：星光每闪一次换一个色相，流水每个灯位一个色相并整体滚动。
+              常亮 / 呼吸不会随时间变色，所以不提供随机。
             </div>
             <table>
               <thead><tr>
@@ -702,10 +704,9 @@
                   <td>{{st.label}}
                     <div class="muted" style="font-size:11px">{{st.desc}}</div></td>
                   <td>
-                    <select :value="aForm.emotion_lights[st.key].preset"
-                            @change="pickLight(st.key,$event)" style="width:100%">
-                      <option value="">自定义</option>
-                      <option v-for="p in lightPresets" :key="p.id" :value="p.id">{{p.name}}</option>
+                    <select :value="aForm.emotion_lights[st.key].effect"
+                            @change="pickEffect(st.key,$event)" style="width:100%">
+                      <option v-for="e in lightEffects" :key="e.effect" :value="e.effect">{{e.label}}</option>
                     </select>
                   </td>
                   <td>
@@ -725,15 +726,48 @@
                     <span v-else class="muted" style="font-size:12px">—</span>
                   </td>
                   <td>
-                    <span :style="{display:'inline-block',width:'14px',height:'14px',
-                                   borderRadius:'50%',verticalAlign:'middle',
-                                   background:aForm.emotion_lights[st.key].rgb,
-                                   opacity:aForm.emotion_lights[st.key].brightness/100}"></span>
-                    <code style="font-size:11px">{{aForm.emotion_lights[st.key].rgb}}</code>
+                    <button @click="openLightColor(st.key,$event)" title="点击选择颜色"
+                            style="display:inline-flex;align-items:center;gap:7px;padding:3px 8px">
+                      <span :style="{display:'inline-block',width:'16px',height:'16px',
+                                     borderRadius:'4px',border:'1px solid rgba(0,0,0,.16)',
+                                     background:(aForm.emotion_lights[st.key].effect==='off'
+                                                 ? '#000000' : aForm.emotion_lights[st.key].rgb)}"></span>
+                      <span style="font-size:12px">{{lightColorName(st.key)}}</span>
+                    </button>
                   </td>
                 </tr>
               </tbody>
             </table>
+            <!-- 颜色选择弹窗。position:fixed + 点击坐标：这张表在 .modal 内，
+                 modal 有 overflow，绝对定位的浮层会被裁掉下半截。 -->
+            <div v-if="lightPick.open" @click="lightPick.open=false"
+                 style="position:fixed;inset:0;z-index:9000"></div>
+            <div v-if="lightPick.open"
+                 :style="{position:'fixed',zIndex:9001,
+                          top:lightPick.top+'px',left:lightPick.left+'px',
+                          background:'var(--panel)',border:'1px solid var(--line)',
+                          borderRadius:'8px',boxShadow:'0 10px 28px rgba(15,23,42,.18)',
+                          padding:'10px',width:'236px'}">
+              <div class="muted" style="font-size:11px;margin-bottom:6px">安全色</div>
+              <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:6px">
+                <button v-for="c in lightColors" :key="c.id" :title="c.name"
+                        @click="applyLightColor(c.rgb)"
+                        :style="{width:'30px',height:'30px',borderRadius:'6px',padding:0,
+                                 cursor:'pointer',background:c.rgb,
+                                 border:(lightPick.rgb===c.rgb
+                                         ? '2px solid var(--brand)'
+                                         : '1px solid rgba(0,0,0,.14)')}"></button>
+              </div>
+              <template v-if="lightPick.randomAllowed">
+                <div class="muted" style="font-size:11px;margin:9px 0 6px">随机</div>
+                <button @click="applyLightColor(lightRandomRgb)" style="width:100%"
+                        :style="{border:(lightPick.rgb===lightRandomRgb
+                                         ? '2px solid var(--brand)' : '')}">颜色随机</button>
+              </template>
+              <div v-else class="muted" style="font-size:11px;margin-top:9px;line-height:1.5">
+                当前效果不支持随机色 —— 常亮 / 呼吸不会随时间变色，设成随机只会不亮。
+              </div>
+            </div>
           </div>
           <div class="row" style="margin-top:16px;justify-content:flex-end">
             <button @click="aBox=null">取消</button>
@@ -1292,10 +1326,14 @@ createApp({
       memories: [], tone: null, personaPrompt: '',
       // 形象
       // 形象只管灯效 / EAF / clips / 资源包；音色归人格预设。
-      // light* / clipStates 全部来自 GET /api/avatars/light-presets —— 状态与预置
-      // 清单是后端说了算的（固件按 key 匹配），前端不写死，否则加一个状态就得改两处。
+      // light* / clipStates 全部来自 GET /api/avatars/light-presets —— 状态 /
+      // 动效 / 色板清单是后端说了算的（固件按 key 与 effect 字符串匹配），
+      // 前端不写死，否则加一个状态就得改三处（后端 + 网页 + APP）。
       avatars: [], aBox: null, aForm: null,
-      lightStates: [], lightPresets: [], lightEffects: [],
+      lightStates: [], lightEffects: [], lightColors: [],
+      lightRandomRgb: '#000000', lightRandomEffects: [],
+      // 颜色弹窗：open + 目标状态 + 当前值 + 视口坐标（fixed 定位，见模板注释）
+      lightPick: {open:false, key:'', rgb:'', top:0, left:0, randomAllowed:false},
       lightMeta: {brightness:{min:1,max:100}, interval_ms:{min:200,max:5000}, defaults:{}},
       clipStates: [],
       // 角色
@@ -1831,31 +1869,51 @@ createApp({
         const r = await this.api('/api/avatars'); if(r) this.avatars = r;
       }catch(e){ this.err = '形象列表加载失败：' + e.message; }
     },
-    // 灯效元数据：7 个状态、15 个预置、5 种效果、9 个片段键、亮度/间隔的取值范围。
-    // 全部由后端下发 —— 固件按 key / preset id 匹配，前端写死一份必然漂移。
+    // 灯效元数据：7 个状态、5 种动效、安全色板 + "随机"哨兵、9 个片段键、
+    // 亮度/间隔的取值范围。全部由后端下发 —— 固件按 key / effect 字符串匹配，
+    // 前端写死一份必然漂移。
     async loadLightMeta(){
       try{
         const r = await this.api('/api/avatars/light-presets'); if (!r) return;
         this.lightStates  = r.states || [];
-        this.lightPresets = r.presets || [];
         this.lightEffects = r.effects || [];
+        this.lightColors  = r.colors || [];
+        const rnd = r.random || {};
+        this.lightRandomRgb = rnd.rgb || '#000000';
+        this.lightRandomEffects = rnd.effects || [];
         this.clipStates   = r.clip_states || [];
         this.lightMeta    = r;
         // 元数据可能比弹窗晚到（loadAll 是并行拉的）。那一刻 lightStates 已经
-        // 有值、aForm.emotion_lights 还是 {} —— 模板会在 undefined 上取 .preset
+        // 有值、aForm.emotion_lights 还是 {} —— 模板会在 undefined 上取 .effect
         // 直接抛渲染错误，整个弹窗变空白。补一次归一即可，成本为零。
         if (this.aBox && this.aForm){ this.fillClips(); this.fillLights(); }
-      }catch(e){ this.err = '灯效预置加载失败：' + e.message; }
+      }catch(e){ this.err = '灯效元数据加载失败：' + e.message; }
     },
-    // 形象列表那一列的灯效摘要：只看待机与提醒两个状态，查预置名，查不到算自定义。
+    // 颜色的展示名：关灯不显示色名，随机显示"随机"，色板内的显示中文名，
+    // 其余（老数据里手填过的颜色）原样显示 hex —— 不要显示成空，
+    // 那会让人以为颜色丢了。
+    lightColorLabel(l){
+      if (!l || !l.effect || l.effect === 'off') return '';
+      if (l.rgb === this.lightRandomRgb) return '随机';
+      const hex = String(l.rgb || '').toUpperCase();
+      const c = (this.lightColors || []).filter(x => String(x.rgb).toUpperCase() === hex)[0];
+      return c ? c.name : String(l.rgb || '');
+    },
+    lightColorName(key){
+      return this.lightColorLabel(this.aForm.emotion_lights[key]) || '—';
+    },
+    // 形象列表那一列的灯效摘要：只看待机与提醒两个状态。
     lightSummary(a){
       const lights = (a && a.emotion_lights) || {};
-      const pick = (k, label) => {
+      const one = (k, label) => {
         const l = lights[k] || {};
-        const p = this.lightPresets.filter(x => x.id === l.preset)[0];
-        return label + ' ' + (p ? p.name : '自定义');
+        if (!l.effect) return label + ' —';
+        if (l.effect === 'off') return label + ' 关闭';
+        const e = (this.lightEffects || []).filter(x => x.effect === l.effect)[0];
+        const name = this.lightColorLabel(l);
+        return label + ' ' + (e ? e.label : l.effect) + (name ? '·' + name : '');
       };
-      return pick('neutral', '待机') + ' / ' + pick('alert', '提醒');
+      return one('neutral', '待机') + ' / ' + one('alert', '提醒');
     },
     // 保证 clips 9 个键都在：模板里直接 v-model="aForm.clips[cs.key]"，
     // 键不存在时界面首次渲染是空的。
@@ -1871,7 +1929,7 @@ createApp({
       });
       this.aForm.clips = out;
     },
-    // 保证 emotion_lights 7 个状态 × 5 个字段都在。
+    // 保证 emotion_lights 7 个状态 × 4 个字段都在。
     fillLights(){
       const src = this.aForm.emotion_lights || {};
       const out = {};
@@ -1879,9 +1937,8 @@ createApp({
         const d = (this.lightMeta.defaults || {})[st.key] || {};
         const cur = src[st.key] || {};
         out[st.key] = {
-          preset: typeof cur.preset === 'string' ? cur.preset : (d.preset || ''),
-          rgb: cur.rgb || d.rgb || '#FFFFFF',
-          effect: cur.effect || d.effect || 'solid',
+          rgb: cur.rgb || d.rgb || '#4A90D9',
+          effect: cur.effect || d.effect || 'breath',
           brightness: Number(cur.brightness || d.brightness || 100),
           interval_ms: Number(cur.interval_ms || d.interval_ms || 800),
         };
@@ -1893,15 +1950,37 @@ createApp({
       const e = (this.lightEffects || []).filter(x => x.effect === eff)[0];
       return !!(e && e.interval);
     },
-    pickLight(key, ev){
-      const id = ev.target.value;
+    // 换效果。**必须顺带处理"随机色"**：先选"星光 + 随机"再改成"常亮"，
+    // rgb 还留着 #000000，而固件对常亮/呼吸的 color==0 就是**灯灭** ——
+    // 界面显示"随机"、实际不亮，是最难排查的一种。
+    pickEffect(key, ev){
+      const eff = ev.target.value;
       const l = this.aForm.emotion_lights[key];
       if (!l) return;
-      l.preset = id;
-      const p = (this.lightPresets || []).filter(x => x.id === id)[0];
-      // 选「自定义」只清 preset 锚点，**不动 rgb/effect** ——
-      // 否则用户手调好的颜色会被一次误点清成白色。
-      if (p){ l.rgb = p.rgb; l.effect = p.effect; }
+      l.effect = eff;
+      if (l.rgb === this.lightRandomRgb
+          && (this.lightRandomEffects || []).indexOf(eff) < 0){
+        l.rgb = (this.lightColors[0] || {}).rgb || '#FFE9C4';
+      }
+    },
+    // 打开颜色弹窗。坐标按按钮 getBoundingClientRect 算并夹在视口内：
+    // 表格最后一行靠页面底部时，往下弹会被浏览器裁掉，看起来像"点了没反应"。
+    openLightColor(key, ev){
+      const l = this.aForm.emotion_lights[key];
+      if (!l) return;
+      const r = ev.currentTarget.getBoundingClientRect();
+      const W = 236, H = 220;   // 弹窗宽（与模板 width 一致）与估算高度
+      this.lightPick = {
+        open: true, key: key, rgb: l.rgb,
+        left: Math.max(12, Math.min(r.left, window.innerWidth - W - 12)),
+        top: Math.max(12, Math.min(r.bottom + 6, window.innerHeight - H)),
+        randomAllowed: (this.lightRandomEffects || []).indexOf(l.effect) >= 0,
+      };
+    },
+    applyLightColor(rgb){
+      const l = this.aForm.emotion_lights[this.lightPick.key];
+      if (l) l.rgb = rgb;
+      this.lightPick.open = false;
     },
     setLight(key, field, val){
       const l = this.aForm.emotion_lights[key];
@@ -1917,7 +1996,7 @@ createApp({
       this.aForm = a ? JSON.parse(JSON.stringify(a))
                      : {name:'', description:'', clips:{}, emotion_lights:{}};
       delete this.aForm.tts_voice;
-      // 必须在 aBox=true 之前补齐：模板里直接读 emotion_lights[st.key].preset，
+      // 必须在 aBox=true 之前补齐：模板里直接读 emotion_lights[st.key].effect，
       // 晚一步就会在首帧拿到 undefined 而报错。
       this.fillClips();
       this.fillLights();

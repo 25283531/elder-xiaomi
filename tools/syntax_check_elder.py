@@ -60,6 +60,11 @@ TARGETS = {
     # （main 编译的是 firmware/xiaozhi/components/elder，不是源目录）。
     "rgb.c": ROOT / "firmware" / "xiaozhi" / "components" / "elder" / "src" / "rgb.c",
     "mcp_server.cc": ROOT / "firmware" / "xiaozhi" / "main" / "mcp_server.cc",
+    # 2026-11-01 加 sync.c：灯效下发解析（light_effect_from_str / apply_lights）
+    # 全在这个文件里，"加一个 effect 字符串"是最容易漏改映射表的一类改动，
+    # 而漏改的表现是**用户换了效果灯没变、两端日志都正常**。
+    # 它之前一直不在检查清单里，等于这块改动从来没有过编译级门禁。
+    "sync.c": ROOT / "firmware" / "xiaozhi" / "components" / "elder" / "src" / "sync.c",
 }
 
 #: 需要确保存在的宏（见坑 3）。

@@ -1265,7 +1265,15 @@ _Static_assert(sizeof(k_light_keys) / sizeof(k_light_keys[0]) == ELDER_RGB_ST_CO
  * 取值避开 ELDER_FX_*（0~7）与 ELDER_RGB_EFFECT_OFF（0xFF）。 */
 #define LIGHT_EFFECT_KEEP 0xFEu
 
-/** 服务端 5 个 effect 字符串 → 固件灯效枚举。认不出返回 LIGHT_EFFECT_KEEP（保留默认）。 */
+/** 服务端 5 个 effect 字符串 → 固件灯效枚举。认不出返回 LIGHT_EFFECT_KEEP（保留默认）。
+ *
+ * 这张表必须与 ``server/app/avatar_style.py`` 的 ``LIGHT_EFFECTS`` 逐字对齐。
+ * 两边不同步的表现是"用户在界面上换了个效果、灯没变"，且**两端日志都正常**
+ * —— 服务端只是发了个字符串，固件只是保留默认，没有任何一方觉得有问题。
+ *
+ * ``blink`` 仍然认：2026-11-01 服务端的 5 种里已经没有它了，但老固件配新服务端、
+ * 新固件配老服务端都会出现（灰度/回滚），删掉它只会让"闪烁"退化成"常亮"。
+ * 映射表**只增不减**，下线一个效果靠服务端不发，不靠固件不认。 */
 static uint8_t light_effect_from_str(const char *s)
 {
     if (!s) return LIGHT_EFFECT_KEEP;
@@ -1274,6 +1282,7 @@ static uint8_t light_effect_from_str(const char *s)
     if (strcmp(s, "breath") == 0)    return (uint8_t)ELDER_FX_BREATH;
     if (strcmp(s, "blink") == 0)     return (uint8_t)ELDER_FX_BLINK_FAST;
     if (strcmp(s, "starlight") == 0) return (uint8_t)ELDER_FX_TWINKLE;
+    if (strcmp(s, "flow") == 0)      return (uint8_t)ELDER_FX_FLOW;
     return LIGHT_EFFECT_KEEP;
 }
 
@@ -1327,7 +1336,24 @@ static void apply_lights(cJSON *lights)
         }
 
         cJSON *rgb = cJSON_GetObjectItem(it, "rgb");
-        if (cJSON_IsString(rgb)) dst->color = light_rgb_from_str(rgb->valuestring);
+        if (cJSON_IsString(rgb)) {
+            /* ``light_rgb_from_str()`` 对**非法串**返回 0，而 0 对常亮/呼吸
+             * 就是"灯灭" —— 拼错一个颜色 = 灯直接不亮，且两端日志都正常。
+             * 所以只接受两种情况：
+             *   · 解析出非零颜色；
+             *   · 字面就是全 0（服务端约定的"颜色随机"哨兵，固件侧靠
+             *     ``s->color == 0`` 识别，见 rgb.c 的 TWINKLE / FLOW 分支）。
+             * 其余（"#FFF" 这种短格式、"#GGGGGG"）保留内置默认色。 */
+            const char *p = rgb->valuestring;
+            if (*p == '#') p++;
+            const uint32_t v = light_rgb_from_str(rgb->valuestring);
+            if (v != 0u || strcmp(p, "000000") == 0) {
+                dst->color = v;
+            } else {
+                ESP_LOGW(TAG, "状态 %s 的 rgb=\"%s\" 不是合法颜色，保留默认色",
+                         k_light_keys[i].key, rgb->valuestring);
+            }
+        }
 
         /* brightness 是 1~100 的百分比，固件要 0~255 的感知亮度。
          * 下限钳到 20（≈8%）：低于它 gamma 表里直接是 0，灯根本不亮，

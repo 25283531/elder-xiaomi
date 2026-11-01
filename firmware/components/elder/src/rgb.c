@@ -616,10 +616,37 @@ static uint32_t fx_pixel(const slot_t *s, uint32_t t_ms, int led_idx)
         break;
     }
     case ELDER_FX_FLOW: {
+        /* **流水（跑马灯）**。2026-11-01 起支持两种颜色模式：
+         *
+         *  · ``s->color != 0``（配了固定色）—— **同色行波**：颜色不变，
+         *    亮度沿灯带做一个行进的三角波，看起来是一道同色的水波流过。
+         *    固定色**不能**沿用"整条同色不动"：那就和 ELDER_FX_SOLID 长得
+         *    一模一样，用户会以为"选了流水没反应"。
+         *
+         *  · ``s->color == 0``（服务端用 rgb="#000000" 表达"颜色随机"）
+         *    —— **五彩流水**：每个灯位一个色相，整条随时间滚动。
+         *    这一段是 2026-10-31 之前的老行为，逐字保留。
+         *
+         * 灯位相位用常量 ``ELDER_FLOW_LED_STEP_DEG``（45°）而不是
+         * ``360 / (LEDS-1)``：后者会随灯数变化，改灯数不该悄悄改掉观感。 */
         uint32_t idx = (led_idx > 0) ? (uint32_t)(led_idx - 1) : 0u;
-        uint32_t hue = ((t_ms / ELDER_FLOW_TICK_MS) * ELDER_FLOW_DEG_PER_TICK
-                        + idx * ELDER_FLOW_LED_STEP_DEG) % 360u;
-        c = hsv2rgb((uint16_t)hue, 255, 255);
+        const uint32_t phase =
+            (t_ms / ELDER_FLOW_TICK_MS) * ELDER_FLOW_DEG_PER_TICK;
+        if (s->color) {
+            /* 行波与随机分支共用同一个 phase ⇒ "流水"的**速度与颜色模式
+             * 无关**，否则换个颜色观感就变了。 */
+            const uint32_t w = (phase + idx * ELDER_FLOW_LED_STEP_DEG) % 360u;
+            /* 三角波 0 → 255 → 0：0~180° 上升、180~360° 下降 */
+            const uint32_t tri = (w < 180u) ? (w * 255u / 180u)
+                                            : ((360u - w) * 255u / 180u);
+            /* 留 40 的底（≈16%）：全灭会看成"灯带断了/坏了" ——
+             * 这台设备是给老人看的，一闪一灭很容易被当成故障。 */
+            mod = 40u + tri * 215u / 255u;
+            c = s->color;
+        } else {
+            const uint32_t hue = (phase + idx * ELDER_FLOW_LED_STEP_DEG) % 360u;
+            c = hsv2rgb((uint16_t)hue, 255, 255);
+        }
         break;
     }
     case ELDER_FX_RAINBOW:
