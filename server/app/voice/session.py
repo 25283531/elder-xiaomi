@@ -136,6 +136,19 @@ _RETRY_SIMILARITY: Final[float] = 0.8  # 归一化后的字符级相似度阈值
 #: 那条假偏好会一直留在 APP 的偏好列表里。真正逐字重复的两句长度比接近 1。
 _RETRY_MIN_LEN_RATIO: Final[float] = 0.85
 
+# ---- 会话建立时叫设备同步配置（2026-11-01）----
+#: 设备侧 MCP 工具名（固件 main/mcp_server.cc 注册，与 voice/tools.py 同名）。
+#: 两边是两份手写字符串，改一处必须改另一处 —— 用同一个常量名提醒后来人。
+_DEVICE_SYNC_TOOL: Final[str] = "self.elder.sync_now"
+#: 等它回包的上限。固件的回调只往事件组置一个位就返回，2 秒已经宽得离谱。
+_DEVICE_SYNC_TIMEOUT: Final[float] = 2.0
+# ⚠️ 刻意**没有**时间节流（"同一台设备 60 秒内只叫一次"那种）。
+# 理由是节流会让行为依赖墙上时钟：同一段代码在"刚连过"和"隔了很久"两种
+# 情况下走不同分支，用例就会按时序变红/变绿，而按钟点变红的用例比没有
+# 用例更坏。重连风暴的代价也远没有想象中大 —— 设备侧同步任务是单线程
+# 串行的，重复叫只会让它多跑一轮（一次 HTTPS，约 200ms），且语音链路
+# 走的是另一条连接，不排队。
+
 
 def _norm_utterance(text: str) -> str:
     """归一化一句话再比相似度：只留字/词，去标点、空白、语气符号。
@@ -766,6 +779,8 @@ class VoiceSession:
         # 值是等回包的 Future。见 call_device_tool()。
         self._mcp_pending: dict[int, asyncio.Future] = {}
         self._mcp_seq: int = 0
+        # 会话建立时「叫设备立刻同步一次配置」的后台任务（见 _kick_sync）。
+        self._sync_task: asyncio.Task | None = None
 
     # ================================================================ 生命周期
     async def run(self) -> None:
@@ -806,6 +821,18 @@ class VoiceSession:
                  self.session_id, getattr(self.dev, "device_id", "?"),
                  self.protocol_version)
 
+        # 会话建立 ⇒ 叫设备立刻同步一次配置（2026-11-01 用户要求）。
+        #
+        # 为什么是这里：灯效 / 形象 / 提醒写的是**设备侧**数据，只能由
+        # `POST /api/device/sync` 下发，而设备空闲时靠 300 秒心跳拉取
+        # （schemas.DeviceSyncOut.sync_interval_sec）。设备在**对话中**才连着
+        # WS —— 这就是"唤醒设备可立即生效"唯一能兑现的时刻。不在这里叫一声，
+        # 三端界面上那句"唤醒设备时立即生效"就是假的。
+        #
+        # ⚠️ 必须**后台跑**，绝不 await：hello 之后设备立刻开始推流，在这里
+        # 挡住 2 秒 = 2 秒音频积压（用户红线：不许卡顿/破音）。
+        self._sync_task = asyncio.create_task(self._kick_sync())
+
         try:
             while True:
                 message = await self.ws.receive()
@@ -830,6 +857,10 @@ class VoiceSession:
                           type(exc).__name__, exc)
         finally:
             self.state = "closed"
+            if self._sync_task is not None and not self._sync_task.done():
+                # 会话没撑到同步请求发出就断了：留着它会在已断开的连接上
+                # 发一条 JSON-RPC，等 2 秒超时后记一条误导性的 WARNING。
+                self._sync_task.cancel()
             if self._watchdog_task is not None and not self._watchdog_task.done():
                 # 会话结束后看门狗必须退：它 while state == "listening" 会
                 # 自然退出，但显式取消更及时（少一个 0.2s 轮询的空转 task）。
@@ -941,6 +972,24 @@ class VoiceSession:
     async def _send_json(self, obj: dict[str, Any]) -> None:
         import json
         await self.ws.send_text(json.dumps(obj, ensure_ascii=False))
+
+    async def _kick_sync(self) -> None:
+        """会话建立时叫设备**立刻**同步一次配置。失败一律静默。
+
+        与 ``voice/tools.py`` 的 ``_request_device_sync`` 是同一个工具、同一套
+        降级口径（失败只记 INFO，周期心跳兜底），区别只在触发时机：那边是
+        "提醒表刚变了"，这里是"设备刚连上来，趁它连着把积压的配置取走"。
+
+        **不抛异常**：这是 fire-and-forget task，抛出去只会变成
+        "Task exception was never retrieved" 的噪声日志，而失败本身
+        完全可接受（老固件没注册这个工具 / 设备没答上来）。
+        """
+        try:
+            await self.call_device_tool(_DEVICE_SYNC_TOOL, {}, _DEVICE_SYNC_TIMEOUT)
+            log.info("[%s] 会话建立，已叫设备立刻同步配置", self.session_id)
+        except Exception as exc:  # noqa: BLE001  老固件没这个工具 / 设备没答
+            log.info("[%s] 会话建立时叫设备同步没成功（%s: %s），等心跳兜底",
+                     self.session_id, type(exc).__name__, exc)
 
     async def call_device_tool(self, name: str, arguments: dict[str, Any] | None = None,
                                timeout: float = 3.0) -> Any:

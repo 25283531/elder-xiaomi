@@ -83,7 +83,7 @@ onShow(() => { refresh() })
   <view class="page">
     <view class="head">
       <text class="dname">{{ browseOnly ? '系统形象库' : deviceName }}</text>
-      <text class="sub">{{ browseOnly ? '在「设备」页选择设备后即可绑定形象' : '切换后设备最长约 5 分钟自动获取生效' }}</text>
+      <text class="sub">{{ browseOnly ? '在「设备」页选择设备后即可绑定形象' : '切换后最长约 5 分钟自动获取生效，唤醒设备进入对话可立即生效' }}</text>
     </view>
 
     <view v-for="a in avatars" :key="a.id" class="card" @click="onPick(a)">

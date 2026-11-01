@@ -321,7 +321,7 @@
              心跳才拿到；而人格与音色是服务端每次会话现读的。 -->
         <div class="muted" style="font-size:12px;line-height:1.7;margin:0 0 8px">
           切换形象 / 角色后，设备最长约 <b>5 分钟</b>自动获取生效；
-          人格与音色在下次对话（唤醒设备）时立即生效。
+          唤醒设备进入对话可立即生效。
         </div>
         <table v-if="devices.length">
           <thead><tr><th>名称</th><th>标识</th><th>状态</th><th>硬件型号</th><th>固件版本</th><th>绑定时间</th><th>形象</th><th>人格角色</th><th>操作</th></tr></thead>
@@ -658,7 +658,8 @@
           <!-- 同步时延告知（2026-11-01 用户要求）。形象与灯效是设备侧配置，
                只由 POST /api/device/sync 下发，设备空闲时靠 300 秒心跳拉取。 -->
           <div class="muted" style="font-size:12px;line-height:1.7;margin:6px 0 0">
-            保存后设备最长约 <b>5 分钟</b>自动获取生效。
+            保存后设备最长约 <b>5 分钟</b>自动获取生效；
+            唤醒设备进入对话可立即生效。
           </div>
           <div class="grid g2">
             <div><label>名称</label><input v-model="aForm.name" style="width:100%" /></div>
@@ -826,7 +827,7 @@
                以为改人格也要等 5 分钟。 -->
           <div class="muted" style="font-size:12px;line-height:1.7;margin:6px 0 0">
             保存后设备最长约 <b>5 分钟</b>自动获取生效；
-            人格与音色在下次对话（唤醒设备）时立即生效。
+            唤醒设备进入对话可立即生效。
           </div>
           <div class="grid g2">
             <div><label>名称</label><input v-model="rEdit.name" style="width:100%" /></div>

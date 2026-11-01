@@ -1156,14 +1156,38 @@ async def _settle(seconds: float = 2.5) -> None:
 
 
 async def _drain(ws: object, seconds: float = 0.2) -> None:
-    """把已经到达的消息读干，避免上一条测试的残留影响下一条计数。"""
+    """把已经到达的消息读干，避免上一条测试的残留影响下一条计数。
+
+    ⚠️ 2026-11-01 起这里要**处理**（而不是丢弃）服务端的 mcp tools/call：
+    会话建立时服务端会主动叫一次 ``self.elder.sync_now``（session.py 的
+    ``_kick_sync``，兑现界面上"唤醒设备进入对话可立即生效"那句）。
+    只读不回的话那条后台任务要白等满 2 秒超时，日志里留一串"叫设备同步
+    没成功"；而且 MCP_CALLS 记不到它，12a 就分不清是"进会话叫的"还是
+    "建完提醒叫的"—— 两条断言会互相冒充成真。
+    """
     import asyncio
     end = time.time() + seconds
     while time.time() < end:
         try:
-            await asyncio.wait_for(ws.recv(), timeout=max(0.05, end - time.time()))
+            msg = await asyncio.wait_for(ws.recv(), timeout=max(0.05, end - time.time()))
         except (asyncio.TimeoutError, Exception):  # noqa: BLE001
             break
+        if isinstance(msg, (bytes, bytearray)):
+            continue
+        try:
+            obj = json.loads(msg)
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "mcp":
+            _pl = obj.get("payload")
+            if isinstance(_pl, dict) and _pl.get("method") == "tools/call":
+                MCP_CALLS.append(str((_pl.get("params") or {}).get("name") or ""))
+                await ws.send(json.dumps({
+                    "type": "mcp",
+                    "payload": {"jsonrpc": "2.0", "id": _pl.get("id"),
+                                "result": {"content": [{"type": "text",
+                                                        "text": "true"}],
+                                           "isError": False}}}))
 
 
 async def _connect(ids: dict, version: int = 1):
@@ -1177,7 +1201,10 @@ async def _connect(ids: dict, version: int = 1):
     ws = await ws_connect(WS_URL, open_timeout=10,
                                   headers=headers)
     hello = await _handshake(ws, ids, version)
-    await _drain(ws)
+    # 0.5s 而不是 0.2s：会话建立时服务端会主动下发一条 mcp tools/call
+    # （sync_now），要给它跑完一个事件循环周期的时间被读到 —— 读不到就会
+    # 让那条后台任务白等 2 秒超时，且 MCP_CALLS 少一条（见 _drain 注释）。
+    await _drain(ws, 0.5)
     return ws, str(hello.get("session_id", ""))
 
 
@@ -1840,9 +1867,16 @@ async def t_tools_reminder(ids: dict) -> None:
           f"{chat_before} -> {UP.get('chat_calls')}")
     # 2026-10-29：提醒表变了必须**立刻**叫设备同步一次。不叫的话新提醒要等
     # 设备下一个心跳（默认 300 秒）才拿到 —— 老人说"两分钟后提醒我"就必然漏。
-    check("12a ★ 提醒建成后叫设备立刻同步（self.elder.sync_now）",
-          "self.elder.sync_now" in MCP_CALLS[mcp_before:],
-          str(MCP_CALLS[mcp_before:]))
+    #
+    # ⚠️ 2026-11-01 起**会话建立时也会叫一次**（session.py 的 _kick_sync，
+    # 兑现界面上"唤醒设备进入对话可立即生效"那句）。于是这条链路上会出现
+    # **两次** sync_now：进会话一次、建完提醒一次。所以断言必须按次数判 ——
+    # 原来那句 `"sync_now" in 切片` 现在恒为真，是假绿。
+    calls = MCP_CALLS[mcp_before:]
+    check("12a ★ 会话建立时叫设备同步一次（唤醒即生效的兑现点）",
+          bool(calls) and calls[0] == "self.elder.sync_now", str(calls))
+    check("12a ★ 提醒建成后**再**叫一次（两件事不能混为一谈）",
+          calls.count("self.elder.sync_now") == 2, str(calls))
     check("12a · 回复是把时间念清楚的确认句",
           any("八点" in s for s in sentences), str(sentences))
     meta = _last_interaction_meta(ids["device_pk"])
