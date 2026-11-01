@@ -170,6 +170,22 @@ _TRIM_PAD_FRAMES: Final[int] = 2             # 语音区间前后各留 2 帧 = 
 _TRIM_MIN_SAVE_MS: Final[int] = 300          # 裁掉总量不足 300ms 就原样发：切片有风险
                                               # （VAD 误判会切掉轻声的词），没收益不担风险
 
+# ---- 送 ASR 前另裁「句中长静音」（2026-11-01 真机：唤醒词只认到两次）----
+# 生产日志：838 帧（50.3s）→ 只裁头尾 → 259 帧（15.5s），识别为空。
+# 259 帧里只有 540ms（9 帧）真语音，其余是十几秒静音 —— 只裁头尾等于
+# 把"一句话 + 十几秒静音 + 另一句"整坨喂给 ASR，短句被静音淹掉。
+# 所以按语音帧下标表把窗口切成若干段拼起来。三条闸都是"宁可不动"：
+_TRIM_GAP_KEEP_FRAMES: Final[int] = 8        # 相邻语音帧间隔 ≤ 8 帧（480ms）算同一段。
+                                              # 句中换气/轻声音节就几百毫秒，切太密
+                                              # 会把一个词劈两半，ASR 直接丢字。
+_TRIM_GAP_MIN_SAVE_MS: Final[int] = 2000      # 句中静音至少省下 2s 才拼接。
+                                              # 正常一轮（连着说一两句）省不到 2s ⇒
+                                              # 走连续窗口，送 ASR 的字节与改动前
+                                              # 完全一致，行为零变化；只有"长静音"
+                                              # 这种形态才动手。
+_TRIM_MIN_KEEP_MS: Final[int] = 300           # 拼完不足 300ms 就回退连续窗口：
+                                              # 一小片碎片送 ASR 只会返回空。
+
 # 每轮对话记 Interaction 的 kind。用 DIALOG（=1）而不是新值：
 # schemas.InteractionReportIn.kind 是 int，取值集合由
 # models.InteractionKind 定义，新增枚举值要连 APP 统计口径一起改。
@@ -668,6 +684,11 @@ class VoiceSession:
         # 送 ASR 前按这个区间裁头尾静音，见 _TRIM_PAD_FRAMES 注释。
         self._first_speech_frame: int = -1
         self._last_speech_frame: int = -1
+        # 本轮所有被判为语音的帧下标（升序，_pcm 下标）。first/last 只够
+        # 裁头尾，句中夹的十几秒静音全留在里面（2026-11-01 真机：838 帧
+        # 只裁到 259 帧，其中真语音 540ms，ASR 返回空）。这张表由
+        # _mark_speech_frame 顺手记，供 _trim_silence_edges 分段拼接。
+        self._speech_idx: list[int] = []
 
         # 会话内对话历史（[{"role":..,"content":..}]），仅内存，不落库；
         # 跨连接的历史由记忆模块管（recent_turns），这里不重复存一份。
@@ -1189,6 +1210,8 @@ class VoiceSession:
         if self._first_speech_frame < 0:
             self._first_speech_frame = idx
         self._last_speech_frame = idx
+        # 顺手记下标表（升序）。句中静音的分段拼接靠它，见 _trim_silence_edges。
+        self._speech_idx.append(idx)
 
     def _reset_speech_window(self) -> None:
         """清空"语音帧区间"。每轮用完即清（_finalize / 重新武装时）。
@@ -1199,6 +1222,9 @@ class VoiceSession:
         """
         self._first_speech_frame = -1
         self._last_speech_frame = -1
+        # 下标表同理：上一轮的下标留在里面，下一轮会被当成"句中语音"拼进
+        # 送 ASR 的音频，把不该保留的静音又拼回去。
+        self._speech_idx.clear()
 
     # ---------------------------------------------------------------- 全双工
     def _feed_barge_in(self, payload: bytes) -> None:
@@ -1882,6 +1908,12 @@ class VoiceSession:
            通常也不够，看门狗根本不会走到这里；设备主动 stop 的
            空轮则保持原行为（送全段 → ASR 返回空 → 念「我没听清」），
            不因本改动改变语义。
+
+        第二段（2026-11-01 真机）：只裁头尾挡不住"一句话 + 十几秒静音 +
+        另一句"——838 帧裁到 259 帧，其中真语音只有 540ms，ASR 返回空。
+        这里再按 ``_speech_idx`` 把窗口切成若干语音段拼起来，三道闸
+        （``_TRIM_GAP_KEEP_FRAMES`` / ``_TRIM_GAP_MIN_SAVE_MS`` /
+        ``_TRIM_MIN_KEEP_MS``）保证正常一轮仍走连续窗口、字节不变。
         """
         if self._first_speech_frame < 0 or self._last_speech_frame < 0:
             return pcm
@@ -1896,11 +1928,44 @@ class VoiceSession:
         frame_ms = config.VOICE_FRAME_DURATION_MS or 60
         if saved_frames * frame_ms < _TRIM_MIN_SAVE_MS:
             return pcm
-        trimmed = pcm[start:end + 1]
+        window = pcm[start:end + 1]
+
+        # ---- 句中长静音：按语音帧下标表分段，拼成一条连续音频 ----
+        # 相邻语音帧间隔 ≤ _TRIM_GAP_KEEP_FRAMES 归同一段（保留句中换气），
+        # 超过就断开；每段两端各外扩 _TRIM_PAD_FRAMES 保护词头/词尾。
+        idxs = [i for i in self._speech_idx if start <= i <= end]
+        segs: list[list[int]] = []
+        for i in idxs:
+            if segs and i - segs[-1][1] <= _TRIM_GAP_KEEP_FRAMES:
+                segs[-1][1] = i
+            else:
+                segs.append([i, i])
+        merged: list[list[int]] = []
+        for a, b in segs:
+            a = max(start, a - _TRIM_PAD_FRAMES)
+            b = min(end, b + _TRIM_PAD_FRAMES)
+            if merged and a <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        spliced = b"".join(b"".join(pcm[a:b + 1]) for a, b in merged)
+        # 口径统一按**帧**算（spliced 是 bytes，len() 是字节数，别拿它当帧数）。
+        spliced_frames = sum(b - a + 1 for a, b in merged)
+        saved_gap_frames = len(window) - spliced_frames
+        # 硬闸：没省下足够长的静音 / 拼完只剩碎片 ⇒ 原样发连续窗口。
+        # 正常一轮在这里必然回退，送 ASR 的音频与改动前逐字节一致。
+        if (saved_gap_frames * frame_ms >= _TRIM_GAP_MIN_SAVE_MS
+                and spliced_frames * frame_ms >= _TRIM_MIN_KEEP_MS):
+            log.info("[%s] ASR 前另裁掉句中静音 %d 帧（%dms）：%d 帧 → %d 帧（%d 段）",
+                     self.session_id, saved_gap_frames,
+                     saved_gap_frames * frame_ms, n, spliced_frames,
+                     len(merged))
+            return spliced
+
         log.info("[%s] ASR 前裁掉头尾静音 %d 帧（%dms）：%d 帧 → %d 帧",
                  self.session_id, saved_frames, saved_frames * frame_ms,
-                 n, len(trimmed))
-        return trimmed
+                 n, len(window))
+        return window
 
     async def _run_turn(self, pcm: list[bytes], started: float) -> str:
         # 每轮重置"待机复核"状态（见 __init__ 里这两个字段的说明）。

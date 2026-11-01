@@ -2544,6 +2544,7 @@ def t_parse_when_units() -> None:
     t_dismiss_and_watchdog()
     t_device_abilities()        # 12m：WiFi / 头条 / 状态灯（2026-11-01 加）
     t_asr_silence_trim()
+    t_asr_silence_gap()         # 12n：句中长静音分段拼接（2026-11-01 真机）
     t_emotion_tag()
     t_barge_in()
 
@@ -2600,6 +2601,7 @@ def t_barge_in() -> None:
         s._max_closed_pause_ms = 0
         s._first_speech_frame = -1
         s._last_speech_frame = -1
+        s._speech_idx = []
         s._mark_speech_frame = types.MethodType(
             S.VoiceSession._mark_speech_frame, s)
         s._reset_speech_window = types.MethodType(
@@ -2788,6 +2790,7 @@ def t_barge_in() -> None:
             s8._pcm = [_mk(False)] * 5 + [_mk(True)] * 5
             s8._first_speech_frame = 5
             s8._last_speech_frame = 9
+            s8._speech_idx = [5, 6, 7, 8, 9]
             s8._barge_handover = True
             # _finalize 的 finally 现在会读这两个字段做"待机兜底"：
             # 桩对象漏了就是 AttributeError，整段 12l 崩掉。空串/False
@@ -2810,8 +2813,10 @@ def t_barge_in() -> None:
             check("12l ★ finalize 后裁剪窗口清零 + 交接标志清除"
                   "（不清则下一轮裁掉老人刚说的话 / 错保空音频）",
                   s8._first_speech_frame == -1 and s8._last_speech_frame == -1
+                  and s8._speech_idx == []
                   and not s8._barge_handover and ran == [10],
                   f"first={s8._first_speech_frame} last={s8._last_speech_frame} "
+                  f"idx={len(s8._speech_idx)} "
                   f"handover={s8._barge_handover} ran={ran}")
 
             # 代码级变异：窗口清零拔掉 ⇒ ⑧ 必须红
@@ -2825,6 +2830,7 @@ def t_barge_in() -> None:
                 s8b._pcm = [_mk(False)] * 5 + [_mk(True)] * 5
                 s8b._first_speech_frame = 5
                 s8b._last_speech_frame = 9
+                s8b._speech_idx = [5, 6, 7, 8, 9]
                 s8b._barge_handover = False
                 s8b._dismiss_candidate = ""
                 s8b._standby_requested = False
@@ -3021,11 +3027,14 @@ def t_asr_silence_trim() -> None:
                 for i in range(n))
         return b"\x00\x00" * (16000 * frame_ms // 1000)
 
-    def _session(first: int, last: int, n: int) -> types.SimpleNamespace:
+    def _session(first: int, last: int, n: int,
+                 idxs: list[int] | None = None) -> types.SimpleNamespace:
         s = types.SimpleNamespace()
         s.session_id = "SMOKE-TRIM"
         s._first_speech_frame = first
         s._last_speech_frame = last
+        # 句中静音拼接要读下标表；不给就退化成"只有头尾"的老行为。
+        s._speech_idx = list(idxs) if idxs is not None else []
         s._trim_silence_edges = types.MethodType(
             S.VoiceSession._trim_silence_edges, s)
         return s
@@ -3048,11 +3057,13 @@ def t_asr_silence_trim() -> None:
     check("12j · 无语音帧时原样返回（不改「识别为空」的既有行为）",
           len(out3) == len(pcm3), f"in={len(pcm3)} out={len(out3)}")
 
-    # ---- ④ 句中长停顿不许裁：first..last 之间整段保留 ----
-    #    老人说话慢，句中停顿 >600ms 常见；只裁边缘，不碰中间。
+    # ---- ④ 句中停顿不到 2000ms 不许裁：first..last 之间整段保留 ----
+    #    老人说话慢，句中停顿常见；12n 加的分段拼接有 _TRIM_GAP_MIN_SAVE_MS
+    #    这道 2000ms 硬闸，20 帧（1200ms）停顿省下的只有 960ms ⇒ 回退连续窗口。
     pcm4 = ([_mk(True)] * 5 + [_mk(False)] * 20 + [_mk(True)] * 5)
-    out4 = _session(0, 29, len(pcm4))._trim_silence_edges(list(pcm4))
-    check("12j · 句中长停顿不裁（first..last 之间整段保留）",
+    idx4 = list(range(0, 5)) + list(range(25, 30))
+    out4 = _session(0, 29, len(pcm4), idx4)._trim_silence_edges(list(pcm4))
+    check("12j · 句中停顿 1200ms 未到 2000ms 闸门 ⇒ 整段保留（不切句中）",
           len(out4) == len(pcm4), f"in={len(pcm4)} out={len(out4)}")
 
     # ---- ⑤ pad 必须存在：贴边裁会把慢语速老人的词头切一半 ----
@@ -3083,6 +3094,7 @@ def t_asr_silence_trim() -> None:
     s6._max_speech_run_ms = 0
     s6._first_speech_frame = -1
     s6._last_speech_frame = -1
+    s6._speech_idx = []
     s6._mark_speech_frame = types.MethodType(
         S.VoiceSession._mark_speech_frame, s6)
     s6._feed_vad = types.MethodType(S.VoiceSession._feed_vad, s6)
@@ -3093,10 +3105,161 @@ def t_asr_silence_trim() -> None:
     check("12j · _feed_vad 记录首/末语音帧（8..24），供裁剪使用",
           s6._first_speech_frame == 8 and s6._last_speech_frame == 24,
           f"first={s6._first_speech_frame} last={s6._last_speech_frame}")
+    check("12j · _feed_vad 顺手记下整张语音帧下标表（句中静音拼接靠它）",
+          s6._speech_idx == list(range(8, 25)), f"idx={len(s6._speech_idx)} 个")
     out6 = _session(s6._first_speech_frame, s6._last_speech_frame,
-                    len(s6._pcm))._trim_silence_edges(list(s6._pcm))
+                    len(s6._pcm), s6._speech_idx)._trim_silence_edges(
+        list(s6._pcm))
     check("12j · VAD 区间喂给裁剪：30 帧 → 21 帧（8-2 .. 24+2）",
           len(out6) == 21, f"out={len(out6)} want=21")
+
+
+def t_asr_silence_gap() -> None:
+    """12n. 送 ASR 前另裁「句中长静音」（2026-11-01 真机 bug）。
+
+    现象：老人连说几次唤醒词，只认到两次。
+    生产日志（2026-11-01 23:20:13）：838 帧（50.3s）只裁头尾 → 259 帧
+    （15.5s）送 ASR，其中真语音只有 540ms（9 帧），识别结果为空 ——
+    短句被十几秒静音淹掉。
+
+    修法：按语音帧下标表分段拼接。三道闸保证正常一轮**字节不变**：
+    - 相邻语音帧间隔 ≤ 8 帧（480ms）算同一段，句中换气不切；
+    - 句中静音省不到 2000ms ⇒ 回退连续窗口（正常轮走这条路）；
+    - 拼完不足 300ms ⇒ 同样回退。
+    """
+    import types
+
+    from app.voice import session as S
+
+    frame_ms = S.config.VOICE_FRAME_DURATION_MS or 60
+    n_per = 16000 * frame_ms // 1000
+
+    def _mk(tag: int) -> bytes:
+        """一帧 PCM：tag>0 当语音（不同 tag 给不同波形，便于逐帧比对），
+        tag=0 当静音（全零）。"""
+        if not tag:
+            return b"\x00\x00" * n_per
+        import struct
+        return b"".join(
+            struct.pack("<h", ((i * tag) % 3000) + 1000)
+            for i in range(n_per))
+
+    def _sess(first: int, last: int, idxs: list[int]) -> types.SimpleNamespace:
+        s = types.SimpleNamespace()
+        s.session_id = "SMOKE-TRIM-GAP"
+        s._first_speech_frame = first
+        s._last_speech_frame = last
+        s._speech_idx = list(idxs)
+        s._trim_silence_edges = types.MethodType(
+            S.VoiceSession._trim_silence_edges, s)
+        return s
+
+    def _continuous(pcm: list[bytes], first: int, last: int) -> list[bytes]:
+        """对照组：老行为（只裁头尾）会送出的连续窗口。"""
+        pad = S._TRIM_PAD_FRAMES
+        a = max(0, first - pad)
+        b = min(len(pcm) - 1, last + pad)
+        return pcm[a:b + 1]
+
+    def _nf(out: bytes) -> int:
+        """返回的 bytes 里有几帧（一帧 = n_per 个 16bit 采样）。"""
+        return len(out) // (n_per * 2)
+
+    def _b(x) -> bytes:
+        """把"帧列表"或"已拼接的 bytes"统一成 bytes 再比 —— 否则
+        list == bytes 恒为 False，断言会假红/假绿。"""
+        return x if isinstance(x, bytes) else b"".join(x)
+
+    # ---- ① 正常形态：头尾静音 + 单段连续语音 ⇒ 与老行为逐字节一致 ----
+    pcm1 = ([_mk(0)] * 10 + [_mk(1)] * 20 + [_mk(0)] * 15)
+    idx1 = list(range(10, 30))
+    out1 = _sess(10, 29, idx1)._trim_silence_edges(list(pcm1))
+    want1 = _b(_continuous(pcm1, 10, 29))
+    check("12n ① 单段连续语音：结果与「只裁头尾」的连续窗口逐字节一致（零回归）",
+          _b(out1) == want1 and _nf(_b(out1)) == 24,
+          f"out={_nf(_b(out1))}帧 want={len(want1)}B 相同={_b(out1) == want1}")
+
+    # ---- ② 两段语音中间夹 20 秒静音 ⇒ 拼接，两段语音帧全在 ----
+    #    20s = 334 帧（60ms/帧），远超 2000ms 闸门。
+    gap = 334
+    pcm2 = ([_mk(0)] * 5 + [_mk(1)] * 10 + [_mk(0)] * gap
+            + [_mk(2)] * 10 + [_mk(0)] * 5)
+    first2, last2 = 5, 5 + 10 + gap + 9
+    idx2 = list(range(5, 15)) + list(range(15 + gap, 25 + gap))
+    out2 = _sess(first2, last2, idx2)._trim_silence_edges(list(pcm2))
+    cont2 = _continuous(pcm2, first2, last2)
+    want2 = b"".join(pcm2[5 - 2:15 + 2] + pcm2[15 + gap - 2:25 + gap + 2])
+    check("12n ② 夹 20s 静音：被拼接，长度远小于连续窗口，两段语音帧逐帧都在",
+          out2 == want2 and _nf(out2) == 28 and _nf(out2) * 3 < len(cont2),
+          f"out={_nf(out2)}帧 cont={len(cont2)}帧 一致={out2 == want2}")
+
+    # ---- ③a 中间只夹 400ms（7 帧）静音 ⇒ 间隔 ≤ 480ms 算同一段，不切 ----
+    #    句中换气/轻声音节就是这个量级，切了 ASR 直接丢字。
+    pcm3 = ([_mk(0)] * 5 + [_mk(1)] * 10 + [_mk(0)] * 7
+            + [_mk(2)] * 10 + [_mk(0)] * 5)
+    first3, last3 = 5, 31
+    idx3 = list(range(5, 15)) + list(range(22, 32))
+    out3 = _sess(first3, last3, idx3)._trim_silence_edges(list(pcm3))
+    cont3 = _continuous(pcm3, first3, last3)
+    check("12n ③a 句中只夹 400ms 静音：间隔 ≤ 480ms 算同一段，仍走连续窗口",
+          _b(out3) == _b(cont3), f"out={_nf(_b(out3))}帧 cont={len(cont3)}帧")
+
+    # ---- ③b 中间夹 1200ms（20 帧）静音 ⇒ 间隔够大能断开，但省下的
+    #      (20-2*2)=16 帧 = 960ms 没到 2000ms 闸门 ⇒ 仍走连续窗口。
+    #      这条是"保守闸"唯一的判据来源，变异测试打的就是它。
+    pcm3b = ([_mk(0)] * 5 + [_mk(1)] * 10 + [_mk(0)] * 20
+             + [_mk(2)] * 10 + [_mk(0)] * 5)
+    first3b, last3b = 5, 44
+    idx3b = list(range(5, 15)) + list(range(35, 45))
+    out3b = _sess(first3b, last3b, idx3b)._trim_silence_edges(list(pcm3b))
+    cont3b = _continuous(pcm3b, first3b, last3b)
+    check("12n ③b 句中夹 1200ms 静音：省 960ms 未到 2000ms 闸门，仍走连续窗口",
+          _b(out3b) == _b(cont3b), f"out={_nf(_b(out3b))}帧 cont={len(cont3b)}帧")
+
+    # ---- ④ 三段语音、各夹 10s 静音 ⇒ 拼成 3 段，总长 ≈ 三段 + 各自 pad ----
+    gap4 = 167                       # 10s
+    pcm4, idx4 = [_mk(0)] * 5, []
+    pos = 5
+    for tag in (1, 2, 3):
+        idx4 += list(range(pos, pos + 10))
+        pcm4 += [_mk(tag)] * 10
+        pos += 10
+        if tag != 3:
+            pcm4 += [_mk(0)] * gap4
+            pos += gap4
+    pcm4 += [_mk(0)] * 5
+    first4, last4 = 5, pos - 1
+    out4 = _sess(first4, last4, idx4)._trim_silence_edges(list(pcm4))
+    check("12n ④ 三段语音各夹 10s 静音：拼成 3 段，总长 = 三段 + 各自 pad",
+          _nf(out4) == 3 * (10 + 2 * S._TRIM_PAD_FRAMES)
+          and _nf(out4) < len(_continuous(pcm4, first4, last4)) // 5,
+          f"out={_nf(out4)}帧 cont={len(_continuous(pcm4, first4, last4))}帧")
+
+    # ---- ⑤ 只有一个语音帧 ⇒ 不拼接，走连续窗口 ----
+    pcm5 = [_mk(0)] * 10 + [_mk(1)] * 1 + [_mk(0)] * 10
+    out5 = _sess(10, 10, [10])._trim_silence_edges(list(pcm5))
+    check("12n ⑤ 只有一个语音帧：不拼接，走连续窗口（别把碎片喂 ASR）",
+          _b(out5) == _b(_continuous(pcm5, 10, 10)),
+          f"out={_nf(_b(out5))}帧 cont={len(_continuous(pcm5, 10, 10))}帧")
+
+    # ---- ⑥ 一轮里没记录到语音帧 ⇒ 原样返回入参 ----
+    pcm6 = [_mk(0)] * 20
+    out6 = _sess(-1, -1, [])._trim_silence_edges(list(pcm6))
+    check("12n ⑥ 无语音帧：原样返回入参（不改「识别为空」的既有语义）",
+          out6 == pcm6 and len(out6) == 20, f"out={len(out6)}")
+
+    # ---- ⑦ 变异：保守闸打到 0（拼接无条件生效）⇒ ③b 必须变红 ----
+    #    ① 单段连续语音无论闸门多少都是同一份字节（拼接结果 == 连续窗口），
+    #    所以"闸门真的在挡"只能由 ③b 这种"能断但省不够"的形态来证明。
+    real_gate = S._TRIM_GAP_MIN_SAVE_MS
+    S._TRIM_GAP_MIN_SAVE_MS = 0
+    try:
+        m3b = _sess(first3b, last3b, idx3b)._trim_silence_edges(list(pcm3b))
+    finally:
+        S._TRIM_GAP_MIN_SAVE_MS = real_gate
+    check("12n ★ 保守闸是真实防线（闸门=0 时 ③b 被拼接变短，说明断言抓得到）",
+          m3b != _b(cont3b) and _nf(m3b) < len(cont3b),
+          f"变异 out={_nf(m3b)}帧 cont={len(cont3b)}帧")
 
 
 
