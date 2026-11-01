@@ -601,6 +601,14 @@ onShow(() => { refresh() })
           创建我的角色
         </view>
 
+        <!-- 同步时延告知（2026-11-01 用户要求）。
+             人格与音色走**服务端**：每次会话开始从库里读 role 行，
+             所以改完下次对话就生效，不必等设备心跳（300 秒）。
+             这句必须和形象页那句区分开，否则用户会以为改角色也要等 5 分钟。 -->
+        <text class="role-hint">
+          保存后设备最长约 5 分钟自动获取生效；人格与音色在下次对话（唤醒设备）时立即生效。
+        </text>
+
         <!-- 创建方式：改成一个下拉（picker）。
              ⚠️ 原来是「原创 + 各平台预设」平铺成一列卡片堆在表单顶部，
              老人看不出它们是**互斥三选一**，会以为要一项项点过去。
@@ -750,6 +758,11 @@ onShow(() => { refresh() })
 
 /* 表单分组标题（创建方式 / 音色） */
 .group-label { font-size: 26rpx; color: #6b7280; margin-bottom: 10rpx; }
+/* 同步时延提示：跟 reminder-edit.vue 的 .notice 同一套视觉（浅橙底），
+   让"这条是提醒你等一会儿"的语义在三端一致。 */
+.role-hint { display: block; font-size: 22rpx; line-height: 1.6; color: #874d00;
+  background: #fff7e6; border: 1rpx solid #ffd591; border-radius: 12rpx;
+  padding: 12rpx 16rpx; margin-bottom: 16rpx; }
 
 /* picker 选择框。
    ⚠️ 高度不能靠 padding 撑：APP 端 <picker> 里包的是原生控件，

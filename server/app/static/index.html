@@ -439,6 +439,15 @@
         <div class="modal">
           <button class="close" @click="aBox=null">&times;</button>
           <h2>{{aForm.id?'编辑形象':'新增形象'}}</h2>
+          <!-- 同步时延告知（2026-11-01 用户要求）。
+               为什么必须写在界面上：灯效/形象是**设备侧配置**，只由
+               POST /api/device/sync 下发，而设备空闲时靠 300 秒心跳拉取
+               （schemas.DeviceSyncOut.sync_interval_sec，固件 sync.c 接受
+               60~3600）。设备没有常连控制通道，服务端无法主动推。
+               不写这句话，用户改完灯效看不到反应只会认为「保存没用」。 -->
+          <div class="muted" style="font-size:12px;line-height:1.7;margin:6px 0 0">
+            保存后设备最长约 <b>5 分钟</b>自动获取生效。
+          </div>
           <div class="grid g2">
             <div><label>名称</label><input v-model="aForm.name" style="width:100%" /></div>
             <div><label>简介</label><input v-model="aForm.description" style="width:100%" /></div>
@@ -585,6 +594,16 @@
         <div class="modal" style="max-width:860px">
           <button class="close" @click="closePreset">&times;</button>
           <h2>{{ pEdit.isNew ? '新建平台预设' : '编辑平台预设：' + pEdit.name }}</h2>
+
+          <!-- 同步时延告知（2026-11-01 用户要求）。
+               人格与音色走的是**服务端**：每次会话开始从库里读 role 行，
+               所以改完下次对话就生效，不必等设备心跳。写成两句是为了让
+               运营知道「哪些要等、哪些不用等」—— 只说 5 分钟会让他们
+               以为改人格也要等。 -->
+          <div class="muted" style="font-size:12px;line-height:1.7;margin:6px 0 0">
+            保存后设备最长约 <b>5 分钟</b>自动获取生效；
+            人格与音色在下次对话（唤醒设备）时立即生效。
+          </div>
 
           <!-- 新建态不显示「影响 N 台设备」：此刻还没有任何设备绑它。
                但要把「稍后仍可改」说清楚，否则运营会以为建完就定型了。 -->
