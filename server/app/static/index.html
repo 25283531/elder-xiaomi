@@ -446,7 +446,8 @@
                60~3600）。设备没有常连控制通道，服务端无法主动推。
                不写这句话，用户改完灯效看不到反应只会认为「保存没用」。 -->
           <div class="muted" style="font-size:12px;line-height:1.7;margin:6px 0 0">
-            保存后设备最长约 <b>5 分钟</b>自动获取生效。
+            保存后设备最长约 <b>5 分钟</b>自动获取生效；
+            唤醒设备进入对话可立即生效。
           </div>
           <div class="grid g2">
             <div><label>名称</label><input v-model="aForm.name" style="width:100%" /></div>
@@ -602,7 +603,7 @@
                以为改人格也要等。 -->
           <div class="muted" style="font-size:12px;line-height:1.7;margin:6px 0 0">
             保存后设备最长约 <b>5 分钟</b>自动获取生效；
-            人格与音色在下次对话（唤醒设备）时立即生效。
+            唤醒设备进入对话可立即生效。
           </div>
 
           <!-- 新建态不显示「影响 N 台设备」：此刻还没有任何设备绑它。
