@@ -431,6 +431,32 @@ def main() -> int:
               code in (200, 201) and (fb2 or {}).get("valid") is False,
               f"reason={(fb2 or {}).get('reason','')}")
 
+        # 2026-11-01 生产实据（不是假设的边界）：
+        # 老人一口气说了 204 字（"水煎包有肉的话买肉的…庙后头加油站北边儿…"），
+        # ASR 把整段连续语音并成了一句，而服务端因为**抢话打断**给了
+        # signal=correction ⇒ 整段被当成"用户给出了自己的表述"，原样写成**正例**。
+        # 之后它作为 few-shot 注入 system prompt，等于拿一段含识别噪声
+        # （"一一臭氧""草镇"）的下单流水账教模型"应该这样说话"，还会顶掉
+        # 真正有用的短示例。闸门：纠正路径超过上限一律不学，但**审计照写**。
+        long_utter = (
+            "我就说，水煎包儿有肉的话买肉的，没有的话就就直接那个小笼包儿。"
+            "庙后再买吧，那就搁好买，都中还庙后。然后，那家儿不是胡辣汤，"
+            "他们说，那家儿胡辣汤都说白借的。啊，一一臭氧。那我去吧，"
+            "我也不知道胡东，你不是说有个清奶奶谁家的那个包子好吃，"
+            "我去那边去买吧。什么牛呀？他家不是包子，不是苗后，还是草镇？"
+            "庙后，庙后头，加油站北边儿。他家的胡辣汤辣，买胡辣汤吧，不买辣。"
+            "我不喝，不喝。就不喝酒，就吃点包子啊，你回来就行了。")
+        code, fb_long = req("POST", "/api/memory/feedback", {
+            "user_text": long_utter, "bot_text": "", "signal": "correction",
+        }, token_a)
+        check("整段流水账（204 字）不当作纠正学习（防 few-shot 被污染）",
+              code in (200, 201) and (fb_long or {}).get("valid") is False
+              and not (fb_long or {}).get("example_id"),
+              f"valid={(fb_long or {}).get('valid')} "
+              f"reason={((fb_long or {}).get('reason') or '')[:50]}")
+        check("超长被拒也留审计（家属能查到「为什么没学」）",
+              int((fb_long or {}).get("audit_id") or 0) > 0)
+
         code, fb3 = req("POST", "/api/memory/feedback", {
             "user_text": "不是，我的意思是你要叫我爷爷，不要叫您",
             "bot_text": "好的，我以后叫您",
