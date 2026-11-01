@@ -1251,12 +1251,16 @@ def _get_device_status(device_call: Any) -> dict[str, Any]:
 def _get_wifi_info(device_call: Any) -> dict[str, Any]:
     """查设备连的是哪个 WiFi。
 
-    数据源是 ``self.get_device_status`` 的 ``network`` 段（``WifiBoard::
-    GetDeviceStatusJson()`` 已经带了 ssid / rssi），**不新增固件工具** ——
+    数据源是 ``self.get_device_status`` 的 ``network`` 段，**不新增固件工具** ——
     设备侧能拿到的信息就这些，再开一个 MCP 工具只是把同一份数据换个入口，
     却要全量刷机才能用。
 
-    ⚠️ rssi 在这里就地翻译成口语，**绝不把数字交给模型**：
+    ``network`` 段有两种形状（见 :data:`_SIGNAL_WORDS` 的说明）：
+    WiFi 板 ``{type:"wifi", ssid, signal:"strong|medium|weak"}``，
+    4G 板 ``{type:"cellular", carrier, csq}``。**不要照着 wifi_board.cc
+    顶上的注释块写**——那块注释写的是 ``"rssi": -60``，与代码不符。
+
+    ⚠️ 信号在这里就地翻译成口语，**绝不把数字/英文交给模型**：
     ``_get_device_status`` 的注释已经踩过这个坑（"模型很可能把 rssi -60
     直接念出来"）。老人听到「信号负六十分贝」只会以为设备坏了。
     """
@@ -1275,24 +1279,88 @@ def _get_wifi_info(device_call: Any) -> dict[str, Any]:
     ssid = str(net.get("ssid") or "").strip()
 
     if kind and kind != "wifi":
-        # 4G / 有线：如实说，不要硬套"WiFi 名字"
-        return {"ok": True, "kind": kind,
-                "message": f"这台设备不是用 WiFi 联网的（{kind}），如实告诉老人即可"}
+        # 4G / 有线：如实说，不要硬套"WiFi 名字"。
+        # 类型与运营商都翻成中文：`cellular` / `CHINA MOBILE` 交给模型，
+        # 它会直接念英文 —— 老人听不懂，还以为设备出了毛病。
+        human = {"cellular": "移动网络（4G）", "4g": "移动网络（4G）",
+                 "ethernet": "网线"}.get(kind, kind)
+        carrier = _carrier_cn(net.get("carrier"))
+        msg = f"这台设备不是用 WiFi 联网的，用的是{human}"
+        if carrier:
+            msg += f"，运营商是{carrier}"
+        # ⚠️ 不把 ``kind``（``cellular`` / ``ethernet``）放进返回值：
+        # 整个 dict 都会被喂给模型，它看到英文就会念英文。这里只留
+        # 已经翻好的中文，模型没有别的可念。
+        out: dict[str, Any] = {"ok": True}
+        if carrier:
+            out["carrier"] = carrier
+        return {**out, "message": msg + "。如实告诉老人即可，不要提 WiFi 名字"}
     if not ssid:
-        return {"ok": True, "kind": "wifi", "wifi_name": "",
+        return {"ok": True, "wifi_name": "",
                 "message": "设备连着 WiFi 但没报出名字（可能是隐藏网络）。"
                            "如实说「连着一个没名字的网」即可，不要猜名字"}
 
-    out: dict[str, Any] = {"ok": True, "kind": "wifi", "wifi_name": ssid}
-    rssi = _coerce_int(net.get("rssi"))
-    if rssi is not None:
-        # 门限按 ESP32 的实际观感：>-60 很好，-60~-75 一般，<-75 较弱。
-        # 只给三个词，不给数字 —— 见上面的说明。
-        out["signal"] = ("很好" if rssi > -60
-                         else "一般" if rssi > -75 else "较弱")
+    out: dict[str, Any] = {"ok": True, "wifi_name": ssid}
+    sig = _wifi_signal_word(net)
+    if sig:
+        # 只给三个口语词，**不给数字** —— 见上面的说明。
+        out["signal"] = sig
     return {**out,
             "message": "用一句话回答老人（如「连着家里的 WiFi，信号挺好的」），"
                        "不要念信号数字、不要说英文、不要说 rssi"}
+
+
+#: 固件 ``WifiBoard::GetDeviceStatusJson()`` 实际发的是**字符串** ``signal``
+#: （strong / medium / weak），不是数字 rssi。
+#:
+#: ⚠️ 这里踩过一次：``wifi_board.cc`` 的**注释块**写的是 ``"rssi": -60``，
+#: 而代码实际 ``cJSON_AddStringToObject(network, "signal", ...)``。照着注释
+#: 写实现 ⇒ 生产上永远拿不到信号，老人问「网好不好」只能答"不知道"。
+#: 所以两种形状都要认：**有 signal 就信固件那个词**（单一真源，门限由固件定），
+#: 没有才拿 rssi 自己算。
+_SIGNAL_WORDS = {
+    "strong": "很好", "good": "很好", "excellent": "很好", "很好": "很好", "强": "很好",
+    "medium": "一般", "fair": "一般", "normal": "一般", "一般": "一般", "中": "一般",
+    "weak": "较弱", "poor": "较弱", "bad": "较弱", "较弱": "较弱", "弱": "较弱",
+}
+
+
+def _wifi_signal_word(net: dict[str, Any]) -> str:
+    """把网络段里的信号强弱翻成一个口语词；取不到返回空串。"""
+    raw = net.get("signal")
+    if isinstance(raw, str) and raw.strip():
+        word = _SIGNAL_WORDS.get(raw.strip().lower())
+        if word:
+            return word
+    rssi = _coerce_int(net.get("rssi"))
+    if rssi is None:
+        return ""
+    # 门限与固件保持一致（>= -60 strong / >= -70 medium / 其余 weak），
+    # 否则同一台设备在「有 signal」和「只有 rssi」两条路上会给出不同的词。
+    return "很好" if rssi >= -60 else "一般" if rssi >= -70 else "较弱"
+
+
+#: 运营商英文名 → 中文。ML307 上报的是 ASCII（``CHINA MOBILE``），
+#: 直接交给模型它会念英文。**认不出来的就不给** —— 宁可不说运营商，
+#: 也不能让模型念一串老人听不懂的字母。
+_CARRIER_CN = {
+    "china mobile": "中国移动", "cmcc": "中国移动", "中国移动": "中国移动",
+    "china unicom": "中国联通", "cucc": "中国联通", "中国联通": "中国联通",
+    "china telecom": "中国电信", "ctcc": "中国电信", "中国电信": "中国电信",
+    "china broadnet": "中国广电", "中国广电": "中国广电",
+}
+
+
+def _carrier_cn(raw: Any) -> str:
+    """运营商名翻成中文；认不出来（或本身就是一串英文）返回空串。"""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    hit = _CARRIER_CN.get(text.lower())
+    if hit:
+        return hit
+    # 未知名字：只有确实是中文才放行，英文一律不给（见上面的说明）。
+    return text if any("\u4e00" <= ch <= "\u9fff" for ch in text) else ""
 
 
 def _get_headlines(args: dict[str, Any]) -> dict[str, Any]:

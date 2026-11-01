@@ -3527,13 +3527,24 @@ def t_device_abilities() -> None:
           f"on={on_spec} required={params.get('required')}")
 
     # ---- ③ WiFi：ssid 原样带出，信号翻成口语，数字绝不外泄 ----
-    # 门限见 tools.py::_get_wifi_info（>-60 很好 / -60~-75 一般 / <-75 较弱）。
-    # 每个门限两侧都取一个点：写错 `>` 和 `>=` 是这里最容易犯的错。
-    for rssi, want in ((-55, "很好"), (-60, "一般"), (-70, "一般"),
-                       (-75, "较弱"), (-82, "较弱")):
+    # ⚠️ 主用例必须是固件**真实**发的形状：`signal` 是字符串
+    # （wifi_board.cc 里 cJSON_AddStringToObject(network, "signal", "strong")），
+    # 而那个文件顶上的注释块写的是 "rssi": -60 —— 照注释写实现，
+    # 生产上永远拿不到信号（这轮真踩了）。数字 rssi 只作为别的板子的兼容路径。
+    for raw, want in (("strong", "很好"), ("medium", "一般"), ("weak", "较弱")):
+        r = T._get_wifi_info(_dev_status_call(
+            {"network": {"type": "wifi", "ssid": "HomeNet", "signal": raw}}))
+        check(f"12m ★ 固件发 signal={raw!r} → 信号「{want}」（真实形状）",
+              r.get("signal") == want, str(r))
+        check(f"12m · signal={raw!r} 时不许把英文原词交给模型（它会直接念）",
+              raw not in json.dumps(r, ensure_ascii=False), str(r))
+
+    # 兼容路径：只有数字 rssi 的板子。门限与固件一致（>= -60 / >= -70）。
+    for rssi, want in ((-55, "很好"), (-60, "很好"), (-65, "一般"),
+                       (-70, "一般"), (-82, "较弱")):
         r = T._get_wifi_info(_dev_status_call(
             {"network": {"type": "wifi", "ssid": "HomeNet", "rssi": rssi}}))
-        check(f"12m · rssi={rssi} → 信号「{want}」", r.get("signal") == want, str(r))
+        check(f"12m · 只有 rssi={rssi} → 信号「{want}」", r.get("signal") == want, str(r))
         check(f"12m ★ rssi={rssi} 的数字不许出现在返回值里（模型会照着念）",
               str(rssi) not in json.dumps(r, ensure_ascii=False), str(r))
 
@@ -3544,8 +3555,25 @@ def t_device_abilities() -> None:
 
     r = T._get_wifi_info(_dev_status_call({"network": {"type": "4g"}}))
     check("12m ★ 非 WiFi 联网（4G）→ 如实说，不许硬套 WiFi 名字",
-          r.get("ok") is True and r.get("kind") == "4g"
-          and not r.get("wifi_name"), str(r))
+          r.get("ok") is True and not r.get("wifi_name")
+          and "移动网络" in (r.get("message") or ""), str(r))
+
+    # 4G 板真实形状（ml307_board.cc）：{type:"cellular", carrier, csq}
+    r = T._get_wifi_info(_dev_status_call(
+        {"network": {"type": "cellular", "carrier": "CHINA MOBILE", "csq": 10}}))
+    check("12m ★ cellular 板 → 类型与运营商都翻成中文，不许留英文给模型念",
+          r.get("ok") is True
+          and "cellular" not in json.dumps(r, ensure_ascii=False)
+          and "CHINA MOBILE" not in json.dumps(r, ensure_ascii=False)
+          and "移动网络" in (r.get("message") or "")
+          and "中国移动" in (r.get("message") or ""), str(r))
+
+    # 认不出的运营商（纯英文）：整段丢掉，不让模型念字母
+    r = T._get_wifi_info(_dev_status_call(
+        {"network": {"type": "cellular", "carrier": "VODAFONE UK", "csq": 10}}))
+    check("12m ★ 认不出的英文运营商 → 整段丢掉（宁可不说，不许念字母）",
+          r.get("ok") is True and "VODAFONE" not in json.dumps(r, ensure_ascii=False)
+          and not r.get("carrier"), str(r))
 
     r = T._get_wifi_info(_dev_status_call(
         {"network": {"type": "wifi", "ssid": ""}}))
