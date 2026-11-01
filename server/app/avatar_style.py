@@ -99,24 +99,32 @@ RANDOM_EFFECTS: tuple[str, ...] = ("starlight", "flow")
 
 # 安全色板 = 「颜色」列弹窗里能选的全部颜色。
 #
+# 这张表的取法**不是**"挑 12 个好看的颜色"，而是"这台产品实际在用的颜色"：
+# 前 6 个（标注了出处的）就是固件 ``k_default_cfg`` 里 7 个状态的出厂色，
+# 后 6 个是给用户换色时备选的。为什么必须把出厂色放进来：
+# 用户新建形象 / 老数据没配过时，颜色列显示的是出厂色；它若不在色板里，
+# 前端只能显示裸 hex（"#00BFFF"），用户既看不懂、也没法从色板里选回来。
+#
 # "安全"指两件事：
 #   ① **不过流**：WS2812B 单颗满白 60mA，8 颗全白 480mA，对板载 5V 供电偏紧。
 #      所以这张表**没有纯白**，最亮的只是偏暖的 ``#FFE9C4``。
-#   ② **不刺眼**：饱和度都收在中段，没有 ``#00FF00`` / ``#0000FF`` 这种
-#      夜里看着像灼烧的纯色 —— 这台设备是放在老人卧室的。
-# 用户要自定义颜色得先改这里（前端不提供自由取色器，这是刻意的）。
+#   ② **能亮得久**：没有 ``#00FF00`` / ``#0000FF`` 这类在暗处刺眼的纯绿纯蓝。
+#      ``#FF0000`` / ``#D50000`` 是例外 —— 它们是提醒/生气的出厂色，
+#      红光的电流效率高、观感也不刺，而且只在这两种状态下短时出现。
 LIGHT_COLORS: tuple[dict, ...] = (
     {"id": "warm_white", "name": "暖白", "rgb": "#FFE9C4"},
-    {"id": "red", "name": "正红", "rgb": "#FF2020"},
-    {"id": "orange", "name": "橙", "rgb": "#FF7A18"},
+    # ↓ 以下 6 个 = 固件 k_default_cfg 的出厂色（顺序对应状态）
+    {"id": "alert_red", "name": "警示红", "rgb": "#FF0000"},    # 提醒警示
+    {"id": "deep_red", "name": "深红", "rgb": "#D50000"},       # 生气
+    {"id": "deep_orange", "name": "深橙", "rgb": "#FF8C00"},    # 说话中
+    {"id": "green", "name": "翠绿", "rgb": "#00C853"},          # 开心
+    {"id": "sky", "name": "深天蓝", "rgb": "#00BFFF"},          # 聆听中
+    {"id": "blue", "name": "宝蓝", "rgb": "#2962FF"},           # 难过
+    # ↓ 以下 5 个是备选色
     {"id": "amber", "name": "琥珀", "rgb": "#FFB020"},
     {"id": "yellow", "name": "暖黄", "rgb": "#FFD24A"},
-    {"id": "green", "name": "草绿", "rgb": "#3AD07A"},
-    {"id": "cyan", "name": "青", "rgb": "#7FD3FF"},
-    {"id": "blue", "name": "天蓝", "rgb": "#4A90D9"},
-    {"id": "indigo", "name": "蓝紫", "rgb": "#6C6CFF"},
+    {"id": "cyan", "name": "天青", "rgb": "#7FD3FF"},
     {"id": "purple", "name": "紫", "rgb": "#B98CFF"},
-    {"id": "pink", "name": "品红", "rgb": "#FF5FA2"},
     {"id": "gray_blue", "name": "灰蓝", "rgb": "#5B6B8C"},
 )
 
@@ -147,26 +155,49 @@ def _light(effect: str, rgb: str, brightness: int = 100,
     }
 
 
-# 每个状态的出厂灯效。
-# ``angry`` 原来是 ``blink_red``（闪烁红），blink 不在新的 5 种里了，
-# 改成"呼吸红" —— 不能改成常亮红，那会和 ``alert``（常亮红）一模一样，
-# 用户就分不出"生气"和"该吃药了"。
+# 每个状态的出厂灯效 —— **必须与固件 rgb.c 的 ``k_default_cfg`` 逐项一致**。
+#
+# 为什么必须一致（2026-11-01 用户问「新设备没自定义形象时是什么灯效」时发现）：
+# 固件的兜底是**编译进二进制的** ``k_default_cfg`` —— 设备没网、第一次心跳还没
+# 成功之前，它只能按那张表亮。而服务端每次心跳都会下发 ``DEFAULT_LIGHTS``。
+# 两张表只要有一项不同，新设备就会在**第一次心跳成功的那一刻变色**：
+# 开机是 A，联网几秒后变成 B，用户看到的是"设备自己乱改灯"。
+#
+# 所以这里的数值**不是重新设计的**，是从 rgb.c 抄过来的（对应关系见
+# tools/smoke_lights.py 的 I 组，它解析 k_default_cfg 逐项比对，改错就红）：
+#   k_default_cfg 的 level 是 0~255 感知亮度 → 这里换成 1~100 百分比
+#   （固件下发时按 b*255/100 反算，153↔60、140↔55、178↔70 正好往返）。
 DEFAULT_LIGHTS: dict[str, dict] = {
-    "neutral": _light("breath", "#4A90D9"),
-    "listening": _light("breath", "#FFB020"),
-    "speaking": _light("breath", "#7FD3FF", brightness=80, interval_ms=600),
-    "happy": _light("breath", "#3AD07A"),
-    "sad": _light("solid", "#5B6B8C", brightness=70),
-    "angry": _light("breath", "#FF2020", interval_ms=400),
-    "alert": _light("solid", "#FF2020"),
+    # 待机：星光 + **颜色随机**。这不是我挑的 —— k_default_cfg 里
+    # ELDER_RGB_ST_NEUTRAL 是 { ELDER_FX_TWINKLE, 0u, 153, 2000 }，
+    # color=0 在 TWINKLE 分支里就是"每闪一次换一个随机色相"。
+    # 也正因为如此，用户才会强调「在星光和流水灯效中，颜色随机是很重要的效果」。
+    "neutral": _light("starlight", RANDOM_RGB, brightness=60, interval_ms=2000),
+    "listening": _light("solid", "#00BFFF", brightness=55),   # 深天蓝
+    "speaking": _light("solid", "#FF8C00", brightness=70),    # 深橙
+    "happy": _light("solid", "#00C853"),
+    "sad": _light("solid", "#2962FF"),
+    "angry": _light("solid", "#D50000"),
+    # 提醒：常亮红。interval_ms=500 不是给 effect 用的，是固件 rgb_task 的
+    # 催促闪烁节奏（k_default_cfg 的 period_ms=500）。所以界面上"间隔"列
+    # 对这一行显示 "—"（solid 不吃 interval），但值仍要存对、仍要下发。
+    "alert": _light("solid", "#FF0000", interval_ms=500),
 }
 
 
 _RGB_RE = re.compile(r"^#[0-9A-F]{6}$")
 
+# 最后的兜底色：暖白（= 安全色板第一项）。
+#
+# 什么时候会用到它：某状态的**默认色本身就是** RANDOM_RGB（待机就是），
+# 而用户把效果改成了不支持随机的（呼吸/常亮）。此时"退回默认色"会退回
+# #000000，而 #000000 对呼吸/常亮就是**灯灭** —— 等于用一个看似合理的
+# 规则把灯关掉。所以兜底必须是一个真正能亮的颜色。
+FALLBACK_RGB = "#FFE9C4"
+
 
 def _norm_rgb(raw: object, effect: str, fallback: str) -> str:
-    """把颜色归一成 ``#RRGGBB``（大写）。非法值 / 不支持随机的组合退回默认色。
+    """把颜色归一成 ``#RRGGBB``（大写）。非法值 / 不支持随机的组合退回安全色。
 
     为什么非要在这里拦，而不是"前端已经限制过了"：
       · ``light_rgb_from_str()`` 在固件侧对非法串返回 **0**，而 0 对
@@ -174,16 +205,19 @@ def _norm_rgb(raw: object, effect: str, fallback: str) -> str:
         且两端日志都正常 —— 这是最坏的一种降级。
       · ``#000000`` 是"随机"哨兵，但它只对 ``RANDOM_EFFECTS`` 有意义。
         用户先选"星光 + 随机"再把效果改成"常亮"时，rgb 会原样留着，
-        变成"常亮 + 黑色" = 灯灭。归一必须把这个组合打回默认色。
+        变成"常亮 + 黑色" = 灯灭。归一必须把这个组合打回安全色。
     """
     s = str(raw or "").strip()
     if not s.startswith("#"):
         s = "#" + s          # '#' 可省略：老数据/手填的 "4A90D9" 是同一个颜色
     s = s.upper()
     if not _RGB_RE.match(s):
-        return fallback
+        s = fallback.upper()
+    # ⚠️ 这一条必须作用在**最终值**上，包括刚从 fallback 取来的那个：
+    # 待机的默认色就是 #000000，用户把待机改成"呼吸"时 fallback 会带着
+    # #000000 过来，不拦就等于把灯关掉。
     if s == RANDOM_RGB and effect not in RANDOM_EFFECTS:
-        return fallback
+        return FALLBACK_RGB
     return s
 
 
