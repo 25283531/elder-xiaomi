@@ -523,36 +523,25 @@ def tone_profile(db, user_id: int, agent_id: int | None) -> dict[str, Any]:
 
 
 def describe_tone(stats: dict[str, Any], effective: dict[str, Any]) -> str:
-    """把画像写成一句（段）人话：既注入 prompt，也直接展示给家属。"""
-    parts: list[str] = []
-    avg = float(effective.get("avg_reply_len") or 0.0)
-    if avg <= 0:
-        parts.append("回复长度：还没有足够数据，先按简短、清楚来说")
-    elif avg <= 18:
-        parts.append(f"回复要短，平均每句 {avg:.0f} 字左右，一次只说一件事")
-    elif avg <= 45:
-        parts.append(f"回复中等长度，平均每句 {avg:.0f} 字左右")
-    else:
-        parts.append(f"可以稍微多说一点，平均每句 {avg:.0f} 字左右")
+    """把画像写成一句（段）人话：既注入 prompt，也直接展示给家属。
 
-    addr = str(effective.get("address") or "")
-    if addr:
-        parts.append(f"称呼对方用「{addr}」")
+    ⚠️ 实现已搬到 ``app/persona/tone.py``（2026-11-01），这里只是**薄包装**。
 
-    parts.append("可以适度开开玩笑" if effective.get("humor") else "少开玩笑，说正事为主")
+    为什么搬走：这句话原先有**两份实现**（本函数 + ``compiler._section_persona``），
+    而后者漏渲染 ``manual.note``、对空值的处理也不同（``avg_reply_len == 0``
+    时一个输出"还没有足够数据"、一个什么都不输出）⇒ 生产 prompt 里同一段画像
+    **出现两次且措辞不同**，模型收到两句互相矛盾的自我描述，而日志里一切正常。
+    修法不是"让两份实现保持一致"（那种承诺在实践中必然失守），而是只留一份。
 
-    speed_map = {"slow": "语速放慢、句子之间多停顿", "normal": "语速正常",
-                 "fast": "语速可以稍快"}
-    parts.append(speed_map.get(str(effective.get("speed") or "normal"), "语速正常"))
+    为什么这里是**函数内局部导入**而不是模块顶层：
+    ``app/persona/__init__.py`` 会 import ``compiler``，而 ``compiler`` 又会
+    import ``app.memory.textutil`` —— 顶层导入会走成
+    ``app.memory.__init__`` → ``.bridge`` → ``.persona``（本模块，尚未加载完）
+    的循环，表现为 ImportError。局部导入在调用时执行，那时包已加载完毕。
+    """
+    from ..persona.tone import describe_tone as _impl
 
-    phrases = [p for p in (stats.get("catchphrases") or []) if len(p) >= 3][:3]
-    if phrases:
-        parts.append("常用口头禅：" + "、".join(phrases))
-
-    note = str(effective.get("note") or "").strip()
-    if note:
-        parts.append("家属特别交代：" + note)
-    return "；".join(parts) + "。"
+    return _impl(stats, effective)
 
 
 # ---------------------------------------------------------------- 示例池与审计

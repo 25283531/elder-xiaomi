@@ -200,7 +200,7 @@ def build_system_prompt(db, user_id: int, agent_id: int | None,
         # 延迟导入：无人格路径（未绑角色）完全不必付 persona 包的导入成本，
         # 也避免 voice 包在 import 阶段就与 persona/memory 绑死。
         from ..persona import guardrails
-        from ..persona.compiler import PromptCompiler
+        from ..persona.compiler import PromptCompiler, dedupe_tone
         from ..persona.loader import load_agent_persona
 
         spec, profile = load_agent_persona(db, user_id, agent_id)
@@ -208,7 +208,12 @@ def build_system_prompt(db, user_id: int, agent_id: int | None,
             return fallback
 
         compiled = PromptCompiler().compile(spec, profile, "", examples_prompt)
-        # 红线要在**末尾**（LLM 对末尾注意力更高，compiler 的设计前提）。
+        # memory_ctx 以「这位老人习惯的说话方式」开头（recall_for_reply 的第一个
+        # 部分就是 build_persona_prompt），而编译产物里已经有同一段画像。
+        # 不去掉的话最终 prompt 里这句话出现两遍 —— 生产实测 3596 字里 130 字
+        # 是重复的，模型会把重复那条当成更强的指令。见 compiler.dedupe_tone。
+        memory_ctx = dedupe_tone(compiled, memory_ctx)
+        # 红线要在**末尾**（LLM 对末尾注意力更高、compiler 的设计前提）。
         # 说话要求插在红线之前，不能把红线挤到中间去。
         tail = guardrails.render_tail(
             guardrails.regenerate_locked(spec.guardrails_hard))

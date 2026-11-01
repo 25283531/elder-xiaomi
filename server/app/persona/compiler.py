@@ -36,6 +36,7 @@ from typing import Any
 from ..memory.textutil import sanitize_for_prompt
 from . import catalog, guardrails
 from .spec import RoleSpec
+from .tone import describe_tone
 
 
 def _clean(text: str, limit: int = 2000) -> str:
@@ -45,6 +46,85 @@ def _clean(text: str, limit: int = 2000) -> str:
     中间内容的注意力越低。截断比"整段塞进去然后指望模型忽略"更可控。
     """
     return sanitize_for_prompt(text or "", limit=limit)
+
+
+#: 画像段的标题。**必须**与 ``memory.persona.build_persona_prompt`` 用的字面量
+#: 一致 —— 去重就是按这个标题认段的。两边各写一份是刻意的取舍：把常量提到
+#: 中立模块要多一条 import 边，而这两处本来就已经互相引用了同一份 ``describe_tone``。
+_TONE_HEAD = "【这位老人习惯的说话方式】"
+
+
+def _tone_block(text: str) -> tuple[str, str] | None:
+    """把开头的「语气画像」段切出来，返回 ``(段, 余下)``；不是这个开头返回 None。
+
+    一段 = 标题行 + 紧随其后的所有非空行（画像是一句用「；」连起来的话，
+    正常情况下只有一行；但 ``note`` 里可能带换行，所以不能只取一行）。
+    """
+    body = text.lstrip("\n")
+    if not body.startswith(_TONE_HEAD):
+        return None
+    lines = body.split("\n")
+    end = 1
+    while end < len(lines) and lines[end].strip():
+        end += 1
+    return "\n".join(lines[:end]).rstrip(), "\n".join(lines[end:]).lstrip("\n")
+
+
+def _drop_duplicate_tone(profile_sec: str, examples: str) -> str:
+    """示例段开头那段画像若与画像段**一字不差**，就从示例段里去掉。
+
+    为什么需要（2026-11-01，生产实据）
+    ---------------------------------
+    语音链路把 ``recall_for_reply`` 的返回值原样当 ``memory_ctx`` 追加，而它
+    开头就是 ``build_persona_prompt`` 产出的画像段；``/roles/{id}/prompt``
+    预览则把 ``build_persona_prompt`` 整个当 ``examples_prompt`` 传进来。
+    两条路径于是都在最终 prompt 里得到**同一段画像两遍**（生产实测 3596 字的
+    prompt 里有 130 字是重复的，同一句话出现两次）。
+
+    这不是"多烧几十 token"的小事：模型会把重复出现的那条当成更强的指令，
+    "少开玩笑"这类措辞被放大，而家属真正想强调的 traits 反而被稀释。
+
+    为什么用**完全相等**而不是标题相等：两个渲染器曾经分叉过（一个渲染
+    ``manual.note``、一个不渲染），标题相等会连**内容不同**的那份也删掉，
+    等于静默丢信息。完全相等意味着"删掉的这段确实一字不差地已经在别处了"，
+    分叉时自动退化成"保留重复"——难看，但不丢东西。
+    """
+    if not profile_sec or not examples:
+        return examples
+    got = _tone_block(examples)
+    if got is None:
+        return examples
+    block, rest = got
+    if block != profile_sec.rstrip():
+        return examples
+    return rest
+
+
+def _find_tone(text: str) -> str | None:
+    """在一段**已经拼好**的 prompt 里找出画像段（不要求在开头）。
+
+    与 ``_tone_block`` 的分工：那个只认开头（示例段/上下文段是以画像开头的），
+    这个用来从编译产物里把画像段捞出来 —— 编译产物开头是红线段，画像在中间。
+    """
+    i = text.find(_TONE_HEAD)
+    if i < 0:
+        return None
+    got = _tone_block(text[i:])
+    return got[0] if got else None
+
+
+def dedupe_tone(compiled: str, extra: str) -> str:
+    """从 ``extra`` 里去掉与 ``compiled`` 中那段**完全相同**的画像段。
+
+    给 ``voice.prompts.build_system_prompt`` 用：语音链路的重复不在
+    ``examples_prompt`` 里（那里恒为空串），而在 ``memory_ctx`` 里 ——
+    ``recall_for_reply`` 的返回值以画像段开头。两条路径共用同一个判定，
+    免得"预览去重了、语音没去重"这种只修一半的状态。
+    """
+    block = _find_tone(compiled)
+    if block is None:
+        return extra
+    return _drop_duplicate_tone(block, extra)
 
 
 class ProfileMerger:
@@ -142,11 +222,15 @@ class PromptCompiler:
         spec.validate()
 
         hard = guardrails.regenerate_locked(spec.guardrails_hard)
+        profile_sec = self._section_persona(profile)
+        # 示例段开头可能带着同一段画像（语音链路的 memory_ctx 就是这么来的），
+        # 与 ④ 完全重复时去掉。见 _drop_duplicate_tone 的说明。
+        examples_prompt = _drop_duplicate_tone(profile_sec, examples_prompt)
         sections: list[tuple[str, str]] = [
             ("safety_head", guardrails.render_head(hard)),
             ("identity", self._section_identity(spec)),
             ("traits", self._section_traits(spec)),
-            ("profile", self._section_persona(profile)),
+            ("profile", profile_sec),
             ("custom", self._section_custom(spec)),
             ("examples", self._section_examples(examples_prompt)),
             ("memory", self._section_memory(memory_ctx)),
@@ -207,33 +291,24 @@ class PromptCompiler:
         return "【怎么说话】\n" + "\n".join(f"- {s}" for s in sentences)
 
     def _section_persona(self, profile: dict[str, Any] | None) -> str:
-        """④ 性格（画像）。由实测数据生成的自然语言，不含用户原始文本。"""
+        """④ 性格（画像）。由实测数据生成的自然语言，不含用户原始文本。
+
+        ⚠️ 句子由 ``persona/tone.describe_tone`` 生成 —— 与家属在 APP 里看到的
+        画像描述、语音链路 ``memory_ctx`` 里那段、以及偏好示例段开头那段，是
+        **同一个函数**。2026-11-01 之前这里自己拼了一份，结果 ``manual.note``
+        （家属手填的画像备注）在这条路径上被静默丢掉，而 prompt 里同时还有一份
+        带 note 的画像 ⇒ 模型收到两句互相矛盾的自我描述。见 ``tone.py`` 文件头。
+
+        ``note`` 是家属自由文本、属于不可信输入，所以整句过 ``_clean``。
+        这也让本段与 ``build_persona_prompt`` 里那句
+        ``sanitize_for_prompt(profile["description"])`` 字节一致，
+        ``_drop_duplicate_tone`` 的完全相等判定才成立。
+        """
         if not profile:
             return ""
-        parts: list[str] = []
-        avg = float(profile.get("avg_reply_len") or 0.0)
-        if avg > 0:
-            if avg <= 18:
-                parts.append(f"回复要短，平均每句 {avg:.0f} 字左右，一次只说一件事")
-            elif avg <= 45:
-                parts.append(f"回复中等长度，平均每句 {avg:.0f} 字左右")
-            else:
-                parts.append(f"可以稍微多说一点，平均每句 {avg:.0f} 字左右")
-        if profile.get("address"):
-            # address 来自统计（"您"/"爷爷"…），是词表内的短词，但仍清洗一次：
-            # 它经过了 LLM 产出的文本，理论上可被污染。
-            parts.append(f"称呼对方用「{_clean(str(profile['address']), limit=16)}」")
-        parts.append("可以适度开开玩笑" if profile.get("humor") else "少开玩笑，说正事为主")
-        speed = str(profile.get("speed") or "")
-        speed_map = {"slow": "语速放慢、句子之间多停顿", "fast": "语速可以稍快",
-                     "normal": "语速正常"}
-        if speed:
-            parts.append(speed_map.get(speed, "语速正常"))
-        phrases = [p for p in (profile.get("catchphrases") or []) if p][:3]
-        if phrases:
-            parts.append("常用口头禅：" + "、".join(
-                _clean(str(p), limit=12) for p in phrases))
-        return "【这位老人习惯的说话方式】\n" + "；".join(parts) + "。"
+        desc = describe_tone({"catchphrases": profile.get("catchphrases") or []},
+                             profile)
+        return _TONE_HEAD + "\n" + _clean(desc)
 
     def _section_custom(self, spec: RoleSpec) -> str:
         """⑤ 家属特别交代。用户自由文本 -> 清洗。"""

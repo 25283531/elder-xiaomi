@@ -2542,6 +2542,7 @@ def t_parse_when_units() -> None:
     # prompt 里的硬约束拦不住，所以 session.py 有一道代码闸门；这里验它。
     t_false_success_gate()
     t_dismiss_and_watchdog()
+    t_device_abilities()        # 12m：WiFi / 头条 / 状态灯（2026-11-01 加）
     t_asr_silence_trim()
     t_emotion_tag()
     t_barge_in()
@@ -3309,13 +3310,15 @@ def t_dismiss_and_watchdog() -> None:
     names = [d["function"]["name"] for d in TOOL_DEFS]
     check("12i ★ enter_standby 必须注册进 TOOL_DEFS", "enter_standby" in names,
           f"names={names}")
-    # 2026-10-25 起末尾是设备能力三件套（音量 / 亮度 / 设备状态）。
+    # 2026-10-25 起末尾是设备能力三件套（音量 / 亮度 / 设备状态）；
+    # 2026-11-01 又追加了 WiFi / 头条 / 状态灯三件套。
     # 判据从「enter_standby 必须是最后一个」改成「新工具只能往后追加」：
     # 真正要守的是**相对顺序**（老工具不许被挤到新工具后面，否则每次请求
     # 的 tools 字段整体位移，prompt 前缀缓存全失效），不是某个具体名字。
-    check("12i · 设备能力三件套必须追加在工具表末尾（保住 prompt 前缀缓存）",
-          names[-3:] == ["set_volume", "set_brightness", "get_device_status"],
-          f"tail={names[-3:]}")
+    check("12i · 设备能力六件套必须追加在工具表末尾（保住 prompt 前缀缓存）",
+          names[-6:] == ["set_volume", "set_brightness", "get_device_status",
+                         "get_wifi_info", "get_headlines", "set_status_light"],
+          f"tail={names[-6:]}")
     check("12i · 老工具不许排到新工具后面（防止有人往中间插）",
           names.index("enter_standby") < names.index("set_volume"),
           f"names={names}")
@@ -3441,6 +3444,204 @@ def t_dismiss_and_watchdog() -> None:
 
     asyncio.run(_run())
 
+
+
+def _dev_status_call(status, calls=None):
+    """假 device_call：只回答 ``self.get_device_status``。
+
+    回包形状照抄固件 ``McpTool::Call``（见 ``tools.py::_device_reply_text``）：
+    成功是 ``{"result":{"content":[{"type":"text","text":"<json 字符串>"}]}}``，
+    text 里还要再 ``json.loads`` 一次 —— 这一步最容易写错，所以替身必须
+    照真实形状造，不能图省事直接返回 dict。
+    """
+    def call(name, args, timeout=None):
+        if calls is not None:
+            calls.append((name, dict(args or {})))
+        if name != "self.get_device_status":
+            raise AssertionError(f"WiFi 查询路径不该调 {name}")
+        if status is None:
+            return {"error": {"message": "device offline"}}
+        return {"result": {"content": [{"type": "text",
+                                        "text": json.dumps(status)}],
+                           "isError": False}}
+    return call
+
+
+def _dev_light_call(get_on=None, set_on=..., fail=False, calls=None):
+    """假 device_call：只回答灯的**查**与**改**两个固件工具。
+
+    ``set_on`` 用 ``...`` 当哨兵：默认「固件按请求回显」，显式给值则模拟
+    「固件真实状态与请求不一致」（真机上按键/定时任务会改灯）。
+    """
+    def call(name, args, timeout=None):
+        if calls is not None:
+            calls.append((name, dict(args or {})))
+        if fail:
+            return {"error": {"message": "boom"}}
+        if name == "self.elder.get_status_light":
+            return {"result": {"content": [{"type": "text",
+                                            "text": json.dumps({"on": get_on})}],
+                               "isError": False}}
+        if name == "self.elder.set_status_light":
+            on = (args or {}).get("on") if set_on is ... else set_on
+            return {"result": {"content": [{"type": "text",
+                                            "text": json.dumps({"on": bool(on)})}],
+                               "isError": False}}
+        raise AssertionError(f"状态灯路径不该调 {name}")
+    return call
+
+
+def t_device_abilities() -> None:
+    """12m. 设备能力：WiFi 查询 / 新闻播报 / 状态灯开关。
+
+    为什么这三条单列一组（2026-11-01 加）：它们全是「模型照着返回值说话」
+    的工具 —— 返回值一错，老人听到的是一句听起来很确定、实际错误的话，
+    比不回答更糟。所以断言都压在**返回值本身**，而不是「没抛异常」。
+
+    全程不打网络：新闻那条把 ``app.news.get_headlines`` 换掉。CI 的
+    runner 没有外网，真去拉 RSS 会变成一条随网络抖动的红灯。
+    """
+    print("── 12m. 设备能力：WiFi 查询 / 新闻播报 / 状态灯开关 ──")
+    import types as _types
+
+    from app import news as N
+    from app.voice import tools as T
+
+    # ---- ① 注册 ----
+    names = [d["function"]["name"] for d in T.TOOL_DEFS]
+    for n in ("get_wifi_info", "get_headlines", "set_status_light"):
+        check(f"12m ★ {n} 必须注册进 TOOL_DEFS", n in names, f"names={names}")
+
+    # ---- ② set_status_light 的 on 必须**不必填** ----
+    # MCP 的「可选参数」只能用默认值表达。一旦把 on 写进 required，模型问
+    # 「灯关了吗」时就必须瞎填一个 bool，服务端再也分不清「查」和「关」——
+    # 那是这个功能里最坏的一种误操作。
+    spec = next(d["function"] for d in T.TOOL_DEFS
+                if d["function"]["name"] == "set_status_light")
+    params = spec.get("parameters") or {}
+    on_spec = (params.get("properties") or {}).get("on") or {}
+    check("12m ★ set_status_light.on 必须是 boolean 且**不必填**"
+          "（必填 ⇒「灯关了吗」会被当成关闭）",
+          on_spec.get("type") == "boolean"
+          and "on" not in (params.get("required") or []),
+          f"on={on_spec} required={params.get('required')}")
+
+    # ---- ③ WiFi：ssid 原样带出，信号翻成口语，数字绝不外泄 ----
+    # 门限见 tools.py::_get_wifi_info（>-60 很好 / -60~-75 一般 / <-75 较弱）。
+    # 每个门限两侧都取一个点：写错 `>` 和 `>=` 是这里最容易犯的错。
+    for rssi, want in ((-55, "很好"), (-60, "一般"), (-70, "一般"),
+                       (-75, "较弱"), (-82, "较弱")):
+        r = T._get_wifi_info(_dev_status_call(
+            {"network": {"type": "wifi", "ssid": "HomeNet", "rssi": rssi}}))
+        check(f"12m · rssi={rssi} → 信号「{want}」", r.get("signal") == want, str(r))
+        check(f"12m ★ rssi={rssi} 的数字不许出现在返回值里（模型会照着念）",
+              str(rssi) not in json.dumps(r, ensure_ascii=False), str(r))
+
+    r = T._get_wifi_info(_dev_status_call(
+        {"network": {"type": "wifi", "ssid": "HomeNet", "rssi": -55}}))
+    check("12m · WiFi 名字原样带出（不猜、不改写）",
+          r.get("ok") is True and r.get("wifi_name") == "HomeNet", str(r))
+
+    r = T._get_wifi_info(_dev_status_call({"network": {"type": "4g"}}))
+    check("12m ★ 非 WiFi 联网（4G）→ 如实说，不许硬套 WiFi 名字",
+          r.get("ok") is True and r.get("kind") == "4g"
+          and not r.get("wifi_name"), str(r))
+
+    r = T._get_wifi_info(_dev_status_call(
+        {"network": {"type": "wifi", "ssid": ""}}))
+    check("12m ★ 隐藏网络（ssid 为空）→ 明确要求「不要猜名字」",
+          r.get("ok") is True and r.get("wifi_name") == ""
+          and "不要猜" in (r.get("message") or ""), str(r))
+
+    check("12m · 设备离线 → ok=False（不抛异常）",
+          T._get_wifi_info(_dev_status_call(None)).get("ok") is False)
+    check("12m · 设备没上报 network 段 → ok=False",
+          T._get_wifi_info(_dev_status_call({"battery": {"level": 50}})
+                           ).get("ok") is False)
+    check("12m · 根本没有设备通道 → ok=False",
+          T._get_wifi_info(None).get("ok") is False)
+
+    # ---- ④ 状态灯：查与改必须是两条路 ----
+    calls = []
+    r = T._set_status_light({"on": False},
+                            _dev_light_call(set_on=False, calls=calls))
+    check("12m ★ on=False 真的下发到 self.elder.set_status_light",
+          ("self.elder.set_status_light", {"on": False}) in calls, str(calls))
+    check("12m ★ 关灯后必须叮嘱「提醒、吃药的灯还是照常亮」"
+          "（说成「灯全关了」老人会以为该吃药时也不亮）",
+          r.get("ok") is True and r.get("on") is False
+          and "照常亮" in (r.get("message") or ""), str(r))
+
+    calls = []
+    r = T._set_status_light({}, _dev_light_call(get_on=True, calls=calls))
+    check("12m ★ 不传 on = 只查状态，**一次都不许调 set**"
+          "（老人问「灯关了吗」被当成关闭是最坏误操作）",
+          calls == [("self.elder.get_status_light", {})], str(calls))
+    check("12m · 查到开着 → on=True，且不出现关灯那句叮嘱",
+          r.get("on") is True and "照常亮" not in (r.get("message") or ""), str(r))
+
+    calls = []
+    r = T._set_status_light({"on": None},
+                            _dev_light_call(get_on=False, calls=calls))
+    check("12m ★ 显式传 null 与「没传」同义：只查不改",
+          calls == [("self.elder.get_status_light", {})]
+          and r.get("on") is False, f"{calls} {r}")
+
+    # 模型经常把 bool 写成字符串（四家协议的 function calling 都见过）
+    for raw, want in (("关", False), ("off", False), ("0", False),
+                      ("开", True), ("on", True), ("1", True)):
+        calls = []
+        T._set_status_light({"on": raw},
+                            _dev_light_call(set_on=want, calls=calls))
+        check(f"12m · on={raw!r} 也要识别成 {'开' if want else '关'}",
+              bool(calls) and calls[0][1].get("on") is want, str(calls))
+
+    # 固件真实状态与请求不一致时，以固件为准（真机上按键/定时任务会改灯）
+    r = T._set_status_light({"on": True}, _dev_light_call(set_on=False))
+    check("12m ★ 请求开灯但固件回的是关 → 必须如实报 on=False"
+          "（不许回显意图骗自己）",
+          r.get("ok") is True and r.get("on") is False, str(r))
+
+    r = T._set_status_light({"on": False}, _dev_light_call(fail=True))
+    check("12m · 固件报错 → ok=False（不抛异常）", r.get("ok") is False, str(r))
+    check("12m · 没有设备通道 → ok=False",
+          T._set_status_light({"on": False}, None).get("ok") is False)
+
+    # ---- ⑤ 新闻：全部打桩，绝不打网络 ----
+    real_get, real_speak = N.get_headlines, N.speak_lines
+    seen: dict = {}
+
+    def _fake_get(limit: int = 3):
+        seen["limit"] = limit
+        return ([_types.SimpleNamespace(title="两部门预拨4500万元支持应急救灾"),
+                 _types.SimpleNamespace(title="多地气温骤降，请注意添衣")], "")
+
+    try:
+        N.get_headlines = _fake_get          # type: ignore[assignment]
+        r = T._get_headlines({})
+        check("12m ★ 头条：把标题列表原样交给模型（不加工、不排序）",
+              r.get("ok") is True
+              and r.get("headlines") == ["两部门预拨4500万元支持应急救灾",
+                                         "多地气温骤降，请注意添衣"], str(r))
+        check("12m · 默认念 3 条", seen.get("limit") == 3, str(seen))
+        check("12m ★ 提示词必须禁止模型补背景 / 发评论（它只是个念稿的）",
+              "只念标题" in (r.get("message") or "")
+              and "不要评论" in (r.get("message") or ""), str(r.get("message")))
+
+        T._get_headlines({"count": 99})
+        check("12m · count 上限钳到 5", seen.get("limit") == 5, str(seen))
+        T._get_headlines({"count": 0})
+        check("12m · count 下限钳到 1", seen.get("limit") == 1, str(seen))
+
+        # 取不到 → 明确失败，且话术里不许留任何"可以编"的口子
+        N.get_headlines = lambda limit=3: ([], "timeout")  # type: ignore[assignment]
+        r = T._get_headlines({})
+        check("12m ★ 取不到新闻 → ok=False 且不带任何标题"
+              "（宁可说没取到，也不许模型编新闻）",
+              r.get("ok") is False and not r.get("headlines")
+              and "没取到新闻" in (r.get("message") or ""), str(r))
+    finally:
+        N.get_headlines, N.speak_lines = real_get, real_speak
 
 
 # ================================================================ main

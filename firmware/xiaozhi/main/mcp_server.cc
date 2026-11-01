@@ -8,6 +8,8 @@
 #include <esp_app_desc.h>
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
+#include <string>
 #include <esp_pthread.h>
 
 #include "application.h"
@@ -28,6 +30,10 @@ extern "C" void elder_enter_standby(void);
 /* 2026-10-29：叫设备立刻同步一次（不等下一个心跳周期）。
  * 提醒表在服务端变了之后由服务端调 —— 见下面 self.elder.sync_now 的注释。 */
 extern "C" esp_err_t elder_sync_request_now(void);
+/* 2026-11-01：状态灯总开关。返回**改完之后**的真实状态（1=开，0=关）。
+ * 只影响状态灯，提醒/服药/告警/按键灯一律照常 —— 判据在 rgb.c 按优先级放行。 */
+extern "C" int elder_set_status_light(int on);
+extern "C" int elder_get_status_light(void);
 // <<< END elder-companion overlay <<<
 
 McpServer::McpServer() {
@@ -207,6 +213,51 @@ void McpServer::AddCommonTools() {
             (void)properties;
             (void)elder_sync_request_now();
             return true;
+        });
+
+    /* 2026-11-01：状态灯总开关。用户原话「关闭状态灯（严禁关闭事件灯）」。
+     *
+     * 为什么拆成 set / get 两个工具，而不是一个带可选参数的 light_control：
+     * 可选参数在 MCP 里用"默认值"表达，而"不传"和"传 false"就分不开了 ——
+     * 老人问「灯关了吗」如果被当成"关闭"，是最坏的一种误操作。
+     * 两个工具、参数都必需，语义没有歧义。
+     *
+     * 为什么描述里反复强调"提醒灯照常"：服务端 prompt 要求模型在关灯后
+     * 补一句「有提醒还是会亮」。模型只能从工具描述里知道这件事 ——
+     * 不写清楚，它会跟老人说"灯全关了"，而老人真的会因此错过吃药提醒。
+     *
+     * 返回 {"on":bool} 的 JSON 字符串（不是裸 bool）：服务端要能区分
+     * "改成了什么"和"请求是什么"。改失败时返回的是改之前的值，如实。 */
+    AddTool("self.elder.set_status_light",
+        "Turn the device's STATUS lights on or off.\n"
+        "Status lights = idle twinkle / listening / speaking / emotion colours.\n"
+        "Call with on=false when the user says \"把灯关了\" \"太亮了\" "
+        "\"晚上别亮灯\"; with on=true when they say \"把灯打开\" \"开灯\".\n"
+        "IMPORTANT: reminder blinks, medicine-pending, alarm and the confirm-button "
+        "indicator are NEVER affected. Tell the user this explicitly "
+        "(\"灯关了，但有提醒还是会亮\") instead of saying all lights are off.",
+        PropertyList({
+            Property("on", kPropertyTypeBoolean)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            int on = properties["on"].value<bool>() ? 1 : 0;
+            int now = elder_set_status_light(on);
+            char buf[24];
+            snprintf(buf, sizeof(buf), "{\"on\":%s}", now ? "true" : "false");
+            return std::string(buf);
+        });
+
+    AddTool("self.elder.get_status_light",
+        "Read whether the device's STATUS lights are currently on.\n"
+        "Call it when the user asks \"灯关了吗\" \"灯还亮着吗\".\n"
+        "Reminder / medicine / alarm lights are independent and always on.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            (void)properties;
+            char buf[24];
+            snprintf(buf, sizeof(buf), "{\"on\":%s}",
+                     elder_get_status_light() ? "true" : "false");
+            return std::string(buf);
         });
     // <<< END elder-companion overlay <<<
 

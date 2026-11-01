@@ -710,6 +710,28 @@ extern "C" void elder_enter_standby(void)
     });
 }
 
+/* ------------------------------------------------ 状态灯开关（2026-11-01） */
+
+/* 老人说「把灯关了」→ 服务端调 self.elder.set_status_light → 落到这里。
+ *
+ * 只关**状态灯**（待机/聆听/说话/表情）。提醒闪灯、服药未确认、求助告警、
+ * #1 按键指示灯一律照常 —— 判据在 rgb.c 的 active_slot 里按优先级放行，
+ * 本函数不参与判断。用户原话：「关闭状态灯（严禁关闭事件灯）」。
+ *
+ * 返回**改完之后**的真实状态，而不是"成功/失败"：老人问「灯关了吗」时，
+ * 服务端要能拿到一个和事实一致的答案。返回 1 = 开，0 = 关。
+ */
+extern "C" int elder_set_status_light(int on)
+{
+    elder_rgb_set_status_light(on != 0);
+    return elder_rgb_status_light_enabled() ? 1 : 0;
+}
+
+extern "C" int elder_get_status_light(void)
+{
+    return elder_rgb_status_light_enabled() ? 1 : 0;
+}
+
 /* ---------------------------------------------------------------- 入口 */
 
 extern "C" void elder_bridge_start(void)

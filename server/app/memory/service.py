@@ -28,7 +28,7 @@ from .extract import (Fact, as_turns, dedup_key_of, extract_facts,
 from .persona import judge_feedback, observe_reply
 from .retrieve import MemoryHit, search as _search
 from .store import NewFact, SqliteMemoryStore, invalidate
-from .textutil import fingerprint, sanitize_for_prompt
+from .textutil import fingerprint, near_duplicate_remainder, sanitize_for_prompt
 
 log = logging.getLogger("elder.memory.service")
 
@@ -45,6 +45,96 @@ _SUBSTANTIVE_RE = re.compile(r"[\W\d_]+")
 
 def _substantive(text: str) -> bool:
     return len(_SUBSTANTIVE_RE.sub("", text or "")) >= 4
+
+
+#: 参与「同一件事多种说法」合并的分类。
+#:
+#: 为什么是这三类：它们是**描述性**的，重复来自"老人反复说同一件事"，
+#: 而库里已经堆了实据 ——
+#:   preference: 老人要买有肉的水煎包(00:58) / 老人喜欢吃有肉的水煎包(00:59)
+#:               / 老人上次说喜欢有肉的水煎包(次日 03:51) 三条并存
+#:   event:      老人要给老三买衣服(10-31 13:07) / 老人前阵子说要给老三买衣服(14:28)
+#:   profile:    两个大的现在才上小学… / 老人是孩子的爸爸（同一段话的两句）
+#:
+#: 用药与日程**不在**这里：那两类的重复由 ``extract.dedup_key_of`` 的
+#: (时间键, 实体) 精确处理，时间差一天就是两件不同的事，用相似度合并会误杀。
+_NEAR_DUP_CATEGORIES = (
+    models.MemoryCategory.PROFILE,
+    models.MemoryCategory.PREFERENCE,
+    models.MemoryCategory.EVENT,
+)
+
+#: 判定「同一件事的两种说法」的**剩余字数**上限。4 是**拿生产真实数据标定**的：
+#:
+#:   真重复  老人要买有肉的水煎包 / 老人喜欢吃有肉的水煎包        剩 3 字
+#:   真重复  老人要给老三买衣服 / 老人前阵子说要给老三买衣服       剩 4 字
+#:   真重复  老人要买有肉的水煎包 / 老人上次说喜欢有肉的水煎包     剩 5 字 ← 漏（可接受）
+#:   必须留  老人明天8点吃鼻炎药 / 老人今天8点吃了鼻炎药          剩 5 字
+#:   必须留  老人要买豆浆 / 老人要买有肉的水煎包                  剩 6 字
+#:   不同事  老人要买有肉的水煎包 / 如果没肉就买小笼包            剩 10 字
+#:   不同事  老人知道胡东家包子好吃 / 老人知道清奶奶家包子好吃     剩 3 字 ← 靠实体判据排除
+#:
+#: 4 是"真重复的上界"与"必须保留的下界（5）"之间唯一的分界。
+#: 刻意**宁可漏**：漏掉的重复只是多占一行 prompt，而误合并是直接丢信息。
+_NEAR_DUP_MAX_REMAINDER = 4
+
+
+def _entities_conflict(a: Sequence[str] | None, b: Sequence[str] | None) -> bool:
+    """两条记忆的实体集合是否**互相排斥**（= 讲的不是同一件事）。
+
+    **只要有一方抽出了实体**，就必须与另一方有交集，否则判为冲突。
+    两边都抽不出实体时才返回 False（"没有证据表明不同"）——
+    规则抽取本来就抽不全，把"抽不出来"当成"不同"会把真重复全放过去。
+
+    生产实据（这条规则为什么不能写成"两边都非空才判"）：
+    「老人知道胡东家包子好吃」抽不出实体，而「老人知道清奶奶家包子好吃」
+    抽出了一个错的「道清奶奶」—— 两边不对称，但**只要有一边给出了
+    与另一边不相交的实体集**，就足以判定它们是两家不同的包子铺。
+    """
+    sa = {e for e in (a or ()) if e}
+    sb = {e for e in (b or ()) if e}
+    if not sa and not sb:
+        return False
+    return not (sa & sb)
+
+
+def suppress_near_duplicates(hits: Sequence[MemoryHit]) -> list[MemoryHit]:
+    """把召回结果里「同一件事的多种说法」压成一条（保留分数最高的那条）。
+
+    为什么在**召回侧**做而不是在入库侧删/压制：
+    ADD-only 的核心承诺是"旧陈述永不删，改口靠检索侧压制"。把重复的旧行
+    直接删掉或标 superseded，会让"老人到底说过几次"这件事无从查起 ——
+    而家属恰恰会问这个。这里只影响**这一次喂给模型的文本**，库里一行不动。
+
+    顺序即优先级：``search()`` 已按融合分数降序返回，所以按顺序贪心保留、
+    把与已保留项相似的丢掉，天然留下分数最高的那条。
+
+    ⚠️ 这是 O(n²)，但 n 是 top_k（默认 6），可以忽略。
+    """
+    kept: list[MemoryHit] = []
+    for h in hits:
+        dup = False
+        for k in kept:
+            if h.category != k.category:
+                continue
+            if h.category not in _NEAR_DUP_CATEGORIES:
+                continue
+            if _entities_conflict(getattr(h, "entities", None),
+                                  getattr(k, "entities", None)):
+                continue
+            if similarity_ok(h.content or "", k.content or ""):
+                dup = True
+                log.info("召回去重：%r 与 %r 判为同一件事，只保留后者",
+                         (h.content or "")[:24], (k.content or "")[:24])
+                break
+        if not dup:
+            kept.append(h)
+    return kept
+
+
+def similarity_ok(a: str, b: str) -> bool:
+    """两条记忆的正文是否近到"可以当成同一件事"。"""
+    return near_duplicate_remainder(a, b) <= _NEAR_DUP_MAX_REMAINDER
 
 
 def _commit(db: Session, user_id: int, agent_id: int | None) -> None:
@@ -344,6 +434,9 @@ def build_context(db: Session, query: str, user_id: int, agent_id: int | None,
     不保证**一定命中缓存**，更不保证下一次读会更快。
     """
     hits = search(db, query, user_id, agent_id, top_k=top_k, client=client)
+    if not hits:
+        return ""
+    hits = suppress_near_duplicates(hits)
     if not hits:
         return ""
     lines = [
