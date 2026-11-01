@@ -381,6 +381,24 @@ def main() -> int:
         # 在此之前 `emotion_lights` 在服务端只有 CRUD、固件也没人消费 ——
         # 用户在界面上调完灯效、点了保存，设备一点变化都没有，而且**全链路
         # 没有任何报错**。这类"写了不跑"的缺陷只能靠端到端断言挡住。
+        #
+        # 2026-11-01：界面从「15 条预置」改成「5 种效果 + 安全色板 + 随机色」。
+        # 元数据契约在下面先断言一遍 —— 旧的 `presets` 键若还在下发，
+        # 说明服务端没跟上；新的 `colors` / `random` 缺了，界面色块就是空的。
+        code, meta = req("GET", "/api/avatars/light-presets", None, u1)
+        check("灯效元数据可取", code == 200 and isinstance(meta, dict), str(code))
+        meta = meta if isinstance(meta, dict) else {}
+        effs = [e.get("effect") for e in (meta.get("effects") or [])]
+        check("★ 效果清单恰好 5 种且顺序 = 关闭/呼吸/常亮/星光/流水",
+              effs == ["off", "breath", "solid", "starlight", "flow"], str(effs))
+        check("★ 旧的 15 条 presets 不再下发（否则前端会渲染出第二份清单）",
+              "presets" not in meta, str(sorted(meta.keys())))
+        check("★ 安全色板随元数据下发且非空",
+              len(meta.get("colors") or []) >= 8, str(len(meta.get("colors") or [])))
+        rnd = meta.get("random") or {}
+        check("★ 随机色声明：哨兵 #000000，且只对 starlight / flow 开放",
+              rnd.get("rgb") == "#000000" and rnd.get("effects") == ["starlight", "flow"],
+              str(rnd))
         lights = (sync or {}).get("lights")
         check("心跳返回体带 lights 段", isinstance(lights, dict), type(lights).__name__)
         # 键名必须与固件 elder_rgb_state_t / sync.c 的 k_light_keys 一一对应。
@@ -399,10 +417,16 @@ def main() -> int:
         # 改形象上的灯效 → 再心跳，必须原样出现在下发里。
         # 只断言"字段齐"是不够的：那样把 normalize 写成"永远返回默认表"也能过，
         # 而用户改了灯效不生效正是这个现象。
+        #
+        # 夹具用 effect="flow"（2026-11-01 新加的"流水"）而不是老代码里的
+        # "blink"：blink 已从服务端 5 种效果里下线，再用它做夹具，断言只会
+        # 验到"被归一成默认值"，等于把回归挡住的同时也把新效果挡住了。
+        # rgb 故意用色板里没有的 #123456 —— 服务端只校验格式，不限制色板
+        # （色板是界面约束，不是数据约束），这条顺带钉死这一点。
         code, av = req("POST", "/api/avatars", {
             "name": "灯效测试形象",
             "emotion_lights": {
-                "neutral": {"preset": "", "rgb": "#123456", "effect": "blink",
+                "neutral": {"rgb": "#123456", "effect": "flow",
                             "brightness": 42, "interval_ms": 1500},
             },
         }, u1)
@@ -414,7 +438,7 @@ def main() -> int:
         l2 = ((sync2 or {}).get("lights") or {}).get("neutral") or {}
         check("★ 改过的灯效真的下发了（neutral 四项逐字段相等）",
               code == 200
-              and l2.get("effect") == "blink" and l2.get("rgb") == "#123456"
+              and l2.get("effect") == "flow" and l2.get("rgb") == "#123456"
               and l2.get("brightness") == 42 and l2.get("interval_ms") == 1500,
               str(l2))
         # 没配的状态要给默认值而不是缺项 —— 缺项在固件里等于"该状态没有灯效"。

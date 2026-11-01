@@ -63,8 +63,19 @@ function lightSummary(a: Avatar) {
     const it = L[k]
     if (!it) return '—'
     const eff = String(it.effect || '')
-    const map: Record<string, string> = { off: '关闭', solid: '常亮', breath: '呼吸', blink: '闪烁', starlight: '星光' }
-    return (map[eff] || eff) + ' ' + String(it.rgb || '')
+    // ⚠️ 这张表是**只读展示**用的兜底：本页不提供灯效编辑，拿不到
+    // /api/avatars/light-presets 的 label 时才走这里。真源仍在服务端
+    // avatar_style.py 的 LIGHT_EFFECTS，加新效果必须两边一起加，
+    // 否则 APP 里会显示成英文 effect 名（如 "flow"）。
+    const map: Record<string, string> = {
+      off: '关闭', solid: '常亮', breath: '呼吸', starlight: '星光', flow: '流水',
+    }
+    const name = map[eff] || eff
+    // #000000 是"颜色随机"的哨兵（服务端约定，见 avatar_style.RANDOM_RGB）。
+    // 直接显示 "#000000" 会让人以为设成了黑色。
+    const rgb = String(it.rgb || '')
+    const color = rgb.toUpperCase() === '#000000' ? '随机' : rgb
+    return name + ' ' + color
   }
   return '待机 ' + pick('neutral') + ' · 提醒 ' + pick('alert')
 }

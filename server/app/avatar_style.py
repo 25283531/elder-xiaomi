@@ -17,6 +17,8 @@
 """
 from __future__ import annotations
 
+import re
+
 # ================================================================ clips
 # 端侧约定的语义片段名，作为默认映射，便于管理页一键填充
 DEFAULT_CLIPS: dict[str, str] = {
@@ -56,37 +58,67 @@ LIGHT_STATES: tuple[tuple[str, str, str], ...] = (
     ("alert", "提醒警示", "待办 / 用药提醒响铃时"),
 )
 
-# 支持的动效。``starlight``（星光）与 ``breath`` / ``blink`` 一样吃
-# interval_ms；``solid`` 与 ``off`` 不吃（常亮没有"间隔"这回事）。
+# 支持的动效 = 界面「灯效」下拉的全部内容。**唯一真源在这里**，
+# 前端直接拉 ``/api/avatars/light-presets`` 渲染，不自己抄一份。
+#
+# ⚠️ 这张表**只能**放固件真认识的字符串。``sync.c`` 的
+# ``light_effect_from_str()`` 认不出就 ``LIGHT_EFFECT_KEEP``（静默保留默认），
+# 于是"选了个新效果、灯没变"而且两端都不报错。加一项之前先去
+# ``firmware/components/elder/src/sync.c`` 把映射补上。
+#
+# 2026-11-01 用户定稿的 5 种：关闭 / 呼吸 / 常亮 / 星光 / 流水（跑马灯）。
+# 原来那张 15 条的"预置灯效"表已删除 —— 它把"效果"和"颜色"焊死成一个
+# 下拉项，用户要的是"先选效果、再选颜色"两个独立维度，且当时列表里
+# 只有 4 种真能生效（``blink`` 也在，但界面根本看不出区别）。
 LIGHT_EFFECTS: tuple[tuple[str, str, bool], ...] = (
     ("off", "关闭", False),
-    ("solid", "常亮", False),
     ("breath", "呼吸", True),
-    ("blink", "闪烁", True),
+    ("solid", "常亮", False),
     ("starlight", "星光", True),
+    ("flow", "流水（跑马灯）", True),
 )
 
-# 预置灯效。**唯一真源在这里**，前端下拉直接拉接口，不自己抄一份 ——
-# 抄一份的下场是加了个新灯效前端看不到，或者两边 rgb 对不上。
-LIGHT_PRESETS: tuple[dict, ...] = (
-    {"id": "off", "name": "关闭", "effect": "off", "rgb": "#000000"},
-    {"id": "breath_blue", "name": "呼吸 · 蓝", "effect": "breath", "rgb": "#4A90D9"},
-    {"id": "breath_cyan", "name": "呼吸 · 天青", "effect": "breath", "rgb": "#7FD3FF"},
-    {"id": "breath_green", "name": "呼吸 · 绿", "effect": "breath", "rgb": "#3AD07A"},
-    {"id": "breath_amber", "name": "呼吸 · 暖黄", "effect": "breath", "rgb": "#FFD24A"},
-    {"id": "breath_purple", "name": "呼吸 · 紫", "effect": "breath", "rgb": "#9B7FE8"},
-    {"id": "solid_blue", "name": "常亮 · 蓝", "effect": "solid", "rgb": "#4A90D9"},
-    {"id": "solid_green", "name": "常亮 · 绿", "effect": "solid", "rgb": "#3AD07A"},
-    {"id": "solid_gray", "name": "常亮 · 灰蓝", "effect": "solid", "rgb": "#5B6B8C"},
-    {"id": "solid_red", "name": "常亮 · 红", "effect": "solid", "rgb": "#FF2020"},
-    {"id": "blink_red", "name": "闪烁 · 红", "effect": "blink", "rgb": "#FF2020"},
-    {"id": "blink_amber", "name": "闪烁 · 琥珀", "effect": "blink", "rgb": "#FFB020"},
-    {"id": "starlight_white", "name": "星光 · 白", "effect": "starlight", "rgb": "#FFFFFF"},
-    {"id": "starlight_purple", "name": "星光 · 紫", "effect": "starlight", "rgb": "#B98CFF"},
-    {"id": "starlight_cyan", "name": "星光 · 青", "effect": "starlight", "rgb": "#7FD3FF"},
-)
+# "颜色随机"的线上哨兵值。
+#
+# 为什么借用 ``#000000`` 而不是加一个 ``random: true`` 字段：固件侧的判据是
+# ``s->color == 0`` 才走随机彩点（``rgb.c`` 的 TWINKLE 分支），而黑色在
+# WS2812B 上本来就等于"灭"，用户不可能主动选它 —— 天然是空闲哨兵。
+# 加布尔字段则要同时改 schema / 归一 / 下发 / 三套前端，收益为零。
+RANDOM_RGB = "#000000"
 
-LIGHT_PRESET_BY_ID: dict[str, dict] = {p["id"]: p for p in LIGHT_PRESETS}
+# 哪些动效**支持**随机色。
+#
+# 只有这两种，这不是保守而是事实：
+#   · ``starlight`` —— 每闪一次换一个色相（rgb.c 里 ``hsv2rgb(hash)``）；
+#   · ``flow``      —— 每个灯位一个色相、整体滚动。
+# 而 ``solid`` / ``breath`` 在固件里是 ``c = s->color``、**不随时间变色**，
+# ``color == 0`` 就是黑色 = 灯灭。把"随机"开放给它们，用户会看到
+# "设了随机，灯不亮了" —— 这是最坏的一种降级。
+# ``normalize_lights()`` 会把不合法的组合打回默认色，别指望界面能拦住全部入口。
+RANDOM_EFFECTS: tuple[str, ...] = ("starlight", "flow")
+
+# 安全色板 = 「颜色」列弹窗里能选的全部颜色。
+#
+# "安全"指两件事：
+#   ① **不过流**：WS2812B 单颗满白 60mA，8 颗全白 480mA，对板载 5V 供电偏紧。
+#      所以这张表**没有纯白**，最亮的只是偏暖的 ``#FFE9C4``。
+#   ② **不刺眼**：饱和度都收在中段，没有 ``#00FF00`` / ``#0000FF`` 这种
+#      夜里看着像灼烧的纯色 —— 这台设备是放在老人卧室的。
+# 用户要自定义颜色得先改这里（前端不提供自由取色器，这是刻意的）。
+LIGHT_COLORS: tuple[dict, ...] = (
+    {"id": "warm_white", "name": "暖白", "rgb": "#FFE9C4"},
+    {"id": "red", "name": "正红", "rgb": "#FF2020"},
+    {"id": "orange", "name": "橙", "rgb": "#FF7A18"},
+    {"id": "amber", "name": "琥珀", "rgb": "#FFB020"},
+    {"id": "yellow", "name": "暖黄", "rgb": "#FFD24A"},
+    {"id": "green", "name": "草绿", "rgb": "#3AD07A"},
+    {"id": "cyan", "name": "青", "rgb": "#7FD3FF"},
+    {"id": "blue", "name": "天蓝", "rgb": "#4A90D9"},
+    {"id": "indigo", "name": "蓝紫", "rgb": "#6C6CFF"},
+    {"id": "purple", "name": "紫", "rgb": "#B98CFF"},
+    {"id": "pink", "name": "品红", "rgb": "#FF5FA2"},
+    {"id": "gray_blue", "name": "灰蓝", "rgb": "#5B6B8C"},
+)
 
 # brightness 的合法区间。0 等于关闭，所以下限给 1 —— 允许存 0 会出现
 # "设成 0 但 effect 是 breath"这种自相矛盾的组合，固件只能二选一。
@@ -97,34 +129,62 @@ INTERVAL_MIN, INTERVAL_MAX = 200, 5000
 _EFFECT_INTERVAL = {eff: has_iv for eff, _lab, has_iv in LIGHT_EFFECTS}
 
 
-def _light(preset_id: str, brightness: int = 100, interval_ms: int = 800) -> dict:
-    """按预置 id 造一条状态灯效。
+def _light(effect: str, rgb: str, brightness: int = 100,
+           interval_ms: int = 800) -> dict:
+    """造一条状态灯效（效果 + 颜色两个独立维度）。
 
-    ``preset`` 是回显用的锚点，``rgb``/``effect`` 是**实际生效值** ——
-    两个都存是刻意的：老代码与设备只认 rgb/effect，只存 preset 会让它们
-    读到空；反过来只存 rgb/effect 则下拉框回显不出"当前选的是哪个预置"，
-    用户会以为没保存成功。
+    2026-11-01 之前这里是 ``_light(preset_id)``，颜色和效果焊在一个
+    "预置"里。改成两个参数之后 ``preset`` 字段整个消失了 —— 它只是
+    "用户选的是哪一条预置"的回显锚点，效果和颜色都能独立选之后，
+    这个锚点既表达不了状态、又会跟实际值不一致（改颜色时锚点必须失效），
+    留着只会变成第二个真源。
     """
-    p = LIGHT_PRESET_BY_ID[preset_id]
     return {
-        "preset": preset_id,
-        "rgb": p["rgb"],
-        "effect": p["effect"],
+        "rgb": rgb,
+        "effect": effect,
         "brightness": brightness,
         "interval_ms": interval_ms,
     }
 
 
-# 每个状态的出厂灯效
+# 每个状态的出厂灯效。
+# ``angry`` 原来是 ``blink_red``（闪烁红），blink 不在新的 5 种里了，
+# 改成"呼吸红" —— 不能改成常亮红，那会和 ``alert``（常亮红）一模一样，
+# 用户就分不出"生气"和"该吃药了"。
 DEFAULT_LIGHTS: dict[str, dict] = {
-    "neutral": _light("breath_blue"),
-    "listening": _light("breath_amber"),
-    "speaking": _light("breath_cyan", brightness=80, interval_ms=600),
-    "happy": _light("breath_green"),
-    "sad": _light("solid_gray", brightness=70),
-    "angry": _light("blink_red", interval_ms=400),
-    "alert": _light("solid_red"),
+    "neutral": _light("breath", "#4A90D9"),
+    "listening": _light("breath", "#FFB020"),
+    "speaking": _light("breath", "#7FD3FF", brightness=80, interval_ms=600),
+    "happy": _light("breath", "#3AD07A"),
+    "sad": _light("solid", "#5B6B8C", brightness=70),
+    "angry": _light("breath", "#FF2020", interval_ms=400),
+    "alert": _light("solid", "#FF2020"),
 }
+
+
+_RGB_RE = re.compile(r"^#[0-9A-F]{6}$")
+
+
+def _norm_rgb(raw: object, effect: str, fallback: str) -> str:
+    """把颜色归一成 ``#RRGGBB``（大写）。非法值 / 不支持随机的组合退回默认色。
+
+    为什么非要在这里拦，而不是"前端已经限制过了"：
+      · ``light_rgb_from_str()`` 在固件侧对非法串返回 **0**，而 0 对
+        ``solid`` / ``breath`` 就是**灯灭**。一个拼错的颜色 = 灯不亮，
+        且两端日志都正常 —— 这是最坏的一种降级。
+      · ``#000000`` 是"随机"哨兵，但它只对 ``RANDOM_EFFECTS`` 有意义。
+        用户先选"星光 + 随机"再把效果改成"常亮"时，rgb 会原样留着，
+        变成"常亮 + 黑色" = 灯灭。归一必须把这个组合打回默认色。
+    """
+    s = str(raw or "").strip()
+    if not s.startswith("#"):
+        s = "#" + s          # '#' 可省略：老数据/手填的 "4A90D9" 是同一个颜色
+    s = s.upper()
+    if not _RGB_RE.match(s):
+        return fallback
+    if s == RANDOM_RGB and effect not in RANDOM_EFFECTS:
+        return fallback
+    return s
 
 
 def normalize_lights(raw: object) -> dict[str, dict]:
@@ -140,10 +200,14 @@ def normalize_lights(raw: object) -> dict[str, dict]:
         base = DEFAULT_LIGHTS[key]
         item = src.get(key)
         item = item if isinstance(item, dict) else {}
-        rgb = str(item.get("rgb") or base["rgb"])
         effect = str(item.get("effect") or base["effect"])
         if effect not in _EFFECT_INTERVAL:
+            # 认不出的效果（含已下线的 blink / 别的版本存的字符串）退回默认。
+            # 注意这里**不能**退回 solid：把"呼吸"拼错成"breathh"就变成
+            # 一直亮着，夜里刺眼且没人能排查出来。默认值是安全的。
             effect = base["effect"]
+        # 颜色校验放在效果确定**之后**：随机色是否合法取决于效果。
+        rgb = _norm_rgb(item.get("rgb"), effect, base["rgb"])
         try:
             brightness = int(item.get("brightness", base["brightness"]))
         except (TypeError, ValueError):
@@ -154,23 +218,8 @@ def normalize_lights(raw: object) -> dict[str, dict]:
         except (TypeError, ValueError):
             interval = base["interval_ms"]
         interval = max(INTERVAL_MIN, min(INTERVAL_MAX, interval))
-        preset = str(item.get("preset") or "")
-        # 整项缺失（新建形象 / 老数据里没这一行）时，rgb/effect/brightness
-        # 全部取自 DEFAULT_LIGHTS —— 那 preset 也必须取默认表里的那个 id，
-        # 否则新建形象的 7 个状态在界面上全显示「自定义」，而它实际就是
-        # "呼吸·蓝"这些出厂预置。注意这**不是**反查：没有从 rgb+effect 猜 id。
-        if not item:
-            preset = base["preset"]
-        # preset 与 rgb/effect 对不上时**以实际值为准**、preset 置空：
-        # 反过来（以 preset 为准）会把用户手改的颜色悄悄改回去。
-        # 注意必须校验"一致"而不只是"id 存在" —— 存了 preset=solid_red
-        # 但 rgb 被改成别的颜色时，若只查 id 存在，下拉会一直显示"常亮·红"
-        # 而实际颜色是别的，用户改了颜色却看到"没改"。
-        p = LIGHT_PRESET_BY_ID.get(preset)
-        if p is None or p["rgb"].lower() != rgb.lower() or p["effect"] != effect:
-            preset = ""
         out[key] = {
-            "preset": preset, "rgb": rgb, "effect": effect,
+            "rgb": rgb, "effect": effect,
             "brightness": brightness, "interval_ms": interval,
         }
     return out
