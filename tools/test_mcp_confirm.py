@@ -333,8 +333,9 @@ def t_device_controls() -> None:
           {"set_volume", "set_brightness", "get_device_status"} <= set(names),
           f"names={names}")
     check("★ 必须追加在工具表末尾（插中间会让 prompt 前缀缓存全失效）",
-          names[-3:] == ["set_volume", "set_brightness", "get_device_status"],
-          f"tail={names[-3:]}")
+          names[-6:] == ["set_volume", "set_brightness", "get_device_status",
+                         "get_wifi_info", "get_headlines", "set_status_light"],
+          f"tail={names[-6:]}")
 
     # ---- 绝对量：一次往返，参数名必须与固件 Property 名逐字一致 ----
     dev = FakeDevice()
