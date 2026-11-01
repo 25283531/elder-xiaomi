@@ -286,12 +286,40 @@ class FakeDevice:
         self.writer.write(M.publish_packet(topic, payload))
         await self.writer.drain()
 
-    async def pingreq(self) -> bool:
+    async def pingreq(self, timeout: float = 5.0
+                      ) -> tuple[bool, list[int], bytes | None]:
+        """发 PINGREQ，等到 PINGRESP 为止。
+
+        返回 ``(是否收到 PINGRESP, 途中遇到的其它报文首字节, 途中第一个
+        PUBLISH 的 payload)``。
+
+        ⚠️ **不能"读下一包就判 0xD0"**：控制面是复用的，会话建立后服务端
+        会主动推一条 MCP 工具调用（``self.elder.sync_now``，见
+        ``voice/session.py`` 的 ``_kick_sync``），那条 PUBLISH 完全可能插在
+        PINGRESP 前面。按"下一包"判，断言就会随服务端推送时机随机变红 ——
+        2026-11-01 就是这么红的（服务端日志写着"会话建立时叫设备同步没成功
+        （TimeoutError）"，而测试这边把那条 PUBLISH 当成了 PINGRESP）。
+        真实客户端同样必须容忍 PUBLISH 与 PINGRESP 交错，这不是迁就测试。
+        """
         from app.voice import mqtt_udp as M
         self.writer.write(M.encode_packet(0xC0))
         await self.writer.drain()
-        head, _ = await M.read_packet(self.reader)
-        return head == 0xD0
+        deadline = time.monotonic() + timeout
+        others: list[int] = []
+        first_publish: bytes | None = None
+        while time.monotonic() < deadline:
+            head, body = await asyncio.wait_for(
+                M.read_packet(self.reader),
+                timeout=max(0.1, deadline - time.monotonic()))
+            if head is None:
+                raise ConnectionError("broker 关闭了连接")
+            if head == 0xD0:
+                return True, others, first_publish
+            others.append(head)
+            if (head & 0xF0) == 0x30 and first_publish is None:
+                tlen = struct.unpack_from(">H", body, 0)[0]
+                first_publish = body[2 + tlen:]
+        return False, others, first_publish
 
     async def recv_publish(self, timeout: float = 10.0) -> tuple[str, bytes]:
         """收一个下行 PUBLISH，返回 (topic, payload)。超时抛 TimeoutError。"""
@@ -610,7 +638,30 @@ async def t_broker_and_e2e(ids: dict) -> None:
     key = bytes.fromhex(str(udp.get("key", "")))
     base_nonce = bytes.fromhex(str(udp.get("nonce", "")))
 
-    SV.check("第 4 条 ★ PINGREQ 收到 PINGRESP", await dev.pingreq(), "")
+    # 会话建立后服务端会**主动**叫设备同步一次配置（唤醒即生效的兑现点，
+    # 见 voice/session.py 的 _kick_sync）。WS 链路由 smoke_voice 12a 覆盖，
+    # MQTT 是**另一条传输**：_send_json 走同一份代码，但"换了传输就丢了"
+    # 这种事没人测就没人知道，所以这里单独证一次。
+    #
+    # 顺序刻意放在 PINGREQ **之前**：_kick_sync 在 hello 之后立刻触发，这条
+    # 一定先到；若反过来先 ping 再"顺手看看有没有插队"，断言就取决于两者
+    # 谁先到 —— 那是按竞态变红的用例，比没有用例更坏。
+    try:
+        _sync_topic, _sync_raw = await dev.recv_publish(timeout=8)
+        _sync_msg = json.loads(_sync_raw.decode("utf-8"))
+    except (asyncio.TimeoutError, ConnectionError, ValueError, UnicodeDecodeError):
+        _sync_msg = {}
+    _sync_payload = _sync_msg.get("payload") or {}
+    SV.check("第 4 条 ★ 会话建立后服务端主动叫设备同步配置（MQTT 链路的「唤醒即生效」）",
+             _sync_msg.get("type") == "mcp"
+             and _sync_payload.get("method") == "tools/call"
+             and (_sync_payload.get("params") or {}).get("name") == "self.elder.sync_now"
+             and isinstance(_sync_payload.get("id"), int),
+             str(_sync_msg)[:200])
+
+    ping_ok, ping_others, _ = await dev.pingreq()
+    SV.check("第 4 条 ★ PINGREQ 收到 PINGRESP", ping_ok,
+             f"途经其它报文={[hex(h) for h in ping_others]}")
 
     await dev.open_udp()
 
