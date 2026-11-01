@@ -185,6 +185,85 @@ def main() -> int:
     vs = mac_variants("aabbccddeeff")
     check("mac_variants 返回 6 种形态且封顶", len(vs) == 6, f"{len(vs)}: {vs}")
 
+    # ------------------------------------------------- 4) 多选 trait 旧格式迁移
+    #
+    # ``topic_scope`` 从单选改成多选后，老库里是字符串 'daily'，而新代码要求
+    # list[str]：``is_valid('daily')`` 为假 ⇒ ``spec.validate()`` 抛 ⇒
+    # ``load_agent_persona`` 整体回退到基础口令。**生产上角色 id=8 就是
+    # 'daily'** —— 不迁的话部署新版之后它照样没有人格，只是日志从
+    # 「不属于该用户」变成「trait 取值非法」，同一句话两种死法。
+    print("\n[4] traits 多选格式（str -> list）")
+    # ⚠️ 必须**另起一个干净库**：上一节把 ELDER_DB 切到了 dupe.db 并清空了
+    # sys.modules 里的 app.*，所以这里不重建就会对着 dupe.db 跑 —— 造的行
+    # 在 old.db、迁移跑在 dupe.db，表现是"迁移一行都没改"，极难看出是环境问题
+    # （第一版就是这么写的，调试了半天）。
+    db3 = Path(tmpdir) / "traits.db"
+    engine2.dispose()
+    os.environ["ELDER_DB"] = f"sqlite:///{db3.as_posix()}"
+    for mod in [m for m in list(sys.modules) if m.startswith("app")]:
+        del sys.modules[mod]
+    from app import models as M3          # noqa: F401  建表靠 import 注册
+    from app.db import Base as Base3, SessionLocal as SL3, engine as engine3
+    from app import main as app_main
+    from app.persona.spec import from_row as _from_row
+
+    Base3.metadata.create_all(engine3)
+
+    with SL3() as db:
+        rows = [
+            ("老角色-str", {"verbosity": "normal", "topic_scope": "daily"}),
+            ("老角色-非法值", {"topic_scope": "not_a_topic"}),
+            ("已经是新格式", {"topic_scope": ["daily", "health"]}),
+        ]
+        made = []
+        for name, traits in rows:
+            r = M3.AIProvider(
+                name=name, description="", system_prompt="", tts_voice="",
+                kind="", record_type=M3.RECORD_TYPE_ROLE, owner_id=1,
+                parent_id=None, traits=traits, guardrails={}, enabled=True,
+            )
+            db.add(r)
+            db.flush()
+            made.append(r.id)
+        db.commit()
+
+    app_main._seed_migration()
+
+    with SL3() as db:
+        got = {r.id: (r.name, r.traits.get("topic_scope"))
+               for r in db.query(M3.AIProvider)
+               .filter(M3.AIProvider.id.in_(made)).all()}
+
+    check("str 'daily' 迁成 ['daily']",
+          got[made[0]][1] == ["daily"], repr(got[made[0]][1]))
+    check("迁后是 list（不是仍留着 str）",
+          isinstance(got[made[0]][1], list), type(got[made[0]][1]).__name__)
+    check("认不出的旧值回落到默认 ['daily']（不是原样留着、也不是空列表）",
+          got[made[1]][1] == ["daily"], repr(got[made[1]][1]))
+    check("已经是 list 的原样不动（幂等，不重排也不丢）",
+          got[made[2]][1] == ["daily", "health"], repr(got[made[2]][1]))
+
+    # 迁移的**目的**是让这些行能通过校验，而不是"字段看起来变了"。
+    # 只断言形状不断言后果，等于没测（下一版 catalog 再改一次就又断了）。
+    ok_all, bad = True, []
+    with SL3() as db:
+        for rid in made:
+            try:
+                _from_row(db.get(M3.AIProvider, rid), None).validate()
+            except Exception as exc:  # noqa: BLE001
+                ok_all = False
+                bad.append(f"id={rid}:{type(exc).__name__}")
+    check("迁移后三行都能过 spec.validate（这才是迁移的目的）", ok_all, ",".join(bad))
+
+    app_main._seed_migration()
+    with SL3() as db:
+        again = {r.id: r.traits.get("topic_scope")
+                 for r in db.query(M3.AIProvider)
+                 .filter(M3.AIProvider.id.in_(made)).all()}
+    check("再跑一次迁移不改任何值（幂等）",
+          again == {made[0]: ["daily"], made[1]: ["daily"],
+                    made[2]: ["daily", "health"]}, repr(again))
+
     print(f"\n{'=' * 60}\n结果：{_pass} 通过 / {_fail} 失败")
     return 1 if _fail else 0
 

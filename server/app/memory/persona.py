@@ -59,6 +59,22 @@ log = logging.getLogger("elder.memory.persona")
 # 只有笑声 / 语气词：文档里点名的典型歧义场景（"哈哈哈"可能是笑机器人蠢）
 _LAUGH_ONLY = re.compile(r"^[哈呵嘿嘻嗨噢哦啊哎唉嗯\n\W\d]+$")
 
+#: 一条"纠正"最多多长。超过它就不当学习信号（2026-11-01 生产实据）。
+#:
+#: 生产上出现过这么一条：老人一口气说了 **204 字**（"水煎包有肉的话买肉的，
+#: 没有的话就小笼包，庙后头加油站北边儿……"），ASR 把整段连续语音并成了一句，
+#: 而服务端因为老人**抢话打断**给了 ``hint=correction`` ⇒ 整段被当成"用户
+#: 明确否定了刚才的说法，并给出了自己的表述"，原样写成**正例**入库。
+#:
+#: 之后这条正例作为 few-shot 注入 system prompt —— 等于拿一段含识别噪声
+#: （"一一臭氧""草镇"）的下单流水账教模型"应该这样说话"。这不只是没用，
+#: 它会**顶掉**真正有价值的那几条短示例（示例池有上限，按权重/时间排序）。
+#:
+#: 阈值取 120：真实纠正的典型长度是 10~20 字（"我说的是两分钟后提醒我做饭"
+#: 14 字），120 字已经约等于 30 秒连续语音，早就不可能是"一句纠正"。
+#: 超长的一律判无效，但**审计照写** —— 家属仍能看到"这条没学、为什么没学"。
+_MAX_LEARN_CHARS = 120
+
 # 玩梗 / 逗弄 / 恶意纠正。命中即判无效：
 # 这些话的真实意图是"逗机器人玩"，不是"教机器人说话"
 _TEASE_KEYWORDS = (
@@ -141,6 +157,17 @@ def judge_feedback(user_text: str, bot_text: str = "", prev_bot_text: str = "",
     # ---- 明确纠正：否定词 + 实质内容 ----
     is_correction = (hint == sig.CORRECTION) or bool(_NEGATION_RE.match(u))
     if is_correction:
+        # ---- 闸门 4：太长（只在纠正路径上判）----
+        # 为什么只在这一支：``hint=POSITIVE/NEGATIVE`` 的正/反例取自 ``bot_text``
+        # （机器人原话，长度可控），拿 user_text 的长度拦它们会误伤。
+        # 而纠正路径的正例**直接来自 user_text**，且 ``hint`` 是抢话打断给的
+        # —— 老人一口气说一大段时，ASR 会把整段并成一句，那不是"纠正"。
+        if len(u) > _MAX_LEARN_CHARS:
+            return FeedbackJudgement(
+                False, signal=hint or sig.CORRECTION,
+                reason=f"这句话太长（{len(u)} 字 > {_MAX_LEARN_CHARS}），"
+                       "像是整段陈述而不是一句纠正，提炼不出可学习的说法"
+                       "（多半是抢话打断 + ASR 把连续语音并成了一句）")
         rest = _clean_remainder(u)
         if len(re.sub(r"\W|\d", "", rest)) < 4:
             return FeedbackJudgement(

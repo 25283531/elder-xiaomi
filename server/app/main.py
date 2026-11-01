@@ -449,10 +449,52 @@ def _seed_migration() -> None:
                 av.system_prompt = ""
                 cleared += 1
 
+        # ---- 步骤 5：多选 trait 从旧格式（str）迁到 list（2026-11-01）----
+        #
+        # ``topic_scope`` 从单选改成多选后，老库里存的是字符串 ``'daily'``，
+        # 而新代码要求 ``list[str]``：``TraitSpec.is_valid('daily')`` 为假
+        # ⇒ ``spec.validate()`` 抛 ``TraitValueError`` ⇒ ``load_agent_persona``
+        # 整体回退到基础口令。**生产上角色 id=8 就是 ``'daily'``**，部署这版
+        # 代码后它会从"归属被拒"变成"trait 非法"，症状一样是没人格 ——
+        # 同一句话两种死法，只看日志会以为是两回事。
+        #
+        # 为什么是**迁移**而不是 ``TraitSpec.coerce()``：用户定调「开发测试
+        # 阶段不留兼容代码」。运行期 coerce 会让"库里到底存的是什么格式"
+        # 永远说不清，而且每读一次都要猜一次；一次性搬完之后库里就是新格式，
+        # 校验保持严格。两者都能让老数据可用，但只有前者会**消失**。
+        #
+        # 幂等：已经是 list 的不动。认不出的老值回落到默认并留痕 ——
+        # 静默改值等于"用户以为自己设了话题范围、实际没有"。
+        fixed = 0
+        for row in db.scalars(select(models.AIProvider)).all():
+            traits = dict(row.traits or {})
+            dirty = False
+            for name, spec in catalog.TRAIT_SPECS.items():
+                if spec.kind != "multi":
+                    continue
+                val = traits.get(name)
+                if not isinstance(val, str):
+                    continue
+                one = [val]
+                if spec.is_valid(one):
+                    traits[name] = spec.normalize(one)
+                else:
+                    traits[name] = list(spec.default)
+                    log.warning(
+                        "migrate: 角色 id=%s 的 %s 旧值 %r 不在合法范围 %s 内，"
+                        "已回落到默认 %r", row.id, name, val,
+                        [v for v, _l, _t in spec.levels], list(spec.default))
+                dirty = True
+            if dirty:
+                row.traits = traits
+                fixed += 1
+
         db.commit()
         if migrated or cleared or filled:
             log.info("migrate: 人格迁移完成（迁入 %s 条 / 置空 %s 条 / 回填 %s 台设备）",
                      migrated, cleared, filled)
+        if fixed:
+            log.info("migrate: %d 个角色的多选 trait 已从旧格式（str）迁到 list", fixed)
 
         # 老角色归属的补救提示（架构 §4.1.1）：无法自动判断归属，
         # 因此只提示管理员按需手工处理，绝不猜一个 owner。
