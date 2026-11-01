@@ -220,7 +220,11 @@ TRAIT_SPECS: Final[dict[str, TraitSpec]] = {
     "topic_scope": TraitSpec(
         # 2026-10-31 用户要求改多选：真实家庭里"只说用药"和"能聊家常"经常要
         # 同时成立（既要盯吃药，又不能除了吃药啥都不聊），单选逼人二选一。
-        # 存储从 str 变成 list[str]；老库里的 str 由 TraitSpec.coerce() 兼容。
+        # 存储从 str 变成 list[str]。
+        # ⚠️ 2026-11-01：`TraitSpec.coerce()` 已删除（用户定调"开发测试阶段
+        # 不留兼容代码"）。老库里残留的 str 值**不再被自动包成单元素列表**，
+        # 而是走"非法值"路径：列表接口用 known_valid_traits() 丢掉它并记日志，
+        # 单角色详情直接 400 报错。老数据按约定可以删掉重建。
         name="topic_scope", label="话题范围", kind="multi",
         default=["daily"],
         levels=(
