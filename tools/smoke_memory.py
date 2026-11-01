@@ -514,6 +514,59 @@ def main() -> int:
             check("作废留痕（discarded_at + 原因）",
                   bool(row) and bool(row.get("discarded_at")), f"row={bool(row)}")
 
+        # ============================================================ E2
+        print("── E2. 召回侧近重复抑制（2026-11-01，生产实据）──")
+        # 生产库里同一件事被**跨轮**反复抽取，逐条都是独立行：
+        #   老人要买有肉的水煎包(00:58) / 老人喜欢吃有肉的水煎包(00:59)
+        #   老人要给老三买衣服(10-31 13:07) / 老人前阵子说要给老三买衣服(14:28)
+        # 后果是召回时同一件事占掉好几行 prompt 预算，而家属看记忆页也是一屏重复。
+        #
+        # 判据是「去掉最长公共子序列后剩余字数 ≤ 4」+「实体不冲突」，
+        # 阈值拿这批真实数据标定。**为什么不改成比例相似度**：
+        # Jaccard 会把「老人要买有肉的水煎包/老人喜欢吃有肉的水煎包」（真重复 0.46）
+        # 与「老人知道胡东家包子好吃/老人知道清奶奶家包子好吃」（两家不同的店 0.50）
+        # 判得一样高 —— 后者一旦合并就是直接丢信息。
+        sys.path.insert(0, str(SERVER))
+        from app.memory.retrieve import MemoryHit
+        from app.memory.service import suppress_near_duplicates
+        from app.memory.textutil import extract_entities
+
+        def _mk_hit(mid: int, cat: str, txt: str, score: float = 0.5):
+            return MemoryHit(memory_id=mid, content=txt, category=cat, score=score,
+                             entities=tuple(e for e, _t in extract_entities(txt)))
+
+        _hits = [
+            _mk_hit(27, "preference", "老人要买有肉的水煎包", 0.90),
+            _mk_hit(29, "preference", "老人喜欢吃有肉的水煎包", 0.85),
+            _mk_hit(28, "preference", "如果没肉的水煎包，老人要买小笼包", 0.80),
+            _mk_hit(32, "profile", "老人知道胡东家包子好吃", 0.75),
+            _mk_hit(33, "profile", "老人知道清奶奶家包子好吃", 0.70),
+            _mk_hit(7, "medicine", "老人明天早上8点需要服用鼻炎药", 0.65),
+            _mk_hit(9, "medicine", "老人今天早上8点吃了鼻炎药", 0.60),
+            _mk_hit(24, "event", "老人要给老三买衣服", 0.55),
+            _mk_hit(25, "event", "老人前阵子说要给老三买衣服", 0.50),
+        ]
+        _kept = {h.memory_id for h in suppress_near_duplicates(_hits)}
+        check("同一件事的两种说法只留一条（水煎包 29 被 27 吃掉）",
+              29 not in _kept and 27 in _kept, f"kept={sorted(_kept)}")
+        check("带条件的不同信息不许合并（没肉就买小笼包）",
+              28 in _kept, f"kept={sorted(_kept)}")
+        check("实体不同的两条不许合并（胡东家 / 清奶奶家）",
+              32 in _kept and 33 in _kept, f"kept={sorted(_kept)}")
+        check("时间不同即两件事（明天吃 / 今天吃了）",
+              7 in _kept and 9 in _kept, f"kept={sorted(_kept)}")
+        check("event 类的跨轮重复也要合并（老三买衣服）",
+              len({24, 25} & _kept) == 1, f"kept={sorted(_kept)}")
+        # 反向自检：阈值若被调松到 5，「明天吃/今天吃了」就会被误合并 ——
+        # 这条用例存在的意义是让"改阈值"这件事必须连带改标定注释。
+        from app.memory.textutil import near_duplicate_remainder as _rem
+        check("标定边界：真重复的剩余字数必须 ≤ 4",
+              _rem("老人要买有肉的水煎包", "老人喜欢吃有肉的水煎包") <= 4,
+              f"rem={_rem('老人要买有肉的水煎包', '老人喜欢吃有肉的水煎包')}")
+        check("标定边界：必须保留的那对剩余字数必须 > 4",
+              _rem("老人明天早上8点需要服用鼻炎药", "老人今天早上8点吃了鼻炎药") > 4,
+              f"rem={_rem('老人明天早上8点需要服用鼻炎药', '老人今天早上8点吃了鼻炎药')}")
+
         # ============================================================ F
         print("── F. 人格画像 ──")
         code, prof = req("GET", "/api/memory/persona/profile", token=token_a)

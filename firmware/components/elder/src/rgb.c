@@ -5,6 +5,7 @@
 #include "driver/rmt_encoder.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -12,6 +13,27 @@
 #include <string.h>
 
 static const char *TAG = "elder.rgb";
+
+/* ------------------------------------------------- 状态灯开关（2026-11-01）
+ *
+ * 用户原话：「关闭状态灯（严禁关闭事件灯）」。
+ *
+ * 判据直接落在**优先级**上，不另立一张"哪些算事件灯"的名单 ——
+ * 名单会漂移：将来加了新的告警灯效，写名单的人不会记得来改这里。
+ * 优先级里 ELDER_RGB_PRIO_REMINDER(50) 及以上就是事件类
+ * （提醒 50 / 服药未确认 90 / 求助告警 100），以下才是状态类
+ * （待机 0 / 对话 10）。所以"关状态灯"= 抑制 prio < REMINDER 的槽位。
+ *
+ * 另外两路**本来就不走槽位**，天然不受影响：
+ *   · 提醒闪灯（g.nag_active）在 rgb_task 里独立算；
+ *   · #1 按键指示灯（btn_step）是独立状态机。
+ * 这正是"严禁关闭事件灯"要的效果 —— 关了灯，"该吃药了"照样闪。
+ *
+ * 为什么落 NVS：老人晚上说"把灯关了"，半夜设备重启（OTA/断电）后又亮起来，
+ * 他会以为设备不听话。记住这个开关的成本只有一个字节。
+ */
+#define NVS_NS          "elder_rgb"
+#define K_STATUS_LIGHT  "st_on"
 
 /* WS2812 时序（单位 ns @ RMT 10MHz 分辨率） */
 #define WS2812_T0H_NS   350
@@ -210,6 +232,14 @@ static struct {
     elder_rgb_state_t     cur_state;
     bool                  cur_valid;
 
+    /* ---- 状态灯开关（2026-11-01，见文件头的说明）----
+     *
+     * status_light_on 只影响 prio < ELDER_RGB_PRIO_REMINDER 的槽位；
+     * 提醒闪灯 / 服药未确认 / 求助告警 / #1 按键灯一律照常。
+     * 默认 true = 开（老设备的 NVS 里没有这个键，读不到就按"开"处理）。
+     */
+    bool                  status_light_on;
+
     /* #1 按键指示灯状态机 */
     btn_mode_t            btn_mode;
     bool                  btn_pending;    /* 存在待确认提醒（吸引注意态的真源） */
@@ -252,6 +282,12 @@ static const elder_rgb_cfg_item_t k_default_cfg[ELDER_RGB_ST_COUNT] = {
     /* 提醒警示：红色 + 500ms 周期（闪灯节奏用它，见 rgb_task 的 nag 分支） */
     [ELDER_RGB_ST_ALERT]     = { ELDER_FX_SOLID, 0xFF0000u, ELDER_UI_FULL_LEVEL, 500u },
 };
+
+/* 状态灯开关的读回（定义在文件末尾的"状态灯开关"一节）。
+ * 前置声明是必须的：elder_rgb_init() 在定义之前就要用它，C 没有隐式声明。
+ * （2026-11-01 首次加这个功能时漏了它，交叉编译语法检查当场报
+ *  "implicit declaration of function 'load_status_light'"。） */
+static bool load_status_light(void);
 
 /* 取某个状态的**生效**配置：有下发用下发的，没有用内置默认。 */
 static elder_rgb_cfg_item_t cfg_of(elder_rgb_state_t st)
@@ -404,6 +440,18 @@ static bool active_slot(slot_t *out, uint32_t t_ms, int *best_prio)
         if (!s->used) continue;
         if (s->expire_ms && (int32_t)(s->expire_ms - t_ms) <= 0) {
             s->used = false;              /* TTL 自然到期 */
+            continue;
+        }
+        /* 状态灯关掉时，只放过**事件类**（提醒/服药/告警）。
+         *
+         * ⚠️ 过滤放在 TTL 清理**之后**：TTL 到期是槽位的生命周期，
+         * 与"要不要显示"无关。放到前面的话，关灯期间过期的槽位会一直
+         * 留在数组里，等灯一开就集体诈尸。
+         *
+         * 也不能只判"有没有事件槽位"就把状态槽位整个跳过 ——
+         * 那样 g.slots 里的 EMOTION 槽位永远不更新，开灯后显示的是
+         * 上次关灯前的陈旧状态。这里是"这一帧不选它"，不是"不收它"。 */
+        if (!g.status_light_on && s->prio < (int)ELDER_RGB_PRIO_REMINDER) {
             continue;
         }
         if (!best || s->prio > best->prio) best = s;
@@ -803,7 +851,11 @@ esp_err_t elder_rgb_init(void)
 #if !ELDER_RGB_ENABLED
     /* 原型期未接灯珠（CONFIG_ELDER_ENABLE_RGB=n 或 ELDER_RGB_GPIO=-1）。
      * 返回 ESP_OK 而不是错误：少一颗灯不该让整个启动流程报错，
-     * 灯效相关的 request 会因为 g.ready=false 自动变成空操作。 */
+     * 灯效相关的 request 会因为 g.ready=false 自动变成空操作。
+     *
+     * 开关值仍要读回：MCP 工具 self.elder.get_status_light 会把它如实回报，
+     * 不读的话"没灯的设备"会一直答"关着"，与事实不符。 */
+    g.status_light_on = load_status_light();
     ESP_LOGW(TAG, "未启用 WS2812（RGB 关闭或 GPIO=-1），灯效功能关闭");
     return ESP_OK;
 #endif
@@ -850,6 +902,7 @@ esp_err_t elder_rgb_init(void)
     memset(g.slots, 0, sizeof(g.slots));
     g.btn_mode = BTN_OFF;
     g.last_valid = false;
+    g.status_light_on = load_status_light();
     g.ready = true;
 
     xTaskCreatePinnedToCore(rgb_task, "elder_rgb", 3072, NULL, 5, &g.task, 1);
@@ -1065,6 +1118,62 @@ void elder_rgb_apply_config(const elder_rgb_cfg_item_t *items)
     }
     ESP_LOGI(TAG, "灯效表已应用（%s），当前状态 %d 已重放",
              items ? "服务端下发" : "回落内置默认", (int)st);
+}
+
+/* ---- 状态灯开关（2026-11-01，语义见文件头）---- */
+
+/* 落盘。写不进去只影响"重启后是否记得"，不影响本次生效 —— 绝不因此报错。 */
+static void persist_status_light(bool on)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGW(TAG, "状态灯开关落盘失败：NVS 打不开（重启后会回到默认「开」）");
+        return;
+    }
+    nvs_set_u8(h, K_STATUS_LIGHT, on ? 1u : 0u);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+/* 读回开关。**读不到就按「开」** —— 老设备的 NVS 里没有这个键，
+ * 而"默认关灯"会让升级后的设备突然全黑，用户以为坏了。 */
+static bool load_status_light(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return true;
+    uint8_t v = 1;
+    if (nvs_get_u8(h, K_STATUS_LIGHT, &v) != ESP_OK) v = 1;
+    nvs_close(h);
+    return v != 0;
+}
+
+void elder_rgb_set_status_light(bool on)
+{
+    const bool changed = (g.status_light_on != on);
+    g.status_light_on = on;
+
+    /* 未启用灯带时也要记住这个值：MCP 工具会读它并如实回报，
+     * 否则老人问「灯关了吗」会得到一个和他说的话不一致的答案。 */
+    if (!g.ready) {
+        persist_status_light(on);
+        return;
+    }
+
+    persist_status_light(on);
+
+    if (changed && g.cur_valid) {
+        /* 立刻重绘，不等下一次状态切换。
+         * 不重放的话，老人说完「把灯关了」要盯着灯等下一轮对话才灭，
+         * 他会以为没听懂、再说一遍。 */
+        request_state(g.cur_state);
+    }
+    ESP_LOGI(TAG, "状态灯已%s（提醒/服药/告警/按键灯不受影响）",
+             on ? "打开" : "关闭");
+}
+
+bool elder_rgb_status_light_enabled(void)
+{
+    return g.status_light_on;
 }
 
 /* ---- 需求 11：服药状态灯 ---- */

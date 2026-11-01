@@ -29,6 +29,13 @@ syntax_check_elder.py —— 对 elder 的 C++ 适配层做**交叉编译语法�
    BOARD_TYPE)` 会把 `lichuang-dev` 当成减法表达式，报出一堆
    `'lichuang' was not declared in this scope` —— 同样是与真实缺陷无关的噪音。
    elder_bridge.cc 引用它、elder_bind_guide.cc 不引用，正是区分两类错误的探针。
+4. **不能整串 `replace("\\", "/")`**：命令里的反斜杠有两种身份 —— 路径分隔符
+   （`-IC:/Users/...`，必须换成 `/`）**和引号转义**（`-DBOARD_NAME=\"lichuang-dev\"`，
+   换成 `/` 就毁了）。整串替换会把后者变成 `-DBOARD_NAME=/"lichuang-dev/"`，
+   宏展开成 `lichuang / dev`，于是报 `'lichuang' was not declared`、
+   `#include expects "FILENAME"` —— 全是与源码无关的假红。
+   以前的补丁只给 `BOARD_TYPE` 兜了底，`MBEDTLS_CONFIG_FILE` 一直漏网，
+   所以 `mcp_server.cc` 永远红。现在按「反斜杠后跟双引号就保留」精确处理。
 """
 from __future__ import annotations
 
@@ -47,6 +54,12 @@ TARGETS = {
     "elder_bridge.cc": ROOT / "firmware" / "xiaozhi" / "components" / "elder" / "src" / "elder_bridge.cc",
     "elder_bind_guide.cc": ROOT / "firmware" / "components" / "elder" / "src" / "elder_bind_guide.cc",
     "config_report.c": ROOT / "firmware" / "components" / "elder" / "src" / "config_report.c",
+    # 2026-11-01 加：状态灯开关改了 rgb.c（C）与 mcp_server.cc（C++），
+    # 两者都是"改错就整块功能没有"的文件，必须在提交前几秒内验证。
+    # 注意 rgb.c 用**注入副本**路径：compile_commands.json 里记的就是它
+    # （main 编译的是 firmware/xiaozhi/components/elder，不是源目录）。
+    "rgb.c": ROOT / "firmware" / "xiaozhi" / "components" / "elder" / "src" / "rgb.c",
+    "mcp_server.cc": ROOT / "firmware" / "xiaozhi" / "main" / "mcp_server.cc",
 }
 
 #: 需要确保存在的宏（见坑 3）。
@@ -80,6 +93,16 @@ def ensure_def(base: str, name: str, fallback: str) -> str:
     return base + " " + fallback
 
 
+def _norm_paths(cmd: str) -> str:
+    """把**路径分隔符**换成 `/`，但保留引号转义 `\\"`（见文件头坑 4）。
+
+    只放行 `\\` 后跟 `"` 的情况：那是 CMake 给字符串宏值做的转义，
+    在 rsp 响应文件里必须原样保留，否则宏值退化成 `lichuang / dev`。
+    其余反斜杠都是 Windows 路径分隔符，换成 `/` 才不会在 rsp 里被当转义符。
+    """
+    return re.sub(r'\\(?!")', "/", cmd)
+
+
 #: 编译命令模板来源：按**精确文件名**匹配，不能用后缀。
 #:
 #: ⚠️ 踩过的坑：用 `endswith(".cc")` 会匹配到上游 main 组件的 .cc
@@ -90,21 +113,34 @@ def ensure_def(base: str, name: str, fallback: str) -> str:
 TEMPLATE_FILE = {".cc": "elder_bridge.cc", ".c": "rgb.c"}
 
 
-def base_command(suffix: str = ".cc") -> str:
-    """取一份真实编译命令当模板。
+def base_command(name: str, suffix: str) -> str:
+    """取一份真实编译命令。
 
-    ⚠️ C 与 C++ 必须**各用自己的模板**，不能共用一份：
-    ESP-IDF 对 `.c` 走 C 编译模式，对 `.cc` 走 C++ 且默认带 `-std=gnu++23`。
-    拿 C++ 命令去编 `.c` 文件，真实缺陷与语言差异混在一起报，根本分不清是
-    代码写错还是检查工具用错命令 —— 这种噪音会让人忽略真正的报错。
+    **优先用该文件自己那条**，找不到才回退到同后缀的模板。
+
+    为什么优先自己的（2026-11-01 加）：每个组件的 ``-I`` 集合不同 ——
+    ``mcp_server.cc`` 属于 main 组件，它需要 mbedtls 的
+    ``MBEDTLS_CONFIG_FILE`` 与 main 的头文件；而 ``elder_bridge.cc`` 属于
+    elder 组件，两者不通用。拿 elder 的命令去检查 mcp_server.cc，报出来的是
+    ``mbedtls/build_info.h: #include expects "FILENAME"`` 和
+    ``'lichuang' was not declared`` —— **与源码毫无关系的假红**。
+    假红比不检查更坏：它教人忽略红灯。
+
+    回退仍然保留：``compile_commands.json`` 是 ``idf.py build`` 的产物，
+    新加的文件在 build 之前不可能出现在里面。
     """
-    want = TEMPLATE_FILE[suffix]
     data = json.loads(CCJSON.read_text(encoding="utf-8"))
     for e in data:
         f = e["file"].replace("\\", "/")
+        if f.endswith("/" + name):
+            return _norm_paths(e.get("command") or " ".join(e["arguments"]))
+    want = TEMPLATE_FILE[suffix]
+    for e in data:
+        f = e["file"].replace("\\", "/")
         if f.endswith("/" + want):
-            return (e.get("command") or " ".join(e["arguments"])).replace("\\", "/")
-    raise SystemExit(f"[fatal] compile_commands.json 里找不到 {want}，先跑一次 idf.py build")
+            return _norm_paths(e.get("command") or " ".join(e["arguments"]))
+    raise SystemExit(f"[fatal] compile_commands.json 里找不到 {name} 或 {want}，"
+                     f"先跑一次 idf.py build")
 
 
 def check(name: str, src: Path, base: str) -> bool:
@@ -152,11 +188,9 @@ def main() -> int:
     results = []
     for suffix in (".cc", ".c"):
         targets = [(n, s) for n, s in TARGETS.items() if s.is_file() and n.endswith(suffix)]
-        if not targets:
-            continue
-        base = base_command(suffix)
         for n, s in targets:
-            results.append((n, check(n, s, base)))
+            # 每个文件各取各的编译命令（见 base_command 的说明）
+            results.append((n, check(n, s, base_command(n, suffix))))
     failed = [n for n, ok in results if not ok]
     print("\n" + "=" * 64)
     print(f"共 {len(results)} 个文件：通过 {len(results) - len(failed)}，失败 {len(failed)}")

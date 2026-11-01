@@ -304,6 +304,73 @@ TOOL_DEFS: list[dict[str, Any]] = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_wifi_info",
+            # 追加在末尾（同上）：前面工具的 JSON 顺序不变，prompt 前缀缓存不被打掉。
+            "description": (
+                "查询设备现在连的是哪个 WiFi。\n"
+                "老人问「连的哪个网」「WiFi 是哪个」「网络好不好」时调用，"
+                "**不要凭印象编**。\n"
+                "返回 wifi_name（WiFi 名字）和 signal（信号强弱，已经是"
+                "「很好/一般/较弱」这种口语词）。\n"
+                "用一句话回答，**不要念信号数字、不要提 rssi、不要说英文**。\n"
+                "如果设备用的是网线或没连 WiFi，如实说「这台没连 WiFi」。"
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_headlines",
+            "description": (
+                "播报今天的新闻头条。老人问「今天有什么新闻」「说说明天的大事」"
+                "「念念头条」时调用。\n"
+                "返回一个标题列表（已经清洗过、可直接念）。\n"
+                "**只念标题，不要补充背景、不要评论、不要发表看法** —— "
+                "你只是把新闻念给他听。\n"
+                "一次最多念三条，每条之间停顿一下；老人说「还有吗」再念剩下的。\n"
+                "如果返回 ok=false，就说「今天没取到新闻，回头再试试」，"
+                "不要编造任何新闻内容。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "count": {
+                        "type": "integer",
+                        "description": "念几条，默认 3，最多 5。老人说「多念几条」时才加大。",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_status_light",
+            "description": (
+                "开关设备上的**状态灯**（待机呼吸、聆听、说话、表情这几种）。\n"
+                "老人说「把灯关了」「太亮了」「晚上别亮灯」时传 on=false；"
+                "说「把灯打开」「开灯」时传 on=true。\n"
+                "⚠️ 只影响状态灯。**提醒闪灯、服药未确认、求助告警、按键指示灯"
+                "永远不受影响** —— 这一点必须如实告诉老人："
+                "「灯关了，但有提醒还是会亮」，不要笼统说「灯全关了」。\n"
+                "老人问「灯是不是关着」时传 on=null（或不传）只查状态，不要改。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "on": {
+                        "type": "boolean",
+                        "description": "true=打开状态灯，false=关闭状态灯；"
+                                       "不传则只查询当前状态，不改变。",
+                    },
+                },
+            },
+        },
+    },
 ]
 
 #: 工具执行出错时喂回 LLM 的 JSON 里，need_clarify=True 表示"必须让老人澄清"。
@@ -879,6 +946,12 @@ def execute_tool(db: Any, device_pk: int, name: str,
             return _set_device_level("brightness", args, device_call)
         if name == "get_device_status":
             return _get_device_status(device_call)
+        if name == "get_wifi_info":
+            return _get_wifi_info(device_call)
+        if name == "get_headlines":
+            return _get_headlines(args)
+        if name == "set_status_light":
+            return _set_status_light(args, device_call)
         return {"ok": False, "message": f"没有叫「{name}」的工具"}
     except Exception as exc:  # noqa: BLE001  兜底：工具失败不崩会话
         log.warning("工具 %s 执行失败：%s: %s", name, type(exc).__name__, exc)
@@ -1173,6 +1246,164 @@ def _get_device_status(device_call: Any) -> dict[str, Any]:
             "message": "用一句话把上面的数字翻译成老人听得懂的话"
                        "（如「电量还有八成，正插着电」），"
                        "不要念字段名，不要说英文"}
+
+
+def _get_wifi_info(device_call: Any) -> dict[str, Any]:
+    """查设备连的是哪个 WiFi。
+
+    数据源是 ``self.get_device_status`` 的 ``network`` 段（``WifiBoard::
+    GetDeviceStatusJson()`` 已经带了 ssid / rssi），**不新增固件工具** ——
+    设备侧能拿到的信息就这些，再开一个 MCP 工具只是把同一份数据换个入口，
+    却要全量刷机才能用。
+
+    ⚠️ rssi 在这里就地翻译成口语，**绝不把数字交给模型**：
+    ``_get_device_status`` 的注释已经踩过这个坑（"模型很可能把 rssi -60
+    直接念出来"）。老人听到「信号负六十分贝」只会以为设备坏了。
+    """
+    if device_call is None:
+        return {"ok": False, "message": "现在连不上设备，查不到网络"}
+
+    status = _device_status(device_call)
+    if status is None:
+        return {"ok": False, "message": "设备没有回应，查不到网络"}
+
+    net = _dig(status, ("network",))
+    if not isinstance(net, dict):
+        return {"ok": False, "message": "设备没上报网络信息"}
+
+    kind = str(net.get("type") or "").strip().lower()
+    ssid = str(net.get("ssid") or "").strip()
+
+    if kind and kind != "wifi":
+        # 4G / 有线：如实说，不要硬套"WiFi 名字"
+        return {"ok": True, "kind": kind,
+                "message": f"这台设备不是用 WiFi 联网的（{kind}），如实告诉老人即可"}
+    if not ssid:
+        return {"ok": True, "kind": "wifi", "wifi_name": "",
+                "message": "设备连着 WiFi 但没报出名字（可能是隐藏网络）。"
+                           "如实说「连着一个没名字的网」即可，不要猜名字"}
+
+    out: dict[str, Any] = {"ok": True, "kind": "wifi", "wifi_name": ssid}
+    rssi = _coerce_int(net.get("rssi"))
+    if rssi is not None:
+        # 门限按 ESP32 的实际观感：>-60 很好，-60~-75 一般，<-75 较弱。
+        # 只给三个词，不给数字 —— 见上面的说明。
+        out["signal"] = ("很好" if rssi > -60
+                         else "一般" if rssi > -75 else "较弱")
+    return {**out,
+            "message": "用一句话回答老人（如「连着家里的 WiFi，信号挺好的」），"
+                       "不要念信号数字、不要说英文、不要说 rssi"}
+
+
+def _get_headlines(args: dict[str, Any]) -> dict[str, Any]:
+    """播报今日头条。
+
+    真正的抓取在 ``app/news/``（可选子系统，未配置时优雅降级）。
+    ``import`` 放函数内，理由同 ``_get_weather``：新闻模块要拉 urllib/XML，
+    让它拖垮整个 tools 模块的 import 不值得 —— 那会连带提醒、确认服药一起瘫痪。
+    """
+    try:
+        from ..news import get_headlines, speak_lines
+    except Exception as exc:  # noqa: BLE001  可选子系统：导入失败就当没这功能
+        log.warning("新闻模块不可用：%s: %s", type(exc).__name__, exc)
+        return {"ok": False, "message": "今天没取到新闻，回头再试试"}
+
+    count = _coerce_int(args.get("count"))
+    count = 3 if count is None else max(1, min(5, count))
+
+    items, reason = get_headlines(limit=count)
+    lines = speak_lines(items)
+    if not lines:
+        return {"ok": False, "message": "今天没取到新闻，回头再试试"}
+    return {"ok": True, "headlines": lines,
+            "message": "把这些标题念给老人听：只念标题，不要补充背景、"
+                       "不要评论、不要发表看法。每条之间停一下。"
+                       "念完问他还要不要听别的"}
+
+
+def _set_status_light(args: dict[str, Any], device_call: Any) -> dict[str, Any]:
+    """开关设备的状态灯。
+
+    ⚠️ 只关**状态灯**（待机/聆听/说话/表情）。提醒闪灯、服药未确认、
+    求助告警、按键指示灯由固件按**优先级**放行，服务端无法关掉它们 ——
+    这是刻意的：家属说「晚上别亮灯」时，最不该被一起关掉的恰恰是
+    「该吃药了」那盏灯。固件侧判据见 ``rgb.c`` 的 ``ELDER_RGB_PRIO_REMINDER``。
+
+    ``on`` 不传 = 只查状态。用 ``in args`` 判而不是 ``args.get(...) is None``：
+    模型可能显式传 ``null``，那与"没传"同义，两种都当查询。
+    """
+    want: bool | None = None
+    if "on" in args and args.get("on") is not None:
+        raw = args.get("on")
+        if isinstance(raw, bool):
+            want = raw
+        else:
+            text = str(raw).strip().lower()
+            if text in ("true", "1", "on", "yes", "开"):
+                want = True
+            elif text in ("false", "0", "off", "no", "关"):
+                want = False
+
+    if device_call is None:
+        return {"ok": False, "message": "现在连不上设备，灯没法调"}
+
+    # 查状态与改状态走**两个**固件工具。为什么不合成一个带可选参数的：
+    # MCP 的"可选"是用默认值表达的，"不传"和"传 false"就分不开了 ——
+    # 老人问「灯关了吗」被当成"关闭"，是最坏的一种误操作。
+    if want is None:
+        try:
+            payload = device_call("self.elder.get_status_light", {},
+                                  _DEVICE_OP_TIMEOUT)
+        except TimeoutError:
+            return {"ok": False, "message": "设备没有响应，查不到灯的状态"}
+        except Exception as exc:  # noqa: BLE001
+            log.warning("get_status_light 下发失败：%s: %s", type(exc).__name__, exc)
+            return {"ok": False, "message": "现在连不上设备，查不到灯的状态"}
+        ok, text = _device_reply_text(payload)
+        current = _light_state_of(text) if ok else None
+        if current is None:
+            return {"ok": False, "message": "设备没报出灯的状态"}
+        return {"ok": True, "on": current,
+                "message": ("现在状态灯是**开着**的" if current
+                            else "现在状态灯是**关着**的")
+                           + "。用一句话告诉老人即可（提醒灯一直不受影响，不用特意说）"}
+
+    try:
+        payload = device_call("self.elder.set_status_light", {"on": want},
+                              _DEVICE_OP_TIMEOUT)
+    except TimeoutError:
+        return {"ok": False, "message": "设备没有响应，灯没调成"}
+    except Exception as exc:  # noqa: BLE001  设备离线/WS 已断
+        log.warning("set_status_light 下发失败：%s: %s", type(exc).__name__, exc)
+        return {"ok": False, "message": "现在连不上设备，灯没法调"}
+
+    ok, text = _device_reply_text(payload)
+    if not ok:
+        return {"ok": False, "message": "设备说没办成，灯没调成"}
+
+    current = _light_state_of(text)
+    if current is None:
+        current = want      # 固件没回状态就回显意图，别让这轮变成"没办成"
+
+    if current:
+        return {"ok": True, "on": True,
+                "message": "状态灯已经打开。用一句话回应老人"}
+    return {"ok": True, "on": False,
+            "message": "状态灯已经关了。**必须补一句**「提醒、吃药的灯还是照常亮」，"
+                       "不要说成「灯全关了」—— 老人会以为该吃药时也不亮"}
+
+
+def _light_state_of(text: str) -> bool | None:
+    """从固件回包 ``{"on":true}`` 里取灯状态；取不到返回 None。"""
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except Exception:  # noqa: BLE001  固件版本差异：解析不了当没回
+        return None
+    if isinstance(data, dict) and isinstance(data.get("on"), bool):
+        return data["on"]
+    return None
 
 
 def _create_reminder(db: Any, device_pk: int, args: dict[str, Any]) -> dict[str, Any]:

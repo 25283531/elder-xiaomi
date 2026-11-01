@@ -69,6 +69,42 @@ def fingerprint(text: str) -> str:
     return normalize(text).replace(" ", "")
 
 
+def _lcs_len(a: str, b: str) -> int:
+    """最长公共子序列长度（按字符）。短句用，O(len(a)*len(b))。"""
+    if not a or not b:
+        return 0
+    prev = [0] * (len(b) + 1)
+    for ca in a:
+        cur = [0] * (len(b) + 1)
+        for j, cb in enumerate(b, 1):
+            cur[j] = prev[j - 1] + 1 if ca == cb else max(prev[j], cur[j - 1])
+        prev = cur
+    return prev[len(b)]
+
+
+def near_duplicate_remainder(a: str, b: str) -> int:
+    """两条短句去掉**最长公共子序列**之后，较长那一侧还剩几个字。
+
+    用途只有一个：判断两条记忆是不是「同一件事的两种说法」
+    （``老人要买有肉的水煎包`` / ``老人喜欢吃有肉的水煎包``）。
+
+    为什么用「剩余字数」而不是相似度比例（Jaccard / 余弦）：
+    比例对短句没有分辨力。实测同一批生产记忆，Jaccard 把
+    「要买有肉的水煎包 / 喜欢吃有肉的水煎包」（真重复，0.46）和
+    「胡东家包子好吃 / 清奶奶家包子好吃」（两家不同的店，0.50）判得**一样高**，
+    而后者误合并就是直接丢信息。剩余字数是个**绝对量**：
+    真重复的那几句差异都在 1~4 字（谓词/时间副词），
+    而"不同的事"至少差 5 字以上。分界清晰得多（标定值见
+    ``service._NEAR_DUP_MAX_REMAINDER``）。
+    """
+    na = normalize(a or "").replace(" ", "")
+    nb = normalize(b or "").replace(" ", "")
+    if not na or not nb:
+        return 10 ** 6          # 有一边是空的：不判为重复（宁可漏）
+    common = _lcs_len(na, nb)
+    return max(len(na) - common, len(nb) - common)
+
+
 # ---------------------------------------------------------------- 实体抽取
 # 停用字：用来把句子切成「干净片段」。药名/地点抽取只在干净片段里做，
 # 否则"每天早上吃一片"会被当成药名（以"片"结尾且不含虚词的话就危险了）。
