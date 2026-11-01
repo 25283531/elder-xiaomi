@@ -3161,23 +3161,25 @@ def t_asr_silence_gap() -> None:
         b = min(len(pcm) - 1, last + pad)
         return pcm[a:b + 1]
 
-    def _nf(out: bytes) -> int:
-        """返回的 bytes 里有几帧（一帧 = n_per 个 16bit 采样）。"""
-        return len(out) // (n_per * 2)
+    def _frames_ok(out) -> bool:
+        """返回值必须是**帧列表**（与入参 list[bytes] 同型）。
 
-    def _b(x) -> bytes:
-        """把"帧列表"或"已拼接的 bytes"统一成 bytes 再比 —— 否则
-        list == bytes 恒为 False，断言会假红/假绿。"""
-        return x if isinstance(x, bytes) else b"".join(x)
+        _run_turn 第一行是 ``pcm_all = b"".join(pcm)``：拿到 bytes 会按 int
+        迭代 ⇒ TypeError ⇒ _finalize 兜底成「刚才没处理好」，ASR 一次都没发。
+        ed3a854 就是这样：拼接分支返回 bytes，恰好 100% 命中它要修的那个
+        场景。所以每个用例都单独验类型，不靠"内容相等"顺手带过。
+        """
+        return isinstance(out, list) and all(isinstance(f, bytes) for f in out)
 
     # ---- ① 正常形态：头尾静音 + 单段连续语音 ⇒ 与老行为逐字节一致 ----
     pcm1 = ([_mk(0)] * 10 + [_mk(1)] * 20 + [_mk(0)] * 15)
     idx1 = list(range(10, 30))
     out1 = _sess(10, 29, idx1)._trim_silence_edges(list(pcm1))
-    want1 = _b(_continuous(pcm1, 10, 29))
-    check("12n ① 单段连续语音：结果与「只裁头尾」的连续窗口逐字节一致（零回归）",
-          _b(out1) == want1 and _nf(_b(out1)) == 24,
-          f"out={_nf(_b(out1))}帧 want={len(want1)}B 相同={_b(out1) == want1}")
+    want1 = _continuous(pcm1, 10, 29)
+    check("12n ① 单段连续语音：结果与「只裁头尾」的连续窗口逐帧一致（零回归）",
+          _frames_ok(out1) and out1 == want1 and len(out1) == 24,
+          f"类型={type(out1).__name__} out={len(out1)}帧 want={len(want1)}帧 "
+          f"相同={out1 == want1}")
 
     # ---- ② 两段语音中间夹 20 秒静音 ⇒ 拼接，两段语音帧全在 ----
     #    20s = 334 帧（60ms/帧），远超 2000ms 闸门。
@@ -3188,10 +3190,12 @@ def t_asr_silence_gap() -> None:
     idx2 = list(range(5, 15)) + list(range(15 + gap, 25 + gap))
     out2 = _sess(first2, last2, idx2)._trim_silence_edges(list(pcm2))
     cont2 = _continuous(pcm2, first2, last2)
-    want2 = b"".join(pcm2[5 - 2:15 + 2] + pcm2[15 + gap - 2:25 + gap + 2])
+    want2 = pcm2[5 - 2:15 + 2] + pcm2[15 + gap - 2:25 + gap + 2]
     check("12n ② 夹 20s 静音：被拼接，长度远小于连续窗口，两段语音帧逐帧都在",
-          out2 == want2 and _nf(out2) == 28 and _nf(out2) * 3 < len(cont2),
-          f"out={_nf(out2)}帧 cont={len(cont2)}帧 一致={out2 == want2}")
+          _frames_ok(out2) and out2 == want2 and len(out2) == 28
+          and len(out2) * 3 < len(cont2),
+          f"类型={type(out2).__name__} out={len(out2)}帧 cont={len(cont2)}帧 "
+          f"逐帧相同={out2 == want2}")
 
     # ---- ③a 中间只夹 400ms（7 帧）静音 ⇒ 间隔 ≤ 480ms 算同一段，不切 ----
     #    句中换气/轻声音节就是这个量级，切了 ASR 直接丢字。
@@ -3202,7 +3206,8 @@ def t_asr_silence_gap() -> None:
     out3 = _sess(first3, last3, idx3)._trim_silence_edges(list(pcm3))
     cont3 = _continuous(pcm3, first3, last3)
     check("12n ③a 句中只夹 400ms 静音：间隔 ≤ 480ms 算同一段，仍走连续窗口",
-          _b(out3) == _b(cont3), f"out={_nf(_b(out3))}帧 cont={len(cont3)}帧")
+          _frames_ok(out3) and out3 == cont3,
+          f"类型={type(out3).__name__} out={len(out3)}帧 cont={len(cont3)}帧")
 
     # ---- ③b 中间夹 1200ms（20 帧）静音 ⇒ 间隔够大能断开，但省下的
     #      (20-2*2)=16 帧 = 960ms 没到 2000ms 闸门 ⇒ 仍走连续窗口。
@@ -3214,7 +3219,8 @@ def t_asr_silence_gap() -> None:
     out3b = _sess(first3b, last3b, idx3b)._trim_silence_edges(list(pcm3b))
     cont3b = _continuous(pcm3b, first3b, last3b)
     check("12n ③b 句中夹 1200ms 静音：省 960ms 未到 2000ms 闸门，仍走连续窗口",
-          _b(out3b) == _b(cont3b), f"out={_nf(_b(out3b))}帧 cont={len(cont3b)}帧")
+          _frames_ok(out3b) and out3b == cont3b,
+          f"类型={type(out3b).__name__} out={len(out3b)}帧 cont={len(cont3b)}帧")
 
     # ---- ④ 三段语音、各夹 10s 静音 ⇒ 拼成 3 段，总长 ≈ 三段 + 各自 pad ----
     gap4 = 167                       # 10s
@@ -3229,27 +3235,43 @@ def t_asr_silence_gap() -> None:
             pos += gap4
     pcm4 += [_mk(0)] * 5
     first4, last4 = 5, pos - 1
+    cont4 = _continuous(pcm4, first4, last4)
     out4 = _sess(first4, last4, idx4)._trim_silence_edges(list(pcm4))
     check("12n ④ 三段语音各夹 10s 静音：拼成 3 段，总长 = 三段 + 各自 pad",
-          _nf(out4) == 3 * (10 + 2 * S._TRIM_PAD_FRAMES)
-          and _nf(out4) < len(_continuous(pcm4, first4, last4)) // 5,
-          f"out={_nf(out4)}帧 cont={len(_continuous(pcm4, first4, last4))}帧")
+          _frames_ok(out4)
+          and len(out4) == 3 * (10 + 2 * S._TRIM_PAD_FRAMES)
+          and len(out4) < len(cont4) // 5,
+          f"类型={type(out4).__name__} out={len(out4)}帧 cont={len(cont4)}帧")
 
     # ---- ⑤ 只有一个语音帧 ⇒ 不拼接，走连续窗口 ----
     pcm5 = [_mk(0)] * 10 + [_mk(1)] * 1 + [_mk(0)] * 10
+    want5 = _continuous(pcm5, 10, 10)
     out5 = _sess(10, 10, [10])._trim_silence_edges(list(pcm5))
     check("12n ⑤ 只有一个语音帧：不拼接，走连续窗口（别把碎片喂 ASR）",
-          _b(out5) == _b(_continuous(pcm5, 10, 10)),
-          f"out={_nf(_b(out5))}帧 cont={len(_continuous(pcm5, 10, 10))}帧")
+          _frames_ok(out5) and out5 == want5,
+          f"类型={type(out5).__name__} out={len(out5)}帧 want={len(want5)}帧")
 
     # ---- ⑥ 一轮里没记录到语音帧 ⇒ 原样返回入参 ----
     pcm6 = [_mk(0)] * 20
     out6 = _sess(-1, -1, [])._trim_silence_edges(list(pcm6))
     check("12n ⑥ 无语音帧：原样返回入参（不改「识别为空」的既有语义）",
-          out6 == pcm6 and len(out6) == 20, f"out={len(out6)}")
+          _frames_ok(out6) and out6 == pcm6 and len(out6) == 20,
+          f"类型={type(out6).__name__} out={len(out6)}帧")
 
-    # ---- ⑦ 变异：保守闸打到 0（拼接无条件生效）⇒ ③b 必须变红 ----
-    #    ① 单段连续语音无论闸门多少都是同一份字节（拼接结果 == 连续窗口），
+    # ---- ⑦ 类型闸：上面每个用例都已单独验过，这里再汇总一次 ----
+    #    单独留一条：它不依赖任何内容断言，只看"返回的是不是帧列表"，
+    #    所以拼接分支一旦回退成 bytes（ed3a854 的 bug），这条必然红。
+    check("12n ⑦ 全部用例的返回值都是 list[bytes]（与入参同型，"
+          "否则 _run_turn 拼整段音频时直接 TypeError）",
+          all(_frames_ok(o) for o in (out1, out2, out3, out3b, out4, out5, out6))
+          # 直接照 _run_turn 第一行的用法拼一次：拼接分支返回 bytes 时
+          # b"".join(bytes) 会按 int 迭代 ⇒ TypeError，这里当场炸。
+          and b"".join(out2) == b"".join(want2),
+          " / ".join(type(o).__name__ for o in
+                     (out1, out2, out3, out3b, out4, out5, out6)))
+
+    # ---- ⑧ 变异：保守闸打到 0（拼接无条件生效）⇒ ③b 必须变红 ----
+    #    ① 单段连续语音无论闸门多少都是同一份帧（拼接结果 == 连续窗口），
     #    所以"闸门真的在挡"只能由 ③b 这种"能断但省不够"的形态来证明。
     real_gate = S._TRIM_GAP_MIN_SAVE_MS
     S._TRIM_GAP_MIN_SAVE_MS = 0
@@ -3258,9 +3280,9 @@ def t_asr_silence_gap() -> None:
     finally:
         S._TRIM_GAP_MIN_SAVE_MS = real_gate
     check("12n ★ 保守闸是真实防线（闸门=0 时 ③b 被拼接变短，说明断言抓得到）",
-          m3b != _b(cont3b) and _nf(m3b) < len(cont3b),
-          f"变异 out={_nf(m3b)}帧 cont={len(cont3b)}帧")
-
+          _frames_ok(m3b) and m3b != cont3b and len(m3b) < len(cont3b),
+          f"变异 类型={type(m3b).__name__} out={len(m3b)}帧 "
+          f"cont={len(cont3b)}帧")
 
 
 def t_false_success_gate() -> None:

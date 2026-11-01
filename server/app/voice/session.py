@@ -1948,9 +1948,11 @@ class VoiceSession:
                 merged[-1][1] = max(merged[-1][1], b)
             else:
                 merged.append([a, b])
-        spliced = b"".join(b"".join(pcm[a:b + 1]) for a, b in merged)
-        # 口径统一按**帧**算（spliced 是 bytes，len() 是字节数，别拿它当帧数）。
-        spliced_frames = sum(b - a + 1 for a, b in merged)
+        # 返回的必须是**帧列表**（与入参同型）：调用方 _run_turn 用
+        # b"".join(pcm) 拼整段音频，给它 bytes 会按 int 迭代 ⇒ TypeError，
+        # 整轮被兜底成「刚才没处理好」，ASR 一次都没发。
+        spliced = [f for a, b in merged for f in pcm[a:b + 1]]
+        spliced_frames = len(spliced)
         saved_gap_frames = len(window) - spliced_frames
         # 硬闸：没省下足够长的静音 / 拼完只剩碎片 ⇒ 原样发连续窗口。
         # 正常一轮在这里必然回退，送 ASR 的音频与改动前逐字节一致。
