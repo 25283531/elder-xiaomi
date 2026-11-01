@@ -21,9 +21,15 @@
  * 区域**（中央的表情图正是这种）；整屏平移一两个像素在 LVGL 里要动
  * 所有对象、每帧重排，代价远大于收益，而且用户看不懂"界面在抖"。
  *
- * 判据用「距上次 UI 变化多久」而不是「当前设备状态」：设备状态要问
- * Application，显示层不该反向依赖它；而"界面 60 秒没变过"本身就是
- * 烧屏风险的定义。
+ * 两条判据，缺一不可：
+ *   ① 「距上次 UI 变化多久」—— "界面 60 秒没变过"是烧屏风险的定义本身；
+ *   ② 「设备是否处于待机态」—— 屏保播的是**待机指示灯**（动态熊猫），
+ *      非待机态播它等于对老人撒谎（见 AntiBurnInStep 里的 2026-11-01 事故注释）。
+ *
+ * 早期只写了 ①，理由是「设备状态要问 Application，显示层不该反向依赖它」。
+ * 那个理由站不住：判据不取 Application 的私有状态，走的是 device_state_event
+ * 的广播（Application 主动 PostStateChangeEvent），方向仍是 Application → 显示层，
+ * 没有反向依赖。代价是只靠 ① 时，老人沉默停在聆听态 60 秒就会把待机熊猫播上去。
  */
 #define ANTI_BURN_CHECK_MS  20000   /* 每 20s 检查一次 */
 #define ANTI_BURN_IDLE_MS   60000   /* 界面 60s 无变化才轮换 */
@@ -62,6 +68,20 @@ protected:
     void AntiBurnInStep();
     lv_timer_t* anti_burn_timer_ = nullptr;
     uint32_t last_ui_change_tick_ = 0;      /* lv_tick 毫秒 */
+    /* 设备当前是否处于待机态（kDeviceStateIdle）。防烧屏屏保的唯一开关。
+     *
+     * 谁写：StartAntiBurnInTimer() 里注册的 DeviceStateEventManager 回调，
+     *       由 Application::SetDeviceState() → PostStateChangeEvent() 触发。
+     * 谁读：AntiBurnInStep()，跑在 LVGL 定时器任务里。
+     * volatile：写的一方是默认事件循环任务（sys_evt），读的一方是 LVGL
+     *       定时器任务，跨任务且无锁 —— 编译器不得把这次读取跨调用缓存/
+     *       合并（lv_timer 在它自己的循环里反复调用 AntiBurnInStep，
+     *       一旦读被提到循环外，写侧置位就永远看不到）。只存一个 bool，
+     *       单字节读写天然原子，不需要 atomic / 互斥量。
+     * 初始 false：开机流程里 display 先于状态机就位，没收到事件前一律
+     *       按"非待机"处理 —— 宁可少播一次熊猫，也不许在开机自检/配网
+     *       界面乱播待机指示灯。 */
+    volatile bool device_idle_ = false;
     std::string anti_burn_last_emoji_;      /* 兜底轮播用：避免连选同一张 */
 
 protected:

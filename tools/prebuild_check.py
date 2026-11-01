@@ -1013,6 +1013,82 @@ def main() -> int:
               "sync 层用 due_of_item() 按计划时刻兜底，无 time(NULL)",
               fatal=True)
 
+    # ------------------------------------------------ C16 屏保必须只在待机态
+    # 2026-11-01 真机：老人沉默停在聆听态，屏幕换成了待机动态熊猫，字幕还是
+    # 「聆听中」、灯还是蓝色 —— 三处互相打架。根因是 AntiBurnInStep() 只看
+    # 「界面静止了多久」，不看设备在干什么，把**待机指示灯**播到了工作态上。
+    #
+    # 这条判据是"编译全绿、串口无异常、只有老人盯着屏幕才会发现"的形态：
+    # 没有断言、没有崩溃、没有日志异常，唯一证据是屏幕和字幕不一致。所以
+    # 必须在编译前按代码位拦住。
+    #
+    # 判据按**代码位**判，不整文件子串匹配：device_idle_ 这个标识符在
+    # 头文件注释、StartAntiBurnInTimer 的注册回调里都出现，全文件匹配
+    # 等于"提过这个名字就算过"，防不住"判据被删掉"。
+    _c16_cc = ROOT / "firmware" / "xiaozhi" / "main" / "display" / "lcd_display.cc"
+    if not _c16_cc.is_file():
+        check("C16 防烧屏屏保只在待机态跑", False,
+              "lcd_display.cc 不存在 —— 本项无判据可查（文件被上游同步冲掉？）",
+              fatal=True)
+    else:
+        _c16_code = _strip_comments(
+            _c16_cc.read_text(encoding="utf-8", errors="replace"))
+        _c16_bad: list[str] = []
+
+        # 用 "LcdDisplay::AntiBurnInStep" 而不是裸函数名：裸名第一次出现的
+        # 位置是 StartAntiBurnInTimer 里的那句 `->AntiBurnInStep();` 调用，
+        # _func_body 会从那里往后找第一个 `{` —— 现在恰好落在定义上，属于
+        # 侥幸。带类名限定符才能稳定锚到定义本身。
+        _c16_body = _func_body(_c16_code, "LcdDisplay::AntiBurnInStep")
+        if _c16_body is None:
+            _c16_bad.append("取不到 LcdDisplay::AntiBurnInStep() 的函数体")
+        else:
+            _m_guard = re.search(r"if\s*\(\s*!\s*device_idle_\s*\)", _c16_body)
+            _m_play = re.search(r"\bPlayDefault\s*\(", _c16_body)
+            if _m_guard is None:
+                _c16_bad.append(
+                    "AntiBurnInStep() 里没有 `if (!device_idle_) return;` 判据"
+                    "—— 非待机态也会把待机熊猫播上去")
+            elif _m_play is not None and _m_guard.start() > _m_play.start():
+                _c16_bad.append(
+                    "device_idle_ 判据写在 PlayDefault() 之后 —— 图已经换掉了，"
+                    "判据形同虚设")
+            # 静态兜底轮播（SetEmotion 换随机表情）同样会让人以为状态变了，
+            # 所以判据必须在函数**最前面**：以 lv_tick_elaps 判据为锚，
+            # 要求 device_idle_ 出现在它之前。
+            _m_tick = re.search(r"lv_tick_elaps\s*\(\s*last_ui_change_tick_\s*\)",
+                                _c16_body)
+            if _m_guard is not None and _m_tick is not None \
+                    and _m_guard.start() > _m_tick.start():
+                _c16_bad.append(
+                    "device_idle_ 判据写在 60 秒静止判据之后 —— 要求放在函数"
+                    "最前面，才能同时挡住静态兜底轮播")
+
+        # 反向失效：判据永远为 false 时熊猫再也播不出来（老人失去"要不要
+        # 喊唤醒词"的唯一依据）。所以要确认注册回调里真的给它赋了值。
+        _c16_start = _func_body(_c16_code, "LcdDisplay::StartAntiBurnInTimer")
+        if _c16_start is None:
+            _c16_bad.append("取不到 LcdDisplay::StartAntiBurnInTimer() 的函数体")
+        else:
+            if "RegisterStateChangeCallback" not in _c16_start:
+                _c16_bad.append(
+                    "StartAntiBurnInTimer() 没注册状态回调 —— device_idle_ "
+                    "永远是初始 false，待机熊猫再也不会出现")
+            elif not re.search(r"device_idle_\s*=\s*\(\s*cur\s*==", _c16_start):
+                _c16_bad.append(
+                    "状态回调里没有 `device_idle_ = (cur == kDeviceStateIdle)` "
+                    "—— 标志位没人写，判据恒 false")
+
+        check("C16 防烧屏屏保只在待机态跑（非待机态不许播待机熊猫）",
+              not _c16_bad,
+              ("⚠️ " + "；".join(_c16_bad[:5]) +
+               "。待机熊猫是「硬件是否在监听声音」的唯一指示灯，播到聆听/"
+               "播报态上等于告诉老人可以喊唤醒词 —— 实际喊了会打断当前这轮，"
+               "越急越乱。") if _c16_bad else
+              "AntiBurnInStep() 首行判 device_idle_，非待机态直接返回；"
+              "标志由 StartAntiBurnInTimer() 注册的状态回调写入",
+              fatal=True)
+
     # ------------------------------------------------------ 汇总
     failed = [r for r in results if not r[1] and r[3]]
     warned = [r for r in results if not r[1] and not r[3]]
