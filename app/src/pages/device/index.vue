@@ -539,6 +539,12 @@ onShow(() => { refresh() })
           <view class="tip left">
             每台设备可以绑定不同的角色。角色决定说话方式与音色，形象决定屏幕上的外观
           </view>
+          <!-- 同步时延告知（2026-11-01 用户要求）。
+               绑定写的是 devices.agent_id / avatar_id，设备要等心跳才拿到；
+               而人格与音色是服务端每次会话现读的，下次对话就生效。 -->
+          <view class="tip left">
+            切换后设备最长约 5 分钟自动获取生效；人格与音色在下次对话（唤醒设备）时立即生效。
+          </view>
 
           <view v-if="presetRoles.length" class="group-label">平台推荐</view>
           <view v-for="r in presetRoles" :key="`p${r.id}`" class="pick" @click="onPickRole(r)">
@@ -555,7 +561,7 @@ onShow(() => { refresh() })
           <view class="group-label">系统形象</view>
           <view v-for="a in avatars" :key="`a${a.id}`" class="pick" @click="onPickAvatar(a)">
             <text class="pick-name">{{ a.name }}</text>
-            <text class="pick-sub">{{ a.description || a.tts_voice || '' }}</text>
+            <text class="pick-sub">{{ a.description || '' }}</text>
           </view>
 
           <view v-if="!roles.length && !avatars.length" class="tip">

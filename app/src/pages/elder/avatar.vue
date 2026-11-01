@@ -53,8 +53,10 @@ function clipCount(a: Avatar) {
 }
 
 // 灯效摘要：只取"待机"和"提醒"两个用户最能感知的状态。
-// ⚠️ 当前固件尚未消费 emotion_lights，所以这里只是**如实展示配置**，
-// 不能写成"设备的灯会是这样" —— 那是还没兑现的承诺。
+// 2026-10-31 起灯效**已由固件消费**（服务端 device.sync 下发 lights，
+// 固件 sync.c 的 apply_lights → rgb.c 的 elder_rgb_apply_config）。
+// 所以这里可以如实说"设备会这样亮"，但仍要写明生效要等心跳 ——
+// 设备没有常连控制通道，服务端推不动它。
 function lightSummary(a: Avatar) {
   const L: Record<string, any> = a.emotion_lights || {}
   const pick = (k: string) => {
@@ -81,7 +83,7 @@ onShow(() => { refresh() })
   <view class="page">
     <view class="head">
       <text class="dname">{{ browseOnly ? '系统形象库' : deviceName }}</text>
-      <text class="sub">{{ browseOnly ? '在「设备」页选择设备后即可绑定形象' : '切换后设备下次心跳生效（默认 5 分钟内）' }}</text>
+      <text class="sub">{{ browseOnly ? '在「设备」页选择设备后即可绑定形象' : '切换后设备最长约 5 分钟自动获取生效' }}</text>
     </view>
 
     <view v-for="a in avatars" :key="a.id" class="card" @click="onPick(a)">
