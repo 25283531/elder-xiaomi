@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 import subprocess
@@ -66,6 +67,26 @@ PORT = resolve_port("smoke_roles")
 BASE = f"http://127.0.0.1:{PORT}"
 
 results: list[tuple[str, bool, str]] = []
+
+
+def _high_risk_meds() -> tuple[str, ...]:
+    """从 catalog.py 源码里取出 ``HIGH_RISK_MEDS``（AST 解析，不 import 服务端）。
+
+    为什么读源码而不是 ``from app.persona.catalog import HIGH_RISK_MEDS``：
+    本脚本刻意**只走 HTTP**、不在进程内 import 服务端模块（见模块头），
+    而 import 会连带拉起 ``app.persona`` 包，把编译器与它的依赖一起拖进来。
+    AST 只解析这一个文件的字面量，零副作用，也不会被半启动的服务影响。
+
+    ⚠️ 断言必须**遍历这个元组**去比对产物。只断言「产物里出现过几个药名」
+    挡不住「清单加了、text 里的药名是手抄的、于是没跟着变」这种静默漂移。
+    """
+    tree = ast.parse((SERVER / "app" / "persona" / "catalog.py")
+                     .read_text(encoding="utf-8"))
+    for node in tree.body:
+        if (isinstance(node, ast.AnnAssign)
+                and getattr(node.target, "id", "") == "HIGH_RISK_MEDS"):
+            return tuple(ast.literal_eval(node.value))
+    raise AssertionError("catalog.py 里找不到 HIGH_RISK_MEDS（常量被改名或删掉了？）")
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
@@ -592,6 +613,21 @@ def main() -> int:
         check("红线首尾各出现一次",
               prompt.count("【安全底线 · 不可协商】") >= 1
               and prompt.count("【安全底线 · 不可协商 · 复述】") >= 1, "")
+
+        # ---- 剂量红线的三段式语义（2026-11-03 新裁决）----------------------
+        # 为什么放在 HTTP 冒烟里而不是 evals：evals 的 redline_matches_baseline
+        # 只证明「产物逐字等于黄金副本」，证明不了「这一版语义是对的」——
+        # 两处一起改就能全绿。下面四条断言的是**正文里到底写了什么**，
+        # 每条都配了一个「改坏就变红」的变异（见交付说明）。
+        check("剂量红线含「致死量」这条绝对禁止", "致死量" in prompt)
+        meds = _high_risk_meds()
+        missed_meds = [m for m in meds if m not in prompt]
+        check(f"高风险药清单 {len(meds)} 味逐个出现在产物里", not missed_meds,
+              "缺：" + "、".join(missed_meds))
+        check("免责声明「咨询医生」排在「常用剂量」之前（先声明、后报数）",
+              0 <= prompt.find("咨询医生") < prompt.find("常用剂量"))
+        check("旧的「不能说数字」已不再出现（防止回退到旧文案）",
+              "不能说数字" not in prompt)
 
         # ==================================================== 10. 非法 traits
         code, bad = req("POST", "/api/roles",
