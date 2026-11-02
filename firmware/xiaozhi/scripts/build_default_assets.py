@@ -718,10 +718,26 @@ def get_emoji_collection_path(default_emoji_collection, xiaozhi_fonts_path):
     """
     Get the emoji collection path if needed
     Returns the emoji directory path or None if no emoji collection is needed
+
+    2026-11-03：第一个参数现在**可以直接是一个目录路径**（CMake 传绝对路径），
+    不再只能是 `78/xiaozhi-fonts/png/` 下的集合名。
+
+    为什么要开这个口子：Fluent 3D 那套素材是本仓自己入库的
+    （main/assets/emoji/fluent3d_128），**不能**塞进 managed_components ——
+    那里被 .gitignore 忽略、CI 浅克隆时取不到，构建会静默少掉全部表情。
+
+    判据是「这个路径真的存在且是目录」：存在就直接用；不存在才按老规则当成
+    集合名去 `<fonts>/png/<name>` 下找。两条都不成立时仍然只告警返回 None，
+    保持原来的宽松语义（没有表情素材也要能出 assets.bin，只是屏上没图）。
     """
     if not default_emoji_collection:
         return None
-    
+
+    # 目录路径直通。用 isdir 而不是 exists：传进来一个文件名（比如误传
+    # png 而不是目录）时要落到下面的告警分支，不能当成集合目录用。
+    if os.path.isdir(default_emoji_collection):
+        return default_emoji_collection
+
     emoji_path = os.path.join(xiaozhi_fonts_path, 'png', default_emoji_collection)
     if os.path.exists(emoji_path):
         return emoji_path
