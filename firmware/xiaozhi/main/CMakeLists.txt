@@ -573,6 +573,30 @@ elseif(CONFIG_BOARD_TYPE_AIPI_LITE)
     set(DEFAULT_EMOJI_COLLECTION twemoji_32)
 endif()
 
+# ---------------------------------------------------------------------------
+# 表情素材 override（2026-11-03）：lichuang-dev 换成 Microsoft Fluent Emoji 3D
+#
+# 素材是本仓自己入库的（main/assets/emoji/fluent3d_128，21 张 128x128，来源、
+# 上游 commit、MIT 许可证全文见该目录下的 THIRD_PARTY.md）。**不能**塞进
+# managed_components/78__xiaozhi-fonts —— 那里被 .gitignore 忽略，CI 浅克隆
+# 时取不到，构建会静默少掉全部表情（assets 里没有 emoji_collection，屏上只剩
+# FontAwesome 图标）。
+#
+# 为什么放在这里覆盖、而不是改上面那个 elseif 分支：
+# CONFIG_BOARD_TYPE_LICHUANG_DEV_S3 这一个 Kconfig 同时供 lichuang-dev 与
+# 若干衍生板使用，直接改分支会把别人的板子一起换掉。
+#
+# 为什么只换这一块：其他板卡的图片区尺寸各不相同（用 twemoji_32 的那批屏更
+# 小），128 的素材在它们上面只是白占 assets 空间。
+#
+# 值是**绝对路径**：build_default_assets.py:717 的 get_emoji_collection_path()
+# 见到「存在的目录」就直接用，不再拼 <xiaozhi_fonts>/png/<name>。
+# ---------------------------------------------------------------------------
+if(BOARD_TYPE STREQUAL "lichuang-dev")
+    set(DEFAULT_EMOJI_COLLECTION
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/emoji/fluent3d_128")
+endif()
+
 file(GLOB BOARD_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_TYPE}/*.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_TYPE}/*.c
@@ -833,6 +857,17 @@ function(build_default_assets_bin)
     list(APPEND BUILD_ARGS "--esp_sr_model_path" "${ESP_SR_MODEL_PATH}")
     list(APPEND BUILD_ARGS "--xiaozhi_fonts_path" "${XIAOZHI_FONTS_PATH}")
     
+    # 表情素材本身也要进 DEPENDS（2026-11-03 加）。
+    #
+    # 为什么：素材换成仓库内的 assets/emoji/fluent3d_128 之后，「换一张表情」
+    # 变成了日常操作。而 add_custom_command 只看 DEPENDS 里的文件时间戳 ——
+    # 不列 PNG 的话，改了图重编，assets.bin 不会重建，固件刷进去还是旧表情，
+    # 构建全绿、串口也不报，与上面 emoji_cbin.py 那条注释是同一类坑。
+    # 用 file(GLOB) 在 configure 期展开：新增/删除文件需要重新 cmake（正常），
+    # 改内容不需要。
+    file(GLOB DEFAULT_EMOJI_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/emoji/*/*.png")
+
     # Create custom command to build assets
     add_custom_command(
         OUTPUT ${GENERATED_ASSETS_BIN}
@@ -845,6 +880,7 @@ function(build_default_assets_bin)
             # 「改了转换逻辑但屏上表情没变」，与 2026-10-19 那次
             # 「改了配置但固件没变」同一类坑。
             ${PROJECT_DIR}/scripts/emoji_cbin.py
+            ${DEFAULT_EMOJI_SOURCES}
         COMMENT "Building default assets.bin based on configuration"
         VERBATIM
     )

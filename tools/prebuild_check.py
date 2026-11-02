@@ -1104,15 +1104,27 @@ def main() -> int:
     # 解析器**逐字段校验产物（不复用转换器的 struct 格式，否则等于自己证明
     # 自己）、再静态确认打包侧没有「PNG 原样拷贝」的回头路。
     #
-    # ⚠️ 源 PNG 在 managed_components/ 里（不进 git）：CI 第一次自检时组件
-    # 还没下载 ⇒ 无判据，必须 SKIP；set-target 之后那次自检才会真跑。
-    _c17_png_root = None
+    # ⚠️ 源 PNG 有两个来源，**两个都要扫**：
+    #   ① managed_components/*xiaozhi-fonts/png —— twemoji_32/64，组件还没
+    #      下载时不存在（CI 第一次自检必然如此），那时只剩 ② 的判据；
+    #   ② main/assets/emoji/* —— 本仓自己入库的素材（Fluent 3D 128）。它在
+    #      git 里，永远存在。
+    #
+    # 2026-11-03 加 ② 的原因：表情换成 Fluent 3D 之后，素材从 managed_components
+    # 搬进了仓库（那边被 .gitignore 忽略，CI 浅克隆取不到）。如果这里还只扫 ①，
+    # 新素材就**完全不过门禁** —— 屏上花不花全靠运气，这是最坏的一种绿。
+    _c17_png_roots: list[Path] = []
+
     _mc_dir = XIAOZHI / "managed_components"
     if _mc_dir.is_dir():
         for _cand in sorted(_mc_dir.glob("*xiaozhi-fonts")):
             if (_cand / "png").is_dir():
-                _c17_png_root = _cand / "png"
+                _c17_png_roots.append(_cand / "png")
                 break
+
+    _repo_emoji_root = XIAOZHI / "main" / "assets" / "emoji"
+    if _repo_emoji_root.is_dir():
+        _c17_png_roots.append(_repo_emoji_root)
 
     _c17_bad: list[str] = []
 
@@ -1173,18 +1185,18 @@ def main() -> int:
 
     # ---- (c) 动态：跑一遍转换器，用独立解析器校验产物 ----
     _c17_total = 0
-    if _c17_png_root is None:
-        # 组件还没下载 ⇒ 动态部分无判据；但静态问题照样要拦。
+    if not _c17_png_roots:
+        # 两个来源都不存在（组件没下载 + 仓库内也没素材目录）⇒ 动态部分无判据；
+        # 但静态问题照样要拦。
         if _c17_bad:
             check("C17 表情资源必须是打包期转好的 cbin（RGB565A8 零解码）",
                   False, "⚠️ " + "；".join(_c17_bad[:6]), fatal=True)
         else:
             check("C17 表情资源必须是打包期转好的 cbin（RGB565A8 零解码）",
                   SKIP,
-                  "找不到 managed_components/*xiaozhi-fonts/png（组件还没下载，"
-                  "首次自检必然如此）⇒ 只做了静态部分：打包侧已转 cbin、"
-                  "设备端已用 LvglCBinImage + 头自检。set-target 之后那次"
-                  "自检会把每个表情集里的 PNG 真正跑一遍。")
+                  "managed_components/*xiaozhi-fonts/png 与 main/assets/emoji 都不"
+                  "存在 ⇒ 只做了静态部分：打包侧已转 cbin、设备端已用 "
+                  "LvglCBinImage + 头自检。")
     else:
         import importlib.util
 
@@ -1248,37 +1260,59 @@ def main() -> int:
             _c17_bad.append(_c17_mod_err)
         else:
             _c17_checked = 0
-            for _coll in sorted(p for p in _c17_png_root.iterdir() if p.is_dir()):
-                _pngs = sorted(_coll.glob("*.png"))
-                if not _pngs:
-                    continue
-                _c17_total += len(_pngs)
-                for _png in _pngs:
-                    try:
-                        _blob = _c17_mod.png_to_cbin(str(_png))
-                    except Exception as exc:   # noqa: BLE001
-                        _c17_bad.append(f"{_coll.name}/{_png.name} 转换抛异常: {exc}")
+            # 两个根目录都要过一遍。错误信息带上根目录名，否则 twemoji_64 与
+            # fluent3d_128 同时存在时，光看 "neutral.png" 分不清是哪一套。
+            for _root in _c17_png_roots:
+                _root_tag = _root.name
+                for _coll in sorted(p for p in _root.iterdir() if p.is_dir()):
+                    _pngs = sorted(_coll.glob("*.png"))
+                    if not _pngs:
                         continue
-                    _wh, _why = _c17_parse(_blob)
-                    if _why:
-                        _c17_bad.append(f"{_coll.name}/{_png.name}: {_why}")
-                        continue
-                    # 与源 PNG 的 IHDR 对账（宽高必须一致，否则就是转错图）
-                    _raw = _png.read_bytes()
-                    if _raw[:8] != b"\x89PNG\r\n\x1a\n":
-                        _c17_bad.append(f"{_coll.name}/{_png.name} 不是 PNG")
-                        continue
-                    _pw = int.from_bytes(_raw[16:20], "big")
-                    _ph = int.from_bytes(_raw[20:24], "big")
-                    if _wh != (_pw, _ph):
-                        _c17_bad.append(
-                            f"{_coll.name}/{_png.name}: 产物 {_wh[0]}x{_wh[1]} "
-                            f"≠ 源图 {_pw}x{_ph}")
-                        continue
-                    _c17_checked += 1
+                    _c17_total += len(_pngs)
+                    for _png in _pngs:
+                        _tag = f"{_root_tag}/{_coll.name}/{_png.name}"
+                        try:
+                            _blob = _c17_mod.png_to_cbin(str(_png))
+                        except Exception as exc:   # noqa: BLE001
+                            _c17_bad.append(f"{_tag} 转换抛异常: {exc}")
+                            continue
+                        _wh, _why = _c17_parse(_blob)
+                        if _why:
+                            _c17_bad.append(f"{_tag}: {_why}")
+                            continue
+                        # 与源 PNG 的 IHDR 对账（宽高必须一致，否则就是转错图）
+                        _raw = _png.read_bytes()
+                        if _raw[:8] != b"\x89PNG\r\n\x1a\n":
+                            _c17_bad.append(f"{_tag} 不是 PNG")
+                            continue
+                        _pw = int.from_bytes(_raw[16:20], "big")
+                        _ph = int.from_bytes(_raw[20:24], "big")
+                        if _wh != (_pw, _ph):
+                            _c17_bad.append(
+                                f"{_tag}: 产物 {_wh[0]}x{_wh[1]} "
+                                f"≠ 源图 {_pw}x{_ph}")
+                            continue
+                        # 本仓自己入库的 fluent3d_* 素材钉死 128×128。
+                        #
+                        # 上面那条「产物 vs 源图 IHDR 对账」挡的是"转错图"，
+                        # 它有个盲区：转换器从 IHDR 取宽高，所以**任何**尺寸的
+                        # 合法 PNG 都自洽通过。于是「有人把一张表情误存成
+                        # 64×64」不会被拦 —— 屏上那张会糊，而构建全绿。
+                        # 2026-11-03 补：新素材换成 Fluent 3D 后，换图成了日常
+                        # 操作，这个盲区的触发概率不再可以忽略。
+                        #
+                        # 只对 fluent3d_* 生效，不碰 twemoji_32/64 —— 那两套
+                        # 本来就是 32/64 混着的，写死会误伤。
+                        if (_coll.name.startswith("fluent3d_")
+                                and (_pw, _ph) != (128, 128)):
+                            _c17_bad.append(
+                                f"{_tag}: 期望 128x128，实际 {_pw}x{_ph}")
+                            continue
+                        _c17_checked += 1
             # 一一对应：产物数量必须等于源 PNG 数量（每个 PNG 都过了一遍）
             if _c17_total == 0:
-                _c17_bad.append(f"{_c17_png_root} 下没有任何 PNG")
+                _c17_bad.append(
+                    "、".join(str(p) for p in _c17_png_roots) + " 下没有任何 PNG")
             elif _c17_checked != _c17_total:
                 _c17_bad.append(f"只有 {_c17_checked}/{_c17_total} 张 PNG 通过校验")
 
