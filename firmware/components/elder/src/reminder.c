@@ -1211,7 +1211,15 @@ esp_err_t elder_reminder_confirm(uint8_t id)
     return elder_reminder_confirm_ex(id, ELDER_CFM_BUTTON);
 }
 
-esp_err_t elder_reminder_confirm_ex(uint8_t id, uint8_t confirm_method)
+/* 确认状态机的**唯一实现体**。对外的两个入口只是它的两种调用姿势：
+ *   · elder_reminder_confirm_ex()     —— force_done = false（历史语义不变）
+ *   · elder_reminder_confirm_server() —— force_done = true（服务端判定）
+ * 之所以拆出一个内部版本而不是在 confirm_ex 里加个特殊 method 值：确认
+ * **方式**（上报给服务端的 method）与确认**置信度**（本地落哪个状态）是
+ * 两件独立的事，用一个枚举同时表达两者，迟早会有人拿 BUTTON 当"强制
+ * 完成"用 —— 那会让服务端把这次记成"老人按了键"。见 confirm_server 的说明。 */
+static esp_err_t confirm_ex_inner(uint8_t id, uint8_t confirm_method,
+                                  bool force_done)
 {
     if (id >= g.table.count) return ESP_ERR_NOT_FOUND;
     /* 先记方式再改状态：set_state() 会同步回调 elder_sync_on_reminder_state，
@@ -1226,8 +1234,13 @@ esp_err_t elder_reminder_confirm_ex(uint8_t id, uint8_t confirm_method)
      *      于是"语音确认后提示按按钮、按下去却提示没有待确认的提醒"；
      *   ② 服务端只会收到一条 method=VOICE 的回执，永远升不到
      *      「语音+按键确认」（全置信）。
-     * 按键/APP 确认本身就是"人在场"的证据，直接 DONE。 */
-    if (confirm_method == ELDER_CFM_VOICE) {
+     * 按键/APP 确认本身就是"人在场"的证据，直接 DONE。
+     *
+     * force_done 例外：它表达的是"这次确认的置信度已经够了"，与 method
+     * 无关。目前唯一使用者是服务端判定（见 elder_reminder_confirm_server）。
+     * 无论哪条路径，HALF 复核窗口的起点都必须清掉 —— 留着它，tick 会在
+     * 10 分钟后把这条已经 DONE 的提醒改判成 HALF_EXPIRED。 */
+    if (confirm_method == ELDER_CFM_VOICE && !force_done) {
         /* 记下复核窗口的起点。必须在 set_state 之前 —— set_state 会同步
          * 回调 sync 层，tick 也可能在别的任务上下文里跑，晚一行就可能
          * 被 tick 读到 0 而用 pending_since_us 兜底（差几十毫秒，无伤，
@@ -1242,9 +1255,74 @@ esp_err_t elder_reminder_confirm_ex(uint8_t id, uint8_t confirm_method)
     return ESP_OK;
 }
 
+esp_err_t elder_reminder_confirm_ex(uint8_t id, uint8_t confirm_method)
+{
+    return confirm_ex_inner(id, confirm_method, false);
+}
+
 uint8_t elder_reminder_last_confirm_method(void)
 {
     return g.last_confirm_method;
+}
+
+/* 「这一轮还没完结、可以被确认」的状态集合。
+ *
+ * 与 has_pending_confirm() / elder_reminder_first_ringing() 同一口径
+ * （PENDING / CONFIRM_WIN / ESCALATED / HALF_CONFIRMED）。
+ * 抽成函数是因为这段判据在"确认"这一侧有两个使用者：远程代确认的状态校验、
+ * 按 server_id 挑选实例。判据复制粘贴迟早会漂移，而漂移的表现是
+ * "屏幕上明明在等确认，确认接口却说它不可确认"——老人按了没反应。 */
+static bool state_is_confirmable(uint8_t st)
+{
+    return st == ELDER_RMD_PENDING || st == ELDER_RMD_CONFIRM_WIN ||
+           st == ELDER_RMD_ESCALATED || st == ELDER_RMD_HALF_CONFIRMED;
+}
+
+/* 在一个 server_id 名下挑出「该确认的那一条」item；找不到返回 -1。
+ *
+ * 为什么不能直接用 elder_reminder_find_by_server_id()：sync.c 的
+ * parse_reminders() 会把一条规则的 times_of_day 展开成**多条** item
+ * （「8:00 吃药 / 20:00 吃药」共用同一个 reminder_id），那个函数只返回
+ * 第一条。远程代确认（confirm_remote）和按 server_id 的语音确认都要按
+ * "实例"再挑一次 —— 所以这段遍历只能有一份，两套定位逻辑迟早会漂移。
+ *
+ * 两种定位模式（由 due_at 是否为 0 区分）：
+ *   · due_at != 0：按到期时刻定位（|Δ| < 60s）。服务端代确认知道是哪个
+ *     实例，必须给准 —— 8:00 的确认不能把 20:00 那条也标成已完成。
+ *   · due_at == 0：按「此刻正在响铃」定位。语音确认这条路上服务端只给了
+ *     reminder_id（设备侧叫 server_id），拿不到实例的到期时刻，只能取本地
+ *     正在等确认的那条；多条时取 fired_due_at 最大 —— 与
+ *     elder_reminder_first_ringing() 同口径：最近触发 = 正在发声的那条。 */
+static int pick_item_for_confirm(uint32_t server_id, time_t due_at)
+{
+    if (server_id == 0) return -1;
+
+    int best = -1;
+    int64_t best_due = 0;
+    for (int i = 0; i < g.table.count && i < ELDER_REMINDER_MAX; i++) {
+        if (g.table.items[i].server_id != server_id) continue;
+
+        if (due_at != 0) {
+            /* fired_due_at == 0 = 这条今天在本地还没触发（只在 tick 触发时
+             * 写），此时无从判断是不是同一个实例，不参与匹配。 */
+            if (g.table.items[i].fired_due_at == 0) continue;
+            int64_t d = g.table.items[i].fired_due_at - (int64_t)due_at;
+            if (d < 0) d = -d;
+            if (d < 60) return i;
+            continue;
+        }
+
+        /* 停用的提醒不发声，也就不该被确认（与 first_ringing 一致）。 */
+        if (!g.table.items[i].enabled) continue;
+        if (!state_is_confirmable(g.state[i])) continue;
+        /* 严格大于：同一分钟触发的多条保留下标更小的那条，行为确定，
+         * 不依赖遍历顺序之外的偶然因素。 */
+        if (best < 0 || g.table.items[i].fired_due_at > best_due) {
+            best = i;
+            best_due = g.table.items[i].fired_due_at;
+        }
+    }
+    return best;
 }
 
 /* 服务端代确认（子女在手机端点了「代确认」）落到设备。
@@ -1283,14 +1361,9 @@ esp_err_t elder_reminder_confirm_remote(uint32_t server_id, time_t due_at,
      * （「8:00 吃药 / 20:00 吃药」共用同一个 reminder_id）。而
      * elder_reminder_find_by_server_id() 只返回**第一条**，拿它去比 20:00 的
      * due_at 必然对不上 ⇒ 20:00 那条的代确认永远落不下去，子女端点了没反应。
-     * 所以在同一 server_id 的所有条目里按到期时刻再挑一次。 */
-    int match = -1;
-    for (int i = 0; i < g.table.count && i < ELDER_REMINDER_MAX; i++) {
-        if (g.table.items[i].server_id != server_id) continue;
-        int64_t d = g.table.items[i].fired_due_at - (int64_t)due_at;
-        if (d < 0) d = -d;
-        if (g.table.items[i].fired_due_at != 0 && d < 60) { match = i; break; }
-    }
+     * 所以在同一 server_id 的所有条目里按到期时刻再挑一次（遍历逻辑与
+     * 语音确认共用 pick_item_for_confirm，见那里的注释）。 */
+    int match = pick_item_for_confirm(server_id, due_at);
     if (match < 0) {
         /* local_due == 0 = 这条今天在本地还没触发（fired_due_at 只在 tick
          * 触发时写），此时无从判断是不是同一个实例，只能跳过。
@@ -1312,8 +1385,7 @@ esp_err_t elder_reminder_confirm_remote(uint32_t server_id, time_t due_at,
         /* 幂等：心跳每次都带，重复确认什么都不做（也不重复回执）。 */
         return ESP_OK;
     }
-    if (st != ELDER_RMD_PENDING && st != ELDER_RMD_CONFIRM_WIN &&
-        st != ELDER_RMD_ESCALATED && st != ELDER_RMD_HALF_CONFIRMED) {
+    if (!state_is_confirmable(st)) {
         /* IDLE / SKIPPED / HALF_EXPIRED：这一轮已经作废或还没开始，
          * 没有"待确认"可言，改了反而会凭空造出一条已完成记录。 */
         ESP_LOGW(TAG, "远程确认：server_id=%lu 当前状态 %u 不是待确认，跳过",
@@ -1331,6 +1403,70 @@ esp_err_t elder_reminder_confirm_remote(uint32_t server_id, time_t due_at,
 
     /* 复用现有状态机，不重写：DONE + 位图 + 回调 + 落盘都在 confirm_ex 里。 */
     return elder_reminder_confirm_ex((uint8_t)idx, confirm_method);
+}
+
+/* 语音确认的**定向**版本：服务端大模型判断出「哪条提醒完成了」之后，
+ * 只带着 reminders.id（= 本地 server_id）回来，不带到期时刻。
+ *
+ * 为什么不能直接复用 elder_reminder_confirm_remote()（两条都是硬伤）：
+ *   ① 它强制把确认方式改成 ELDER_CFM_APP(3) —— 那个入口的语义是"子女在
+ *      手机端点代确认"，而服务端会拿设备上报的 method **覆盖**库里的值。
+ *      语音确认必须记 ELDER_CFM_VOICE(1)，否则服务端那套「先 VOICE 再
+ *      BUTTON 合并成 VOICE_AND_BUTTON(5)」永远合并不起来。
+ *   ② 它要求 due_at 精确到 ±60s，而这条路上服务端根本拿不到实例的到期
+ *      时刻；传 0 进去不会命中任何一条（fired_due_at 是 epoch 秒，
+ *      |fired_due_at - 0| 远大于 60）。
+ * 所以这里只共享"同一 server_id 下挑哪一条"的遍历（pick_item_for_confirm），
+ * 不复制定位逻辑 —— 两套定位迟早会漂移。
+ *
+ * 找不到 / 本地那条不在待确认状态 ⇒ 返回非 0。调用方（MCP 工具）据此回
+ * false，让服务端知道"设备侧状态没同步上"，而不是假装成功。
+ *
+ * ---- 为什么这条路径**直落 DONE**，而不是沿用 VOICE 的半置信 ----
+ * 半置信的初衷是"老人只在语音里说了句『吃了』，没人核实"。这条路径的前提
+ * 恰好相反：服务端是在**完整对话里问清了是哪味药、哪次提醒**之后才判定完成
+ * 的（多药提醒会逐味追问），置信度高于单句"吃了"。此时还落 HALF 有三个
+ * 具体后果，全是坏结果：
+ *   · done_today 不置位 ⇒ 子女端看到的依从率永远缺这一条；
+ *   · OnReminder 没有 HALF_CONFIRMED 分支 ⇒ 全屏提醒不收，老人以为没确认；
+ *   · 10 分钟后 HALF_EXPIRED，sync 层对它是**空 case**（故意不上报）⇒
+ *     服务端和家属端永远等不到终态，这条提醒悬在半空。
+ * 所以这里落 DONE。但 **method 仍然必须是 VOICE**：服务端按上报的 method
+ * 判断"是老人说的还是子女代点的"，并据此把「先 VOICE 后 BUTTON」合并成
+ * VOICE_AND_BUTTON(5)。为了拿到 DONE 就把 method 改成 BUTTON，等于替老人
+ * 编造了一次他没做过的按键 —— 依从率数据从此不可信，而且这条路再也不会
+ * 被升级成"语音+按键"（它本来就不是按键）。
+ * ⇒ 方式（method）与置信度（force_done）必须分开表达，这也是
+ *    confirm_ex_inner() 存在的理由。 */
+esp_err_t elder_reminder_confirm_server(uint32_t server_id,
+                                        uint8_t confirm_method)
+{
+    if (server_id == 0) return ESP_ERR_INVALID_ARG;
+
+    /* 只接受 VOICE：这个入口的语义是"服务端判定"，不是"按键"。传别的值
+     * 不是"更保险"，而是把语义换成了另一个人做的另一件事。调用点只有
+     * elder_bridge.cc 一处，错了就该当场炸出来，而不是静默记错方式。 */
+    if (confirm_method != ELDER_CFM_VOICE) return ESP_ERR_INVALID_ARG;
+
+    int idx = pick_item_for_confirm(server_id, 0);
+    if (idx < 0) {
+        /* 本地没有这条、或它已经确认完/还没响：都不该凭空改状态。
+         * 服务端会收到 false，据自己的库决定要不要再下发一次。 */
+        ESP_LOGW(TAG, "按 server_id 确认：本地没有 server_id=%lu 正在等确认的"
+                      "条目，跳过", (unsigned long)server_id);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    ESP_LOGI(TAG, "按 server_id 确认（服务端判定，直落 DONE）："
+                  "server_id=%lu -> 本地 #%d（method=%u）",
+             (unsigned long)server_id, idx, (unsigned)confirm_method);
+
+    /* 复用同一份状态机：set_state 置 dirty + 回调 sync 层（DONE 分支会带上
+     * last_confirm_method 上报 CONFIRMED），flush 在 confirm_ex_inner 末尾
+     * 显式调用 —— 状态不会只活在 RAM 里（屏幕/闪灯/回执都以它为准）。
+     * 重复调用天然幂等：set_state 发现状态没变就直接返回，不会重复回执、
+     * 不会重复写 NVS。 */
+    return confirm_ex_inner((uint8_t)idx, confirm_method, true);
 }
 
 void elder_reminder_arm_confirm(uint8_t id)
