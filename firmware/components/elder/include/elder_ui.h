@@ -83,6 +83,17 @@ typedef struct {
     /* 收掉全屏提醒，恢复正常界面。可为 NULL */
     void (*hide_reminder)(void *ctx);
 
+    /* 播放一条**预录语音片段**（固件内置 OGG，离线可用）。id 见 elder_clip.h
+     * 的 elder_clip_id_t。可为 NULL —— 为 NULL 时 elder_clip_play() 返回
+     * false，调用方回落「提示音 + TTS」。
+     *
+     * ⚠️ **只能追加在结构体末尾**。插在中间会让所有已有初始化器
+     *    （elder_bridge.cc 的 `hooks.xxx = ...` 逐字段赋值、以及 host 自测
+     *    工程的 `elder_ui_hooks_t h = {...}` 位置初始化）字段错位 ——
+     *    编译不报错，行为全乱。本项目已有先例：给 router 函数中间插参数
+     *    导致 10 个脚本静默错位。 */
+    void (*play_clip)(int id, void *ctx);
+
     void *ctx;
 } elder_ui_hooks_t;
 
@@ -130,6 +141,17 @@ void elder_ui_speak(const char *text);
 
 /** 直接播放本地提示音（离线兜底） */
 void elder_ui_play_tone(elder_tone_t tone);
+
+/**
+ * @brief 转发一条**预录语音片段**给上层（`hooks.play_clip`）。
+ *
+ * @return true 已转发；false 没有 play_clip 钩子（或钩子内部拒绝）。
+ *
+ * 为什么不直接在 elder_clip.c 里调钩子：hooks 是 ui.c 的私有状态，
+ * 多一个入口去读它就等于把"谁持有 hooks"这件事拆成两处，迟早不同步。
+ * 本函数是 elder_clip.c 唯一的转发出口。
+ */
+bool elder_ui_play_clip(int id);
 
 /**
  * @brief 只屏显一条通知，**不发声**（不发 TTS、不播提示音）。

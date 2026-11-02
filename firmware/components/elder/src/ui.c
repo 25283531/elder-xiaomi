@@ -82,10 +82,11 @@ void elder_ui_set_hooks(const elder_ui_hooks_t *hooks)
      * （见该函数里的注释）。开机日志里少打这两项，现场就只能靠"猜"为什么
      * 提醒响了但屏幕没字。 */
     ESP_LOGI(TAG, "hooks: emotion=%d notify=%d tone=%d speak=%d "
-                  "show_reminder=%d hide_reminder=%d",
+                  "show_reminder=%d hide_reminder=%d play_clip=%d",
              g.hooks.set_emotion != NULL, g.hooks.notify != NULL,
              g.hooks.play_tone != NULL, g.hooks.speak != NULL,
-             g.hooks.show_reminder != NULL, g.hooks.hide_reminder != NULL);
+             g.hooks.show_reminder != NULL, g.hooks.hide_reminder != NULL,
+             g.hooks.play_clip != NULL);
 
     /* 钩子变更时把当前形象立刻推一次，避免切换后屏幕停在旧表情 */
     if (g.hooks.set_emotion) {
@@ -212,6 +213,18 @@ void elder_ui_play_tone(elder_tone_t tone)
         return;
     }
     g.hooks.play_tone(tone, g.hooks.ctx);
+}
+
+bool elder_ui_play_clip(int id)
+{
+    if (!g.has_hooks || !g.hooks.play_clip) {
+        /* 不是错误：无音频的板子 / bridge 还没接线。调用方会回落
+         * 「提示音 + TTS」，所以这里静默返回 false，不打日志 ——
+         * 每次提醒都刷一条 WARN 会把真正的告警淹掉。 */
+        return false;
+    }
+    g.hooks.play_clip(id, g.hooks.ctx);
+    return true;
 }
 
 static bool online_now(void)

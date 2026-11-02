@@ -193,19 +193,24 @@ def _page(serial: int, seq: int, granule: int, packets: list[bytes],
     return page[:22] + struct.pack("<I", crc) + page[26:]
 
 
-def mux_ogg(packets: list[bytes], *, serial: int = 0x1234ABCD) -> bytes:
+def mux_ogg(packets: list[bytes], *, serial: int = 0x1234ABCD,
+            vendor: bytes = b"voice-avatar-box reminder chime") -> bytes:
     """把一串 Opus 包封成 OGG Opus（OpusHead + OpusTags + 音频页）。
 
     颗粒度（granulepos）按 Opus 规范以 **48kHz 采样**计：本文件是 24kHz、
     每包 60ms ⇒ 每包推进 2880。写错只会影响 seek/时长，不影响解码，
     但既然要给固件用就按标准写对。
+
+    :param vendor: OpusTags 里的厂商串（纯信息字段，不影响解码）。
+        开放成参数是给 ``make_elder_clips.py`` 用的 —— 它复用本函数封
+        老人语音片段，标签里再写 "reminder chime" 就名不副实了。
     """
+
     pre_skip = 312        # 6.5ms，与既有 popup.ogg 一致
     opus_head = (b"OpusHead" + bytes([1, 1])
                  + struct.pack("<H", pre_skip)
                  + struct.pack("<I", SAMPLE_RATE)
                  + struct.pack("<h", 0) + bytes([0]))
-    vendor = b"voice-avatar-box reminder chime"
     opus_tags = (b"OpusTags" + struct.pack("<I", len(vendor)) + vendor
                  + struct.pack("<I", 0))
 
