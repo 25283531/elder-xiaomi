@@ -349,6 +349,38 @@ esp_err_t elder_reminder_confirm_remote(uint32_t server_id, time_t due_at,
                                         uint8_t confirm_method);
 
 /**
+ * @brief 按 server_id 定向确认（服务端大模型判断「哪条提醒完成了」后调）。
+ *
+ * 为什么不能直接复用 elder_reminder_confirm_remote()：
+ *   - 那个入口强制把确认方式记成 ELDER_CFM_APP(3)（"子女在手机端点代确认"），
+ *     服务端会拿设备上报的 method 覆盖库里的值。语音确认必须记
+ *     ELDER_CFM_VOICE(1)，否则「语音 + 按键」永远合并不成 VOICE_AND_BUTTON；
+ *   - 那个入口要求 due_at 精确到 ±60s，而这条路上服务端只有 reminders.id，
+ *     拿不到实例的到期时刻（传 0 不会命中任何一条）。
+ * 两者共用同一份「同一 server_id 下挑哪一条」的遍历，避免两套定位逻辑漂移。
+ *
+ * 与 elder_reminder_confirm_ex(id, ELDER_CFM_VOICE) 的唯一区别：**直落 DONE**。
+ * 半置信的前提是"只有一句『吃了』、没人核实"；这条路径的前提是服务端在
+ * 完整对话里问清了是哪味药，置信度已经够。落 HALF 会让 done_today 不置位、
+ * 全屏提醒不收、10 分钟后 HALF_EXPIRED 又什么都不上报（见 .c 里的详述）。
+ * 但上报的 method **仍然是 VOICE** —— 服务端靠它区分"老人说的"与"子女点的"，
+ * 不能为了拿 DONE 而谎报成 BUTTON。
+ *
+ * 定位规则：在同一 server_id 的所有条目里挑 enabled 且正在等确认
+ * （PENDING / CONFIRM_WIN / ESCALATED / HALF_CONFIRMED）的那条；多条时取
+ * fired_due_at 最大（= 最近触发 = 此刻正在响铃的那条，与 first_ringing 同口径）。
+ *
+ * @param server_id      服务端 reminders.id（= elder_rmd_item_t.server_id）
+ * @param confirm_method 只接受 ELDER_CFM_VOICE(1)（别的值直接报错，见 .c）
+ * @return ESP_OK                已确认（重复调用幂等）
+ *         ESP_ERR_NOT_FOUND     本地没有正在等确认的该条 —— 调用方应回 false，
+ *                               让服务端知道设备侧状态没同步上
+ *         ESP_ERR_INVALID_ARG   server_id == 0 或 confirm_method != VOICE
+ */
+esp_err_t elder_reminder_confirm_server(uint32_t server_id,
+                                        uint8_t confirm_method);
+
+/**
  * @brief 打开确认窗口（按键长按后由 input 事件驱动）
  */
 void elder_reminder_arm_confirm(uint8_t id);

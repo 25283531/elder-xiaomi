@@ -158,18 +158,42 @@ def main() -> int:
     check("B9 PlaySound 经 Schedule 延后，不就地同步播（避免压穿小栈任务）",
           -1 < _i_sched < _i_play, f"Schedule@{_i_sched} PlaySound@{_i_play}")
 
-    # 顺序：play_tone(REMINDER) 必须出现在 ScheduleAnnounce 之前
-    i_tone = bridge.find("elder_ui_play_tone(ELDER_TONE_REMINDER)")
-    i_sched = bridge.find("ScheduleAnnounce(text)")
+    # 只看**可执行代码**：注释里提到 ScheduleAnnounce / play_tone 不算调用。
+    # 函数定义行（static void ScheduleAnnounce(...)）也不是调用点，一并剔掉，
+    # 否则下面的"配对"会把它误当成一次播报。
+    code_only = "\n".join(line for line in bridge.split("\n")
+                          if not line.lstrip().startswith(("*", "//", "/*"))
+                          and "static void ScheduleAnnounce" not in line)
+
+    # 顺序：每一处 play_tone(REMINDER) 之后都必须紧跟一次 ScheduleAnnounce。
+    #
+    # 为什么改成按**位置配对**、不钉变量名：这条断言原先写的是
+    # ScheduleAnnounce(text)，而 a85f21f 把话术改成带时段（文本内容变了，
+    # 变量名随之改成 speak），断言从此恒假。假红与恒真一样有害 —— 都会教人
+    # 忽略红灯。变量名不是产品语义，**顺序**才是：音乐先、语音后，否则音乐
+    # 盖住第一句话，老人只听得清开头。所以逐个调用点配对：对每一处 tone，
+    # 它之后必须还有一次没被前一处用掉的 ScheduleAnnounce。把两者调换顺序、
+    # 或删掉任一处播报，都配不满 ⇒ 红。
+    tone_at = [i for i in range(len(code_only))
+               if code_only.startswith("elder_ui_play_tone(ELDER_TONE_REMINDER)", i)]
+    sched_at = [i for i in range(len(code_only))
+                if code_only.startswith("ScheduleAnnounce(", i)]
+    paired = 0
+    j = 0
+    for t in tone_at:
+        while j < len(sched_at) and sched_at[j] < t:
+            j += 1
+        if j < len(sched_at):
+            paired += 1
+            j += 1
     check("B4 提醒触发时**先响音乐、再排播语音**（顺序即产品语义）",
-          -1 < i_tone < i_sched, f"play_tone@{i_tone} Schedule@{i_sched}")
+          bool(tone_at) and paired == len(tone_at),
+          f"tone@{tone_at} 配对成功={paired}/{len(tone_at)} sched@{sched_at}")
     check("B5 语音是延后播的（专用任务等音乐放完），不是同时下发",
           "xTaskCreate(AnnounceTask" in bridge
           and "vTaskDelay(pdMS_TO_TICKS(kChimeMs))" in bridge)
     # 反向要求：不许用 esp_timer 回调做这件事（默认 3.5KB 栈里跑 LVGL 会溢出，
     # 症状是随机 LoadProhibited）。只在**可执行代码**里查，注释里提到不算。
-    code_only = "\n".join(line for line in bridge.split("\n")
-                          if not line.lstrip().startswith(("*", "//", "/*")))
     check("B6 播报不用 esp_timer（3.5KB 栈里跑 LVGL 会随机崩）",
           "esp_timer_start_once" not in code_only
           and "esp_timer_create" not in code_only)

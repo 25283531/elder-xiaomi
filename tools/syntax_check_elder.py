@@ -76,6 +76,16 @@ TARGETS = {
     #    base_command() 会回退到同后缀模板（rgb.c）—— 这是脚本设计好的行为。
     "elder_clip.c": ROOT / "firmware" / "components" / "elder" / "src" / "elder_clip.c",
     "ui.c": ROOT / "firmware" / "xiaozhi" / "components" / "elder" / "src" / "ui.c",
+    # 2026-11-03 加 reminder.c：提醒状态机 + NVS 落盘（set_state / confirm_ex /
+    # 半置信复核窗口 / 合并对账）全在这一个文件里，是 elder 改动最频繁、
+    # 错一次就是「提醒不响 / 确认不落盘 / 老人按了没反应」的地方，
+    # 却一直没有编译级门禁 —— 这一轮改得最多的正是它。
+    # ⚠️ 用**注入副本**路径：compile_commands.json 里记的就是
+    #    firmware/xiaozhi/components/elder/src/reminder.c（main 编的是注入副本）。
+    #    已实测它在 compile_commands.json 里有**自己的条目**，base_command()
+    #    会优先用它那条命令，不会回退到 rgb.c 模板 —— 回退才会给出假红
+    #    （加 lcd_display.cc 时踩过：-I 集合不同，报一堆与源码无关的错）。
+    "reminder.c": ROOT / "firmware" / "xiaozhi" / "components" / "elder" / "src" / "reminder.c",
     # 2026-11-03 加 lcd_display.cc：待机熊猫删除 + 待机跑马灯（1 个 lv_image +
     # lv_anim 驱动 x）全落在这个文件里，而它恰好是**改动最频繁的"直接改上游"
     # 文件**（70/30 布局、全屏提醒、跑马灯都在这里），却一直没有任何编译级门禁。

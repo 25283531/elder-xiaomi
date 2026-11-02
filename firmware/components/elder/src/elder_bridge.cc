@@ -426,6 +426,21 @@ int s_arming_id = -1;
  * -1 = 本次上电还没播过。 */
 static int64_t s_last_announced_min = -1;
 
+/* 上一次**真正播过升级话术**的提醒分钟（= fired_due_at / 60）。
+ *
+ * 为什么必须与 s_last_announced_min 分开（2026-11-03 残留修复）：
+ *   同一条提醒的 PENDING 与 ESCALATED 用的是**同一个 fired_due_at** ——
+ *   升级只是状态变了，到期时刻不变，所以两者的 due_min 完全相同。
+ *   共用一份变量的话，8:00 播过 PENDING 之后，8:15 的升级会被判成
+ *   "这一分钟已经播过"而静默 ⇒ 「请长按按钮确认」这句永远不播，
+ *   而它正是老人唯一能自救的指令。
+ *   （"T 分钟 / T+15 分钟"是墙上时钟，不是这里用的 fired_due_at。）
+ *
+ * 这个变量的作用只有一条：3 条服药提醒同时升级时，别把 4,560ms 的
+ * confirm_hint 连播三遍（≈13.7 秒）。判据与 PENDING 一致，用提醒实例的
+ * 到期分钟而不是 time(NULL)，理由见 s_last_announced_min 的注释。 */
+static int64_t s_last_escalated_min = -1;
+
 /* 时段词（用户 2026-11-03 定义）：
  *   上午 <12:00、中午 12:00–13:59、下午 14:00–17:59、晚上 ≥18:00 */
 static const char *TimeOfDayWord(int hour)
@@ -560,7 +575,7 @@ void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
          *    的话术（每减 1 个汉字约省 0.21 秒），或动音频通路加打断（红线）。 */
         elder_ui_play_tone(ELDER_TONE_SUCCESS);
         break;
-    case ELDER_RMD_ESCALATED:
+    case ELDER_RMD_ESCALATED: {
         /* 超时升级：**不收全屏提醒**（用户明确要求"没确认就一直显示"），
          * 只换表情 + 说一句话。
          * 灯也不再改成"一直闪"——交给 elder_rgb 的 2 小时节奏，
@@ -582,6 +597,31 @@ void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
          *   非服药（喝水/运动/日程）继续播 escalated —— confirm_hint 里
          *   明说"服药确认"，对它们是错的，会让老人以为要吃错东西。 */
         elder_ui_set_state(ELDER_UI_MISSED, 0);
+
+        /* ---- 同一分钟只播一次（2026-11-03 残留修复）----
+         *
+         * 现场：老人 8:00 有「降压药」「降糖药」「喝水」三条提醒，15 分钟后
+         * 三条同时升级 ⇒ 三次 confirm_hint（4,560ms × 3 ≈ 13.7 秒）连着播。
+         * 老人等这一句"该按哪个键"已经等了 15 分钟，再排队听三遍只会更烦。
+         *
+         * 屏幕照旧**每条都切** MISSED（在去重之前就切了）：老人要知道不止一条；
+         * 声音只该有一遍。
+         *
+         * ⚠️ 判据用 fired_due_at/60，且必须用**独立**的 s_last_escalated_min，
+         *    不能复用 PENDING 那个 s_last_announced_min —— 同一条提醒的
+         *    PENDING 与 ESCALATED 共用同一个 fired_due_at，共用变量会把升级
+         *    这次判成"同分钟已播"而静默。理由见变量定义处的注释。 */
+        const int64_t esc_min =
+            (item->fired_due_at > 0) ? (item->fired_due_at / 60) : -1;
+        const bool esc_same_minute =
+            (esc_min > 0 && esc_min == s_last_escalated_min);
+        if (esc_min > 0) s_last_escalated_min = esc_min;
+        if (esc_same_minute) {
+            ESP_LOGI(TAG, "同一分钟（%lld）已播过升级提示，只切表情不出声：%s",
+                     (long long)esc_min, item->label);
+            break;
+        }
+
         if (item->type == ELDER_RMD_TYPE_MEDICINE) {
             if (!elder_clip_play(ELDER_CLIP_CONFIRM_HINT)) {
                 elder_ui_play_tone(ELDER_TONE_EXCLAMATION);
@@ -590,6 +630,7 @@ void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
             elder_ui_play_tone(ELDER_TONE_EXCLAMATION);
         }
         break;
+    }
     case ELDER_RMD_SKIPPED:
     case ELDER_RMD_HALF_EXPIRED:
         /* 这两态都是"这一次作废/跳过了" —— 引擎里已经没有待确认项，
@@ -1016,6 +1057,57 @@ extern "C" int elder_confirm_pending_medicine(void)
         return -1;
     }
     ConfirmMedicine(idx, ELDER_CFM_VOICE);
+    return 0;
+}
+
+/* 定向版：服务端大模型判断出「哪条提醒完成了」之后，带着 reminders.id
+ * （= 本地 server_id）回来确认**那一条**。
+ *
+ * 为什么需要它（2026-11-03 多药提醒改造的闭环缺口）：
+ *   长按多药提醒不再自己确认，改成进对话让服务端判断哪条日程完成。
+ *   服务端判断完如果不回灌设备，设备侧那条提醒会一直挂在 PENDING/ESCALATED
+ *   —— 屏幕和闪灯再挂 4 小时、state[] 一直停在"待确认"、NVS 里也不会记下
+ *   老人已经回应过。所以服务端按约定调
+ *   device_call("self.elder.confirm_reminder", {"server_id": id})。
+ *
+ * ⚠️ 落到的状态是 **DONE**（不是 HALF_CONFIRMED）—— 走的是
+ *    elder_reminder_confirm_server() 这条专用入口。半置信的前提是"只有
+ *    一句『吃了』、没人核实"，而这里是服务端在完整对话里问清了哪味药之后
+ *    才判定的，置信度已经够；落 HALF 会让 done_today 不置位、全屏提醒不收、
+ *    10 分钟后 HALF_EXPIRED 又什么都不上报（终态永远到不了家属端）。
+ *    但**上报方式仍是 ELDER_CFM_VOICE**：不能为了让状态变 DONE 就谎报
+ *    BUTTON —— 那会替老人编造一次他没按过的键，服务端还会把它合并成
+ *    VOICE_AND_BUTTON(5)。方式与置信度是两件事，分开表达。
+ *
+ * server_id == 0（没传 / 类型不对 / 传了 0）：**完全走旧路径**
+ *   elder_confirm_pending_medicine()。服务端某个版本没带参数时不能因此
+ *   让语音确认彻底失效 —— 宁可退化成"确认正在响铃的那条"。
+ *   注意这条旧路径**仍然是半置信**（真人只说了句"吃了"），这是刻意的。
+ *
+ * 确认方式固定 ELDER_CFM_VOICE：服务端认定这是语音确认，它那套
+ * 「先 VOICE 后 BUTTON 合并成 VOICE_AND_BUTTON(5)」的逻辑依赖这个值。
+ * 改成 BUTTON 会让"老人自己按的"和"跟小智说的"再也分不开。
+ *
+ * 返回：0 = 已确认；-1 = 本地没有正在等确认的该条（服务端收到 false，
+ *       据此知道设备状态没同步上）。 */
+extern "C" int elder_confirm_reminder_by_server_id(uint32_t server_id)
+{
+    if (server_id == 0) {
+        return elder_confirm_pending_medicine();
+    }
+
+    esp_err_t rc = elder_reminder_confirm_server(server_id, ELDER_CFM_VOICE);
+    if (rc != ESP_OK) {
+        ESP_LOGW(TAG, "定向语音确认失败（server_id=%lu, rc=%d）",
+                 (unsigned long)server_id, (int)rc);
+        return -1;
+    }
+
+    /* 收尾与 ConfirmMedicine() 保持一致：状态机已经由 reminder.c 改完
+     * （含 flush 落盘），这里只负责关掉确认窗、清掉长按待确认标记 ——
+     * 否则 #1 会继续按"待确认"呼吸，屏幕上还留着一条已经确认过的提醒。 */
+    elder_input_close_confirm_window();
+    s_arming_id = -1;
     return 0;
 }
 

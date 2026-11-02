@@ -24,7 +24,9 @@
 // >>> BEGIN elder-companion overlay（由本 fork 维护，勿随上游合并覆盖）>>>
 // 老人服药确认：由 elder 组件导出（定义在 components/elder/src/elder_bridge.cc）。
 // 项目里 elder 没有对外头文件，沿用 main.cc 的裸 extern "C" 声明模式。
-extern "C" int elder_confirm_pending_medicine(void);
+// 2026-11-03 起只有一个入口：带 server_id 的定向确认，server_id == 0 时
+// 内部退化成"确认当前正在响铃的那条"（改造前的行为）。
+extern "C" int elder_confirm_reminder_by_server_id(uint32_t server_id);
 /* 需求 7：进入待机（关收音、重开唤醒词）。服务端在念完告别语后调它。 */
 extern "C" void elder_enter_standby(void);
 /* 2026-10-29：叫设备立刻同步一次（不等下一个心跳周期）。
@@ -147,17 +149,31 @@ void McpServer::AddCommonTools() {
     // 返回 false 不是错误：老人可能只是顺口说「吃过了」，此时没有待确认
     // 提醒，工具如实返回 false，让 LLM 用一句话圆过去即可。
     AddTool("self.elder.confirm_reminder",
-        "Confirm that the elderly user has just completed the current reminder "
-        "(for example, has taken their medicine).\n"
+        "Confirm that the elderly user has completed a reminder (for example, "
+        "has taken their medicine).\n"
         "Call this tool when the user says things like \"我吃过了\", \"吃完了\", "
-        "\"已经吃了\", \"药吃了\" in response to a medicine reminder.\n"
+        "\"已经吃了\", \"药吃了\" in response to a reminder.\n"
+        "Parameter server_id: the id of the reminder to confirm (the server's "
+        "reminders.id). Pass 0 or omit it to confirm the reminder that is "
+        "currently ringing on the device.\n"
         "Return:\n"
-        "  true if a pending reminder was confirmed; false if there is nothing "
-        "pending (in that case just reply naturally, do not report an error).",
-        PropertyList(),
+        "  true if that reminder was confirmed; false if the device has no such "
+        "reminder waiting for confirmation (in that case just reply naturally, "
+        "do not report an error).",
+        /* server_id 必须是**可选**（带默认值 0）：mcp_server.cc 的 DoToolCall
+         * 只在"没有默认值且没传"时报 Missing valid argument。写成必需参数的话，
+         * 服务端任何一个没带参数的旧调用点都会被设备拒绝，语音确认直接失效。
+         * 也刻意不给 min/max —— Property::set_value 越界会抛异常并回错误，
+         * 而这里"取不到/取到怪值就当 0"才是安全行为（走旧路径）。 */
+        PropertyList({
+            Property("server_id", kPropertyTypeInteger, 0)
+        }),
         [](const PropertyList& properties) -> ReturnValue {
-            (void)properties;
-            return elder_confirm_pending_medicine() == 0;
+            /* 缺失或类型不对时保留默认值 0（DoToolCall 不会覆盖），
+             * 负数兜底成 0 —— 都表示"确认当前正在响铃的那条"，即改造前的行为。 */
+            int sid = properties["server_id"].value<int>();
+            if (sid < 0) sid = 0;
+            return elder_confirm_reminder_by_server_id((uint32_t)sid) == 0;
         });
 
     /* 需求 7：待机。
