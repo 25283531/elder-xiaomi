@@ -66,6 +66,27 @@ function kindText(r: Reminder) {
   }
 }
 
+/**
+ * 一条提醒的「用药」行文字。
+ *
+ * 三种情况：
+ *   · 有 medicines → 逐味拼：「降压药 1片 · 二甲双胍 0.5g」
+ *   · medicines 空/不存在（2026-11 之前的老数据）→ 回退老的 dose
+ *   · 两者都空 → 返回空串，模板 v-if 不渲染这一行
+ *
+ * 为什么端侧要回退而不是等后端派生：列表接口可能来自缓存/老版本服务端，
+ * 拿不到 medicines 时直接不显示，家属会以为「这条提醒没设剂量」。
+ */
+function medText(r: Reminder) {
+  const list = (r.medicines || []).filter(m => (m?.name || '').trim())
+  if (list.length) {
+    return list
+      .map(m => ((m.dose || '').trim() ? `${m.name.trim()} ${m.dose.trim()}` : m.name.trim()))
+      .join(' · ')
+  }
+  return (r.dose || '').trim()
+}
+
 /** 保留本地名 `fmt`：模板已在用，改名要连带改模板。统一走北京时间。 */
 function fmt(v?: string | null) {
   return fmtDateTime(v)
@@ -208,6 +229,11 @@ async function onAdd() {
       rtype,
       schedule_kind: 1,
       times_of_day: ['08:00'],
+      // dose 和 medicines 都显式给空值：草稿字段清单里缺字段时，编辑页
+      // load() 拿到的是 undefined，medicines 少了兜底就会让 v-for 抛错。
+      // 这里给全，编辑页就有确定的数据形状。
+      dose: '',
+      medicines: [],
       require_confirm: true,
       confirm_methods: ['voice', 'button'],
       enabled: true,
@@ -288,8 +314,8 @@ onShow(() => { refresh() })
             </view>
             <view class="sub">{{ typeNames[r.rtype] }} · {{ kindText(r) }}</view>
             <view class="sub times">时间 {{ (r.times_of_day || []).join('  ') }}</view>
-            <view v-if="r.dose" class="sub">
-              剂量 {{ r.dose }}
+            <view v-if="medText(r)" class="sub">
+              用药 {{ medText(r) }}
             </view>
             <view class="sub">下次 {{ fmt(r.next_fire_at) }}</view>
             <view class="row ops">

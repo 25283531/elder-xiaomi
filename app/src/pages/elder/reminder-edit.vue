@@ -6,9 +6,9 @@
 
 <script setup lang="ts">
 import { onLoad } from '@dcloudio/uni-app'
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { createReminder, listReminders, updateReminder } from '@/api/elder'
-import type { Reminder } from '@/api/elder'
+import type { MedicineItem, Reminder } from '@/api/elder'
 
 const devicePk = ref(0)
 const editId = ref(0)
@@ -40,6 +40,7 @@ const form = ref<Partial<Reminder>>({
   start_date: '',
   end_date: '',
   dose: '',
+  medicines: [],
   require_confirm: true,
   repeat_interval_min: 10,
   repeat_times: 3,
@@ -51,6 +52,39 @@ const form = ref<Partial<Reminder>>({
 const timesText = ref('08:00')
 const monthText = ref('')
 const methods = ref<Record<string, boolean>>({ voice: true, button: true, app: false })
+
+/** 服务端限制：一条提醒最多 4 种药。超了接口会 422，所以端侧先拦住。 */
+const MAX_MEDICINES = 4
+
+/** 药名/剂量上限，跟服务端字段长度一致，输入框 maxlength 也用这两个值 */
+const NAME_MAX = 32
+const DOSE_MAX = 64
+
+/** 已经加满 4 种药 —— 用来把「+ 添加一种药」置灰 */
+const medFull = computed(() => (form.value.medicines || []).length >= MAX_MEDICINES)
+
+/**
+ * 加一行空药。
+ *
+ * 为什么**允许删到 0 行**（而不是至少留 1 行）：
+ * 提醒不只是吃药 —— 「喝水」「散步」「复诊」这些日程提醒本来就没有药。
+ * 强制留一行空药，家属每次建日程都得手动删一次，删不掉就会存进一条
+ * 药名空白的脏数据；服务端本身也允许空数组，所以这里就让它能空。
+ */
+function addMedicine() {
+  if (medFull.value) {
+    uni.showToast({ title: `最多 ${MAX_MEDICINES} 种药`, icon: 'none' })
+    return
+  }
+  if (!form.value.medicines)
+    form.value.medicines = []
+  form.value.medicines.push({ name: '', dose: '' })
+}
+
+/** 删掉第 i 行。删到 0 行也允许（见 addMedicine 的注释）。 */
+function removeMedicine(i: number) {
+  form.value.medicines?.splice(i, 1)
+}
 
 function pickType(e: any) { form.value.rtype = Number(e.detail.value) }
 function pickKind(e: any) { form.value.schedule_kind = Number(e.detail.value) }
@@ -72,7 +106,19 @@ async function load() {
   const all = await listReminders(devicePk.value)
   const hit = all.find(x => x.id === editId.value)
   if (!hit) return
-  form.value = { ...hit }
+  // ⚠️ 两个坑，都在这一句里解决：
+  // 1) 老数据（2026-11 之前的行）没有 medicines 字段，接口返回 undefined，
+  //    模板里 v-for="(m, i) in form.medicines" 会直接抛错白屏 —— 兜成 []。
+  // 2) { ...hit } 是浅拷贝，medicines 数组仍是 listReminders 缓存里的同一个
+  //    实例；用户在编辑页改药名会顺手改掉缓存，取消返回后列表显示的是改过的值。
+  //    所以每一项也重新建对象。
+  form.value = {
+    ...hit,
+    medicines: (hit.medicines || []).map((m: MedicineItem) => ({
+      name: m?.name || '',
+      dose: m?.dose || '',
+    })),
+  }
   timesText.value = (hit.times_of_day || []).join(', ')
   monthText.value = (hit.month_days || []).join(',')
   methods.value = {
@@ -100,8 +146,34 @@ async function save() {
     }
   }
 
+  // ---- 药物列表清洗 ----
+  // 规则（三条都是为了「不静默丢数据」）：
+  //   · 药名和剂量都空  → 直接丢掉。这是「加了行但没填」的残留，不该存进库。
+  //   · 有药名          → 保留（剂量可以为空，只吃一种药不写剂量很常见）。
+  //   · **只有剂量没药名** → 拦下来报错，不提交。直接丢掉等于把用户填的
+  //     "1片" 悄悄吞了，家属会以为保存成功；直接存下去又会在列表里显示成
+  //     一条没有名字的药，看着像 bug。让用户补个药名最省事。
+  const medicines: MedicineItem[] = []
+  const rows = f.medicines || []
+  for (let i = 0; i < rows.length; i++) {
+    const name = (rows[i]?.name || '').trim()
+    const dose = (rows[i]?.dose || '').trim()
+    if (!name && !dose) continue
+    if (!name) {
+      uni.showToast({ title: `第 ${i + 1} 种药只填了剂量，请补药名`, icon: 'none' })
+      return
+    }
+    medicines.push({ name: name.slice(0, NAME_MAX), dose: dose.slice(0, DOSE_MAX) })
+  }
+  if (medicines.length > MAX_MEDICINES) {
+    uni.showToast({ title: `最多 ${MAX_MEDICINES} 种药`, icon: 'none' })
+    return
+  }
+
   const payload: Partial<Reminder> = {
     ...f,
+    // 覆盖掉 ...f 里那份未清洗的 medicines
+    medicines,
     times_of_day: times,
     month_days: monthText.value.split(/[,，\s]+/).filter(Boolean).map(Number),
     confirm_methods: Object.keys(methods.value).filter(k => methods.value[k]),
@@ -145,8 +217,26 @@ onLoad((options: any) => {
       <text class="label">播报文案（留空则读标题）</text>
       <input v-model="form.speak_text" class="input" placeholder="该吃降压药了，一片" />
 
-      <text class="label">剂量 / 备注</text>
+      <text class="label">药物（可加多种，每种带自己的剂量）</text>
+      <!-- key 用下标：这是**可增删的编辑行**，用下标做 key 在删中间一行时会复用
+           组件，但 v-model 绑定的是 m.name / m.dose 本身，重新渲染时 value 会被
+           重新 patch 成新一行的值，不会出现"框里留着上一行文字"。 -->
+      <view v-for="(m, i) in (form.medicines || [])" :key="i" class="med-row">
+        <input v-model="m.name" class="input med-name" :maxlength="NAME_MAX" placeholder="药名，如：降压药" />
+        <input v-model="m.dose" class="input med-dose" :maxlength="DOSE_MAX" placeholder="剂量，如：1 片" />
+        <text class="med-del" @click="removeMedicine(i)">删除</text>
+      </view>
+      <view class="med-add-wrap">
+        <text class="med-add" :class="medFull ? 'off' : ''" @click="addMedicine">+ 添加一种药</text>
+        <text v-if="medFull" class="tip med-full">最多 4 种药</text>
+      </view>
+
+      <!-- 老字段保留：2026-11 之前的提醒把药名塞在「标题」、剂量塞在 dose，
+           老数据还在库里跑，不能把输入框摘掉 —— 摘了家属就改不了老提醒的剂量。
+           标签明确写成「备注 / 老剂量」，避免有人以为这里是新药列表的剂量。 -->
+      <text class="label">备注 / 老剂量</text>
       <input v-model="form.dose" class="input" placeholder="1 片，饭后" />
+      <view class="tip">新数据请用上面的药物列表；这里留给老提醒，也当整条提醒的备注用。</view>
 
       <text class="label">类型</text>
       <picker mode="selector" :range="typeOptions" :value="form.rtype" @change="pickType">
@@ -234,6 +324,17 @@ onLoad((options: any) => {
 .chip { padding: 10rpx 24rpx; margin: 8rpx 12rpx 0 0; border-radius: 28rpx; background: #f1f3f6; color: #6b7280; font-size: 26rpx; }
 .chip.on { background: #2563eb; color: #fff; }
 .tip { font-size: 22rpx; color: #8a8f99; margin-top: 12rpx; }
+/* 药物行：药名弹性占满，剂量固定宽度（flex:none 防止被药名挤扁），删除按钮跟在后面。
+   min-width:0 是给 flex 子项兜底的 —— uni-app 的 input 默认 width:100%，
+   不加这一条时内容一长会把剂量框挤出屏幕。 */
+.med-row { display: flex; flex-direction: row; align-items: center; margin-bottom: 12rpx; }
+.med-name { flex: 1; min-width: 0; margin-right: 12rpx; }
+.med-dose { width: 200rpx; flex: none; margin-right: 12rpx; }
+.med-del { font-size: 24rpx; color: #d93025; padding: 12rpx 8rpx; flex: none; }
+.med-add-wrap { display: flex; flex-direction: row; align-items: center; margin-top: 4rpx; }
+.med-add { font-size: 26rpx; color: #2563eb; padding: 12rpx 0; }
+.med-add.off { color: #c0c4cc; }
+.med-full { margin-top: 0; margin-left: 16rpx; }
 .notice { background: #fff7e6; border: 1rpx solid #ffd591; }
 .notice-t { display: block; font-size: 26rpx; font-weight: 600; color: #874d00; }
 .notice-s { display: block; font-size: 22rpx; color: #ad6800; margin-top: 8rpx; line-height: 1.6; }

@@ -35,6 +35,19 @@ export interface ActivationCode {
   device_id: string | null
 }
 
+/**
+ * 一条提醒里的**一味药**（2026-11 起支持一条提醒带多种药）。
+ *
+ * 服务端约束：`name` ≤ 32 字符、`dose` ≤ 64 字符、一条提醒**最多 4 项**、
+ * 允许空数组。老的 `title` / `dose` 字段仍在，服务端读的时候若 `medicines`
+ * 为空而 `dose` 非空会自动派生出 1 项 —— 所以端侧**不做兼容派生**，
+ * 只在显示时做「空就回退老字段」的兜底。
+ */
+export interface MedicineItem {
+  name: string
+  dose: string
+}
+
 export interface Reminder {
   id: number
   device_id: number
@@ -50,6 +63,13 @@ export interface Reminder {
   start_date: string | null
   end_date: string | null
   dose: string
+  /**
+   * 这条提醒要吃的药（每味药带自己的剂量）。
+   *
+   * ⚠️ 老数据里这个字段**不存在**（服务端老行没有该列 / 接口老版本不返回），
+   * 所以类型上按数组写、取值处必须 `|| []` 兜底，不要直接 `v-for`。
+   */
+  medicines: MedicineItem[]
   require_confirm: boolean
   repeat_interval_min: number
   repeat_times: number
