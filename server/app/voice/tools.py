@@ -103,6 +103,13 @@ TOOL_DEFS: list[dict[str, Any]] = [
                             "老人原话里已带重复词时留空即可。"
                         ),
                     },
+                    "dose": {
+                        "type": "string",
+                        "description": (
+                            "老人提到的剂量，如「一片」「半片」「两粒」，没说就留空。"
+                            "**只填剂量本身**，不要把药名塞进来 —— 药名属于 title。"
+                        ),
+                    },
                 },
                 "required": ["title", "when"],
             },
@@ -845,10 +852,64 @@ def _find_reminders(db: Any, device_pk: int, keyword: str) -> list[models.Remind
     return [r for r in rows if kw in (r.title or "")]
 
 
+#: 提醒类别的中文名（``models.ReminderType``）。给 LLM 看**中文**而不是 0/1/2：
+#: 只丢一个整数过去，模型既不会念给老人听，也分不清「服药」和「喝水」。
+_RTYPE_LABELS = {
+    int(models.ReminderType.MEDICINE): "服药",
+    int(models.ReminderType.SCHEDULE): "日程",
+    int(models.ReminderType.WATER): "喝水",
+    int(models.ReminderType.EXERCISE): "运动",
+    int(models.ReminderType.CUSTOM): "自定义",
+}
+
+
+def _medicines_of(r: models.Reminder) -> list[dict[str, str]]:
+    """这条提醒的药 + 剂量（**含老数据派生**），与 ``schemas.ReminderOut`` 同口径。
+
+    为什么这里再实现一遍派生而不是复用 Pydantic：语音链路直接吃 ORM 行
+    （``_list_reminders`` / ``_describe_reminder`` 都不构造 ReminderOut），
+    为了拿这个字段去 ``model_validate`` 一整份 schema 是舍近求远。
+    ⚠️ 口径必须与 ``schemas.ReminderOut._derive_medicines`` **逐字一致**
+    （同样是"medicines 为空且 dose 非空 ⇒ [{title, dose}]"、同样截断 32/64），
+    否则老人从语音里听到的药和网页上看到的药会不一样。
+    """
+    items = [{"name": str(m.get("name") or "")[:32],
+              "dose": str(m.get("dose") or "")[:64]}
+             for m in (r.medicines or []) if isinstance(m, dict)]
+    items = [m for m in items if m["name"]]
+    if items:
+        return items
+    dose = (r.dose or "").strip()
+    name = (r.title or "").strip()[:32]
+    if dose and name:
+        return [{"name": name, "dose": dose[:64]}]
+    return []
+
+
+def _medicine_phrase(r: models.Reminder) -> str:
+    """把药 + 剂量拼成一句话（给 LLM 念）。没有剂量时返回空串。
+
+    * 一味药 → ``剂量 1片``（药名已经在 title 里，重复念一遍老人会觉得啰嗦）
+    * 多味药 → ``药 降压药 1片、二甲双胍 0.5g``（**必须逐味列出**：老人要听的
+      就是"今天吃哪几种、各吃多少"，只说"两种药"等于没说）
+    """
+    items = _medicines_of(r)
+    if not items:
+        return ""
+    if len(items) == 1:
+        dose = items[0]["dose"]
+        return f"剂量 {dose}" if dose else ""
+    return "药 " + "、".join(
+        f"{m['name']} {m['dose']}".strip() for m in items)
+
+
 def _describe_reminder(r: models.Reminder) -> str:
     """给 LLM 看的一行描述（含下次触发时间，让它能念给老人）。"""
     nxt = next_occurrence(r)
     parts = [f"id={r.id}", f"「{r.title}」"]
+    meds = _medicine_phrase(r)
+    if meds:
+        parts.append(meds)
     if not r.enabled:
         parts.append("已暂停")
     if nxt is not None:
@@ -1532,6 +1593,13 @@ def _create_reminder(db: Any, device_pk: int, args: dict[str, Any]) -> dict[str,
         month_days=parsed.month_days,
         interval_days=parsed.interval_days,
         once_date=parsed.once_date,
+        # 剂量走**老字段** ``dose``（一条提醒一味药），不塞 medicines：
+        # 老人一句「提醒我八点吃降压药一片」只有一味药，写 medicines 反而
+        # 让"老字段 vs 新字段"出现两份真源。出参由 schemas.ReminderOut 派生，
+        # 网页 / APP / 设备看到的 medicines 与这里逐字一致。
+        # 截到 64：与 schemas.MedicineItem.dose 的上限对齐，避免一条超长的
+        # 模型输出让派生出来的 MedicineItem 校验失败（那是读路径，会 500）。
+        dose=str(args.get("dose") or "").strip()[:64],
         require_confirm=True,
         enabled=True,
     )
@@ -1580,9 +1648,16 @@ def _list_reminders(db: Any, device_pk: int) -> dict[str, Any]:
     if not rows:
         return {"ok": True, "count": 0, "reminders": [],
                 "message": "老人当前没有任何提醒，如实告知"}
+    # 每条都带上 dose / rtype / medicines：以前只给 {id,title,enabled,next_fire_at}，
+    # 模型**完全看不到**剂量和类别 —— 老人问「我早上吃几片药」，它只能瞎猜或者
+    # 说"不知道"，而这恰恰是服药提醒里最要命的那部分信息。
     return {"ok": True, "count": len(rows),
             "reminders": [{"id": int(r.id), "title": r.title,
                            "enabled": bool(r.enabled),
+                           "rtype": int(r.rtype),
+                           "rtype_label": _RTYPE_LABELS.get(int(r.rtype), ""),
+                           "dose": r.dose or "",
+                           "medicines": _medicines_of(r),
                            "next_fire_at": (next_occurrence(r).isoformat()
                                             if next_occurrence(r) else None)}
                           for r in rows],

@@ -96,7 +96,7 @@ def _display_name(actor: Any) -> str:
 _SNAPSHOT_FIELDS: tuple[str, ...] = (
     "title", "speak_text", "rtype", "schedule_kind", "times_of_day",
     "weekdays", "month_days", "interval_days", "once_date", "start_date",
-    "end_date", "dose", "require_confirm", "repeat_interval_min",
+    "end_date", "dose", "medicines", "require_confirm", "repeat_interval_min",
     "repeat_times", "escalate_after_min", "confirm_methods", "enabled", "tz",
 )
 

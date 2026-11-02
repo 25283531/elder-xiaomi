@@ -605,7 +605,27 @@ class Reminder(Base):
     end_date: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     # 服药剂量等补充信息，展示用
+    #
+    # ⚠️ 这是**老字段**：一条提醒只挂一味药时用它。2026-11-02 起同一条提醒
+    # 可以挂多味药（见下面的 ``medicines``），读取时若 ``medicines`` 为空而
+    # 本字段非空，由 ``schemas.ReminderOut`` 派生出 ``[{name: title, dose}]``。
+    # **不要**删这一列，也不要写回填脚本：存量行靠派生就够，回填只会多一次
+    # 改数据的机会（改错了没有任何回滚脚本）。
     dose: Mapped[str] = mapped_column(String(128), default="")
+
+    # 同一条提醒的多味药 + 各自剂量，如
+    # ``[{"name": "降压药", "dose": "1片"}, {"name": "二甲双胍", "dose": "0.5g"}]``
+    # 约束（由 ``schemas.MedicineItem`` 执行）：name ≤ 32、dose ≤ 64、最多 4 项。
+    #
+    # 为什么是 JSON 列而不是 ``reminder_medicines`` 子表：
+    #   1. ``routers/reminders.create_reminder`` 是 ``Reminder(**payload.model_dump())``
+    #      **整包展开**进 ORM。子表需要在 ``ReminderOut`` 上加计算字段，而
+    #      ``**data`` 展开遇到非列字段会 500（``TypeError: invalid keyword argument``）。
+    #   2. ``routers/device_api`` 每 5 分钟一次的心跳直接
+    #      ``ReminderOut.model_validate(r)`` 整包下发。JSON 列天然跟着走；
+    #      子表会变成 N+1（一台设备 N 条规则 = N 次 join）。
+    #   3. ``times_of_day``（本类上方）本来就是 JSON 列，写法有现成先例。
+    medicines: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
 
     # ---- 确认与升级策略 ----
     require_confirm: Mapped[bool] = mapped_column(Boolean, default=True)

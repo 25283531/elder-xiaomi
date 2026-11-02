@@ -370,6 +370,17 @@ NEW_COLUMNS: Final[list[tuple[str, str, str, str]]] = [
     ("reminders", "deleted_at", "DATETIME", "DATETIME NULL"),
     ("reminders", "deleted_by", "INTEGER", "INT NULL"),
     ("reminders", "deleted_via", "VARCHAR(16) DEFAULT ''", "VARCHAR(16) DEFAULT ''"),
+    # ---- reminders：一条提醒挂多味药（2026-11-02）----
+    # JSON 数组，如 [{"name":"降压药","dose":"1片"},{"name":"二甲双胍","dose":"0.5g"}]。
+    # SQLite 侧**必须**写 DEFAULT '[]'：老行补列后读出空数组，语义正是
+    # 「没有多药信息」，读取端由 schemas.ReminderOut 从老字段 title/dose 派生，
+    # 不需要任何回填。漏 DEFAULT 的话老行读出 NULL，序列化成 medicines=null，
+    # 前端 (r.medicines||[]) 虽然能兜住，但「空数组」和「未知」就混成一个值了。
+    # MySQL 的 JSON 列**不允许带 DEFAULT**（见本清单开头），只能留空由读取端兜。
+    #
+    # ⚠️ 这一条漏登记 = 生产库永远没有这一列：本仓没有 Alembic，
+    #    db.create_all() 只建**缺失的表**，绝不给已存在的表加列。
+    ("reminders", "medicines", "TEXT DEFAULT '[]'", "JSON"),
     # ---- devices：已配网设备「改 WiFi」（2026-10-30，契约见 _wifi-spec.md）----
     # 前四列都带 DEFAULT：存量设备补列后读出 0 / '' / '' / ''，语义正是
     # 「从未改过 WiFi」，不需要回填。**漏 DEFAULT 就会 NULL 炸序列化**，

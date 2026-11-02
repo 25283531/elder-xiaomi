@@ -1059,6 +1059,23 @@ class HomeSummaryOut(ORMBase):
 
 
 # ============================================================ 提醒
+class MedicineItem(BaseModel):
+    """一条提醒里的一味药。
+
+    为什么单独一个类而不是裸 ``dict``：``ReminderIn`` 会被 ``model_dump()``
+    整包展开成 ``models.Reminder(**data)``，裸 dict 完全没有长度约束 ——
+    前端一个超长串就能把 128 字宽的展示位撑爆，而且 4 味药的上限也无处可写。
+    """
+
+    name: str = Field(max_length=32)
+    dose: str = Field(default="", max_length=64)
+
+
+#: 一条提醒最多挂几味药。写在这里而不是只写在前端：前端可以绕过（直接打 API），
+#: 而"最多 4 味"是产品约束（老人一次吃超过 4 种药，该拆成多条提醒分时段）。
+MAX_MEDICINES = 4
+
+
 class ReminderIn(ORMBase):
     title: str = Field(max_length=128)
     speak_text: str = ""
@@ -1071,7 +1088,17 @@ class ReminderIn(ORMBase):
     once_date: str | None = None
     start_date: str | None = None
     end_date: str | None = None
-    dose: str = ""
+    #: 老字段（一条提醒一味药）。**保留**：存量行还在用它，且旧版 APK 只会发它。
+    #: 上限与 ``models.Reminder.dose`` 的 ``String(128)`` 对齐 —— 以前这里没有
+    #: max_length，超长串能一路写进列里（SQLite 不校验长度），再读出来就把
+    #: 列表页的布局顶歪。
+    dose: str = Field(default="", max_length=128)
+    #: 多味药 + 各自剂量。空数组 = 没有多药信息（老数据 / 旧版客户端）。
+    #: 上限 4 味：产品约束，写在这里而不是只写在前端 —— 前端可以绕过
+    #: （直接打 API），只在前端拦等于没拦。超限由 Pydantic 抛 422。
+    #: 读取侧的派生见 :class:`ReminderOut` 的 ``_derive_medicines``。
+    medicines: list[MedicineItem] = Field(default_factory=list,
+                                          max_length=MAX_MEDICINES)
     require_confirm: bool = True
     repeat_interval_min: int = 10
     repeat_times: int = 3
@@ -1093,6 +1120,19 @@ class ReminderIn(ORMBase):
             if parse_hhmm(t) is None:
                 raise ValueError(f"时间格式非法: {t}，应为 HH:MM")
         return v
+
+    @field_validator("medicines", mode="before")
+    @classmethod
+    def _none_medicines_to_empty(cls, v: Any) -> Any:
+        """NULL → 空数组。**读路径的救命垫**，不是宽容。
+
+        老库补列时 SQLite 拿到 ``'[]'``（DDL 里带了 DEFAULT），但 **MySQL 的
+        JSON 列不允许带 DEFAULT**（见 ``schema_patch`` 开头）—— 补完列老行
+        读出的是 ``NULL``。而 ``list[MedicineItem]`` 不接受 None：校验在
+        **读**路径上（``ReminderOut.model_validate(r)``）抛错 ⇒ 这条提醒
+        ``GET`` 500，设备心跳整包 500（一条坏行 = 整台设备一条提醒都同步不到）。
+        """
+        return v if v is not None else []
 
     @field_validator("tz")
     @classmethod
@@ -1147,6 +1187,56 @@ class ReminderOut(ReminderIn):
     #: 已删除标记（前端加「已删除」标签用）。由 router 从 deleted_at 推导，
     #: **不是列** —— 派生值存列就多了一份会漂移的真源。
     is_deleted: bool = False
+
+    #: ⚠️ **读路径刻意不加 max_length**（覆盖父类的 ``Field(max_length=128)``）。
+    #: 父类那条约束要拦的是「**即将写进库**的超长串」（这是本次补的洞）；
+    #: 存量行是另一回事：SQLite 不校验 VARCHAR 长度，改之前 API 也没拦，
+    #: 所以生产库里**可能**已经躺着 200 字的 dose。带着 max_length 去
+    #: ``model_validate`` 一条存量行 = 抛 ValidationError ⇒ 这条提醒 GET 500、
+    #: 设备心跳整包 500（一条坏行让整台设备一条提醒都同步不到）。
+    #: 这与 ``routers/reminders._reject_once_without_date`` 的分层原则同源：
+    #: 只该拦入参的约束不能挂在会被出参复用的模型上。
+    #: 超长值在这里不丢：派生出来的 ``MedicineItem.dose`` 会截到 64。
+    dose: str = ""
+
+    @model_validator(mode="after")
+    def _derive_medicines(self) -> ReminderOut:
+        """老数据兼容：``medicines`` 为空而 ``dose`` 非空 ⇒ ``[{title, dose}]``。
+
+        为什么要派生而不是写回填脚本
+        ----------------------------
+        存量行只有 ``title`` + ``dose`` 两列。回填要 UPDATE 真实业务列，
+        而本仓**没有 Alembic、没有回滚脚本** —— 回填错了只能手工救。
+        派生是纯读取期行为，零风险，且"老数据长什么样"这件事本身如实保留。
+
+        为什么放在 ``ReminderOut`` 而不是每个 router 里各写一遍
+        -----------------------------------------------------
+        出参有三条**互不相干**的路径，而且都不经过同一个函数：
+          1. 网页 / APP：``GET /api/reminders``（``_with_next`` → 本类）；
+          2. 设备心跳：``routers/device_api`` 每 5 分钟一次
+             ``ReminderOut.model_validate(r)``；
+          3. 语音链路：``voice/tools._list_reminders``（自己拼 dict）。
+        写在 router 里必然漏一处，而漏的那一处**不会报错** —— 只会让"某一端
+        看不到剂量"，属于只有用户投诉才会发现的故障。挂在 model 上则所有
+        ``model_validate`` 路径自动一致。
+
+        ⚠️ 这里**必须截断**，不能直接 ``MedicineItem(name=self.title, ...)``：
+        ``title`` 上限 128，而 ``MedicineItem.name`` 上限 32。一条 40 字的
+        存量标题会让本校验器抛 ``ValidationError``，而它跑在**读**路径上
+        （``model_validate``）—— 后果不是"少显示剂量"，是这条提醒
+        ``GET`` 500、设备心跳整包 500（一台设备一条坏行 = 全部提醒同步不到）。
+        截断只影响这份**派生视图**，``title`` 本身仍完整返回，信息不丢。
+        """
+        if self.medicines:
+            return self
+        dose = (self.dose or "").strip()
+        if not dose:
+            return self
+        name = (self.title or "").strip()[:32]
+        if not name:
+            return self
+        self.medicines = [MedicineItem(name=name, dose=dose[:64])]
+        return self
 
 
 class ReminderAuditOut(ORMBase):
