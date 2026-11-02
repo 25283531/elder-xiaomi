@@ -608,7 +608,9 @@ static int32_t ordinal_from_iso_date(const char *s)
 }
 
 static void parse_reminders(cJSON *root, elder_rmd_item_t *out,
-                            elder_rmd_when_t *when_out, uint8_t *out_count)
+                            elder_rmd_when_t *when_out,
+                            uint8_t *med_counts, elder_med_name_t *med_names,
+                            uint8_t *out_count)
 {
     uint8_t n = 0;
     /* 服务端这次**想要**下发多少条（把每条规则的 times_of_day 展开之后）。
@@ -638,6 +640,15 @@ static void parse_reminders(cJSON *root, elder_rmd_item_t *out,
         cJSON *jstart = cJSON_GetObjectItem(r, "start_date");
         cJSON *jend = cJSON_GetObjectItem(r, "end_date");
         cJSON *jcreated = cJSON_GetObjectItem(r, "created_at");
+        /* 2026-11-03 新增：多药提醒。服务端 ReminderOut 里 medicines 是
+         * [{name,dose}] 数组（最多 4 味，见 schemas.py 的 MAX_MEDICINES）。
+         *
+         * 为什么只取"长度 + 第一味药名"：设备侧只用来判断「这条提醒是不是
+         * 多药」（>1 味 ⇒ 长按后进对话问"您吃的是哪种药"），以及在只有
+         * 一味时把药名念出来。**哪一味吃了**由服务端大模型判断，固件不猜。
+         * 把整份药单搬进 RAM 既没必要，也会把 ELDER_MED_NAME_MAX 的预算
+         * 乘上 4 倍。 */
+        cJSON *jmed = cJSON_GetObjectItem(r, "medicines");
 
         if (!cJSON_IsNumber(jid)) continue;
         if (cJSON_IsBool(jenabled) && !cJSON_IsTrue(jenabled)) continue;
@@ -693,6 +704,32 @@ static void parse_reminders(cJSON *root, elder_rmd_item_t *out,
 
         const char *title = cJSON_IsString(jtitle) ? jtitle->valuestring : "提醒";
 
+        /* 药数与第一味药名 —— 同一规则展开出的多条 item 共用同一份。
+         *
+         * 只认数组长度与 [0].name：dose 不取（设备侧不念剂量，念错剂量比
+         * 不念更危险），下标 1..3 的药名也不取（判断"吃了哪一味"是服务端
+         * 大模型的职责，固件只负责把问题问出口）。
+         * 字段缺失/类型不对一律按 0 处理 —— 0 的语义是「未知」，长按会走
+         * 老的「直接确认」路径，绝不会因为解析失败让老人确认不了。 */
+        uint8_t med_cnt = 0;
+        char med_first[ELDER_MED_NAME_MAX + 1] = "";
+        if (cJSON_IsArray(jmed)) {
+            int msz = cJSON_GetArraySize(jmed);
+            if (msz > 255) msz = 255;          /* counts 是 uint8_t，防溢出 */
+            if (msz > 0) {
+                med_cnt = (uint8_t)msz;
+                cJSON *m0 = cJSON_GetArrayItem(jmed, 0);
+                cJSON *jname = cJSON_IsObject(m0)
+                                   ? cJSON_GetObjectItem(m0, "name") : NULL;
+                if (cJSON_IsString(jname) && jname->valuestring[0]) {
+                    /* 服务端 name 最长 32 **字符**（≤96 字节），缓冲区 128 字节，
+                     * 正常数据不会被截断。这里仍然用 snprintf：万一历史脏数据
+                     * 超长，截断也比越界安全。 */
+                    snprintf(med_first, sizeof(med_first), "%s", jname->valuestring);
+                }
+            }
+        }
+
         /* 展开 times_of_day */
         if (cJSON_IsArray(jtimes) && cJSON_GetArraySize(jtimes) > 0) {
             cJSON *t = NULL;
@@ -722,6 +759,9 @@ static void parse_reminders(cJSON *root, elder_rmd_item_t *out,
                 snprintf(it->label, sizeof(it->label), "%s", title);
                 /* 同一规则展开出的多条 item 共用同一份排期 */
                 when_out[n] = w;
+                /* 药数/药名同理：同一规则的所有时刻挂的是同一批药 */
+                med_counts[n] = med_cnt;
+                memcpy(med_names[n], med_first, sizeof(med_names[n]));
                 n++;
             }
         } else {
@@ -1156,6 +1196,13 @@ static const char *chip_model_name(void)
 typedef struct {
     elder_rmd_item_t items[ELDER_REMINDER_MAX];
     elder_rmd_when_t when[ELDER_REMINDER_MAX];
+    /* 多药提醒的元数据（**只进 RAM**，见 elder_reminder.h 的说明）。
+     * 与 items[] 同下标；解析完由 elder_reminder_set_med_info() 一次性写进
+     * 提醒引擎。放这里而不是塞进 elder_rmd_item_t：那个结构是 NVS blob 的
+     * 组成部分，加字段会让 V1/V2 前缀断言失效、老用户整表被清空。
+     * 这块也必须在堆上（+2KB），理由与上面 items/when 完全相同。 */
+    uint8_t          med_counts[ELDER_REMINDER_MAX];
+    elder_med_name_t med_names[ELDER_REMINDER_MAX];
 } sync_rmd_buf_t;
 
 /* ---- 服务端代确认（R1，2026-10-31）----
@@ -1504,6 +1551,10 @@ static esp_err_t do_sync(void)
                  (unsigned)sizeof(*rb));
     } else {
         memset(rb->when, 0, sizeof(rb->when));
+        /* 药数/药名同样先清零：parse_reminders 只会写它实际装下的那几条，
+         * 不清零的话上一轮的残留会被当成"这一条挂了几味药"。 */
+        memset(rb->med_counts, 0, sizeof(rb->med_counts));
+        memset(rb->med_names, 0, sizeof(rb->med_names));
         /* 「服务端说没有」与「这轮响应不完整」必须分开判 —— 判据是
          * **键是否存在、类型对不对**，而不是「解析出几条」。
          *
@@ -1526,7 +1577,8 @@ static esp_err_t do_sync(void)
          * keep[] 逻辑；这里不需要额外判空。 */
         cJSON *jrem = cJSON_GetObjectItem(root, "reminders");
         if (cJSON_IsArray(jrem)) {
-            parse_reminders(jrem, rb->items, rb->when, &count);
+            parse_reminders(jrem, rb->items, rb->when,
+                            rb->med_counts, rb->med_names, &count);
             /* ⚠️ replace_all 的返回值里**混着落盘结果**（函数末尾
              * `return elder_reminder_flush()`）。NVS 满时它返回错误，但表其实
              * 已经装进 RAM 了 —— 若只认 ESP_OK，NVS 一满，子女的手机端代确认
@@ -1535,6 +1587,19 @@ static esp_err_t do_sync(void)
              *   ESP_ERR_NO_MEM（快照区拿不到，什么都没动） */
             esp_err_t rrc = elder_reminder_replace_all(rb->items, rb->when, count);
             table_ok = (rrc != ESP_ERR_NO_MEM && rrc != ESP_ERR_INVALID_SIZE);
+            /* 药数/药名必须**在新表装好之后**写回（2026-11-03）。
+             *
+             * 两条时序约束，顺序反了就是数据错位：
+             *   ① replace_all 会重排 items[] 下标（后端条目在前、本地保留在后），
+             *      并按新表把 med 数据清零 —— 先写会被它清掉；
+             *   ② 只有真装成功了才写：replace_all 因 NO_MEM/INVALID_SIZE
+             *      提前返回时表还是旧的，此刻写新解析出来的药数，等于拿
+             *      "下一份配置"的药名去对应"这一份配置"的条目。
+             * 漏写这一句的后果是**5 分钟后药数归零**（心跳整表重装一次），
+             * 长按追问退化成"直接确认"—— 症状很隐蔽，只有日志能看出来。 */
+            if (table_ok) {
+                elder_reminder_set_med_info(rb->med_counts, rb->med_names, count);
+            }
         } else {
             ESP_LOGW(TAG, "响应里没有 reminders 数组（老服务端或字段缺失），"
                           "本轮不动本地提醒表");

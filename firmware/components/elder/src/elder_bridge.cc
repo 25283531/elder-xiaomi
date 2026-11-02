@@ -15,6 +15,8 @@
 
 #include <cstring>
 #include <cstdio>
+#include <cstdint>
+#include <ctime>
 #include <string>
 #include <string_view>
 
@@ -409,6 +411,49 @@ static void ScheduleAnnounce(const char *text)
 
 int s_arming_id = -1;
 
+/* 上一次**真正播报过**的提醒分钟（= fired_due_at / 60）。
+ *
+ * 为什么键是「提醒实例的到期分钟」而不是 time(NULL)/60：
+ *   · sync.c 的 due_of_item() 也是按 fired_due_at 定位实例的，两边必须
+ *     同一个口径，否则回执说的"哪一次"和播报说的"哪一次"会对不上；
+ *   · 用墙上时钟时，8:00:59 触发的两条会被算成"8:00 这一分钟"，而 8:01:00
+ *     触发的第三条又算成"8:01"，结果是**该合并的没合并**；反过来，跨分钟
+ *     迟到的提醒会被上一分钟的播报吃掉，**一条都不播**。
+ *   · fired_due_at 由 reminder.c 用条目自己的 hour/minute + 本地时区算出，
+ *     同一时刻触发的多条提醒天然相等，正好就是"同一分钟"的定义。
+ *
+ * 只活在 RAM：重启后重播一次可以接受（比"重启后这一分钟彻底不响"安全）。
+ * -1 = 本次上电还没播过。 */
+static int64_t s_last_announced_min = -1;
+
+/* 时段词（用户 2026-11-03 定义）：
+ *   上午 <12:00、中午 12:00–13:59、下午 14:00–17:59、晚上 ≥18:00 */
+static const char *TimeOfDayWord(int hour)
+{
+    if (hour < 12) return "上午";
+    if (hour < 14) return "中午";
+    if (hour < 18) return "下午";
+    return "晚上";
+}
+
+/* 取「这条提醒自己的钟点」。
+ *
+ * 用 fired_due_at（本次实例的到期时刻）而不是 time(NULL)：
+ *   11:59 的提醒因为 tick 晚了一秒在 12:00:01 触发时，用墙上时钟会念成
+ *   「您今天中午」，而屏幕上写的是 11:59 —— 老人会以为设备算错了时间。
+ * fired_due_at 为 0（异常路径）时退回条目自己的 hour。 */
+static int DueHour(const elder_rmd_item_t *item)
+{
+    if (item->fired_due_at > 0) {
+        time_t t = (time_t)item->fired_due_at;
+        struct tm tmv;
+        if (localtime_r(&t, &tmv) != nullptr) {
+            return tmv.tm_hour;
+        }
+    }
+    return (int)item->hour;
+}
+
 void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
 {
     (void)ctx;
@@ -420,76 +465,79 @@ void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
         // 形象切到「惊讶/提醒」，保持 30s 后自动回落
         elder_ui_set_state(ELDER_UI_REMINDER, 30000);
 
-        char text[96];
-        if (item->type == ELDER_RMD_TYPE_MEDICINE) {
-            snprintf(text, sizeof(text), "该吃%s了", item->label);
-        } else {
-            snprintf(text, sizeof(text), "%s时间到了", item->label);
-        }
+        /* ---- 同一分钟只播一次（2026-11-03 用户需求）----
+         *
+         * 现场：老人 8:00 同时有「降压药」「降糖药」「喝水」三条提醒时，
+         * 三条各自回调一次 OnReminder(PENDING)，于是三遍铃声 + 三句话
+         * 叠在一起播 —— 听不清、也分不出有几件事。
+         *
+         * 判据是**提醒实例的到期分钟**（fired_due_at/60），不是墙上时钟，
+         * 理由见 s_last_announced_min 的注释。 */
+        const int64_t due_min =
+            (item->fired_due_at > 0) ? (item->fired_due_at / 60) : -1;
+        const bool same_minute = (due_min > 0 && due_min == s_last_announced_min);
+        if (due_min > 0) s_last_announced_min = due_min;
 
-        /* ⚠️ 2026-10-29 用户实报后**重写**：确认话术的主行动必须是
-         * 「长按按钮」，不能是「说一句」。
+        /* 屏幕：**每条都推**，即使这一分钟已经播过音。
          *
-         * 现场：8 点的服药提醒，老人 10 点看到屏幕写着"说「我吃过了」"，
-         * 照着念 —— 设备毫无反应；长按按键也没反应；最后只能喊"你好小智"
-         * 唤醒，唤醒后才确认成功。
+         * 老人需要知道"不止一条"——文案由 elder_reminder_screen_text() 统一
+         * 生成（内部带「（还有 N 条）」），与 reminder.c 的反向对账共用同一份
+         * 实现。原先两处各写一份 snprintf、靠注释约定「改一处要改两处」，
+         * 这一轮加了条数提示，手写两份必然漂移；漂移的表现是屏幕上的句子
+         * 在两条路径之间来回跳，老人会以为是两条不同的提醒。
          *
-         * 为什么念了没用：xiaozhi 只在 **listening** 状态才把音频上传到
-         * 服务端 ASR，待机时麦克风不上行（离线命令词在 2026-10-20 回归
-         * 上游时已全部删除，见 prebuild_check 的 C9）。所以**待机时对着
-         * 设备说任何话都不可能有反应** —— 屏幕却把这句话写成了唯一指引，
-         * 等于让老人去按一个不存在的按钮。
-         *
-         * 待机时唯一可行的确认动作就是长按 GPIO11（input.c 轮询，不依赖
-         * 联网、不依赖唤醒）。所以它必须是第一行、是唯一的大字。
-         * 语音那条彻底不写了：唤醒后老人本来就会说话，不需要屏幕教。
-         *
-         * 历史注释（2026-10-22）说"删掉「或按一下按钮」因为 GPIO11 还没接
-         * 开关"—— 开关现在接了，那条结论已经过期。 */
+         * 文案里的主行动仍然是「长按按钮」（2026-10-29 用户实报后定的）：
+         * xiaozhi 只在 listening 态才上传音频，待机时对着设备说话不可能有
+         * 反应，所以屏幕不能把「说一句」写成指引。 */
         char screen_text[160];
-        snprintf(screen_text, sizeof(screen_text), "%s\n\n长按按钮 3 秒确认", text);
+        elder_reminder_screen_text(item, screen_text, sizeof(screen_text));
         elder_ui_show_reminder(screen_text);
 
-        /* 1) 优先播**预录片段**（2026-11-03）。
-         *
-         * 片段里已经包含「提醒音 + 话术」，所以这一条路径上：
-         *   · 不再单独 play_tone（会变成音乐响两遍）；
-         *   · 不再 ScheduleAnnounce（片段自己就把话说完了，再发 TTS 等于
-         *     同一句话听两遍，而且 TTS 首帧还要多等 0.8~1.2 秒）。
-         *
-         * 老人听到的间隔从「4.9 秒音乐 + TTS 首帧」缩短到「0」——
-         * 音乐结束紧接着就是人声，这是本方案的全部收益。
-         *
-         * 2) 没有片段资源 / 没有 play_clip 钩子 ⇒ **必须回落**原逻辑：
-         *    先响音乐、4.9 秒后再念。少了这个回落，任何一块没接音频的
-         *    板子都会"提醒响了但一句话都没有"，而屏幕和日志一切正常。
-         *
-         * ⚠️ TODO（2026-11-03，多药提醒实现时必须先读这段）：
-         *    预录片段是**编译进 .rodata 的固定资源**，`PlaySound` 只吃一个
-         *    `string_view`，运行时零参数化能力 —— 它永远只会说「您有一条
-         *    服药提醒」，**念不出药名**。
-         *    所以一条提醒挂 **>= 2 味药**时（多药合并播报），必须走 TTS
-         *    分支（`ScheduleAnnounce(text)`），**不许播 ELDER_CLIP_MEDICINE**。
-         *    否则老人听到的是"您有一条服药提醒"，却完全不知道要吃哪几味、
-         *    各几粒 —— 对服药场景这是事故，不是瑕疵。
-         *
-         *    现在还不判药数，因为设备侧根本还没有这个数据：
-         *    `elder_rmd_item_t` 没有 medicines 字段，`sync.c` 也完全没有解析
-         *    服务端的 medicines 数组。等那条链路落地后，**判据加在这里**
-         *    （拿到 item 的这一层才知道有几味药），不要加进 elder_clip.c ——
-         *    那里是"只认 id"的纯转发层，让它认识业务数据会把两件事绑死。
-         *
-         *    还有一处容量风险要一起处理：`text[96]`（上面 :415）装不下
-         *    "该吃A、B、C、D了" 这种带剂量的多药句子（约 28 个汉字上限），
-         *    `screen_text[160]` 也只剩约 44 个汉字。多药落地时要同步放大
-         *    这两个缓冲区，否则是**静默截断**（snprintf 不报错）。 */
-        elder_clip_id_t clip = (item->type == ELDER_RMD_TYPE_MEDICINE)
-                                   ? ELDER_CLIP_MEDICINE : ELDER_CLIP_TODO;
-        if (!elder_clip_play(clip)) {
-            ESP_LOGW(TAG, "预录片段不可用 ⇒ 回落「提示音 + TTS」");
-            elder_ui_play_tone(ELDER_TONE_REMINDER);
-            ScheduleAnnounce(text);
+        if (same_minute) {
+            ESP_LOGI(TAG, "同一分钟（%lld）已播报过，只推屏不出声：%s",
+                     (long long)due_min, item->label);
+            break;
         }
+
+        /* ---- 话术带时段，必须走 TTS（2026-11-03 用户需求）----
+         * 「提醒音效 + 您今天上午/中午/下午/晚上 + 有一条服药提醒，请您知悉」。
+         *
+         * 为什么不能用预录片段：片段是编译进 .rodata 的固定资源，
+         * `PlaySound` 只吃一个 `string_view`，运行时**零参数化能力** ——
+         * 它永远只会说「您有一条服药提醒」，念不出时段（更念不出药名）。
+         * 所以这条路径走 ScheduleAnnounce() 的 TTS 分支。 */
+        char speak[96];
+        snprintf(speak, sizeof(speak), "您今天%s有一条%s，请您知悉",
+                 TimeOfDayWord(DueHour(item)),
+                 item->type == ELDER_RMD_TYPE_MEDICINE ? "服药提醒" : "待办事项");
+
+        /* 「在线」用两个判据一起看：
+         *   · OnIsOnline()   —— xiaozhi 设备状态不是配网/启动中（TTS 通道前提）；
+         *   · elder_net_is_online() —— 后端 HTTP 最近一次成功（软状态）。
+         * 只看前者会在"Wi-Fi 掉了但设备停在 Idle"时误判成在线，TTS 请求
+         * 静默失败 —— 老人只听到一声音乐、一个字都没有。 */
+        if (!OnIsOnline(nullptr) || !elder_net_is_online()) {
+            /* 离线：TTS 一定不可用。回落预录片段 —— 它虽然不带时段，
+             * 但含提醒音 + 「该按哪个键」的行动指令，比"只有一声音乐"强。
+             * 断网时提醒内容可以简化，但不能没有，这是本工程一贯的口径。 */
+            ESP_LOGW(TAG, "离线：时段话术不可用，回落预录片段");
+            elder_clip_id_t clip = (item->type == ELDER_RMD_TYPE_MEDICINE)
+                                       ? ELDER_CLIP_MEDICINE : ELDER_CLIP_TODO;
+            if (!elder_clip_play(clip)) {
+                elder_ui_play_tone(ELDER_TONE_REMINDER);
+                ScheduleAnnounce(speak);
+            }
+            break;
+        }
+
+        /* 在线：提醒音效 + 时段话术。
+         *
+         * 音效用 ELDER_TONE_REMINDER（那段 4.9 秒的铃声），不是 POPUP：
+         * ScheduleAnnounce 的 kChimeMs 就是按它的长度校准的（4900ms）。
+         * 换成 0.5 秒的 POPUP，TTS 会在 4.4 秒静默之后才开口，老人会以为
+         * 设备卡住了；而且"提醒音效"本来就是指这段铃声，不是一声叮咚。 */
+        elder_ui_play_tone(ELDER_TONE_REMINDER);
+        ScheduleAnnounce(speak);
         break;
     }
     case ELDER_RMD_DONE:
@@ -514,15 +562,31 @@ void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
         break;
     case ELDER_RMD_ESCALATED:
         /* 超时升级：**不收全屏提醒**（用户明确要求"没确认就一直显示"），
-         * 只换表情 + 说一句「该吃药了，请长按按钮」。
+         * 只换表情 + 说一句话。
          * 灯也不再改成"一直闪"——交给 elder_rgb 的 2 小时节奏，
          * 见 reminder.c 的说明。
          *
-         * 2026-11-03：升级这里**可以**换成预录片段 —— 与 DONE 不同，
-         * 升级时老人已经 15 分钟没确认、本来也不在等他说话，2.5 秒的
-         * 人声比一声感叹音更能说清"该干什么"。失败回落原来的感叹音。 */
+         * 2026-11-03 用户需求：「请长按机身顶部凸起的橙色大按键确认」这句
+         * 只在「服药日程生效但未确认、已升级」时主动播放。这里正是那个
+         * 唯一入口 —— PENDING 不播它（那时老人刚听到提醒，再催一遍只会
+         * 显得聒噪），SKIPPED/DONE 更不播。
+         *
+         * 为什么服药类**只播 confirm_hint、不和 ESCALATED 连播**：
+         *   · 两条连播 2.52 + 4.56 ≈ 7.1 秒。老人已经等了 15 分钟，
+         *     再让他听 7 秒才听到"该按哪个键"，只会更烦躁；
+         *   · 两条语义重叠（escalated 是「该吃药了，请长按按钮」），
+         *     先播它等于把关键指令推后 2.5 秒；
+         *   · 此刻屏幕已经是 MISSED 表情 + 全屏大字，"还没确认"这件事
+         *     已经用灯和屏说过两遍了，声音只该补"该按哪个键"。
+         * ⇒ 服药类只播 confirm_hint（4.56 秒，一句话说清位置和动作）；
+         *   非服药（喝水/运动/日程）继续播 escalated —— confirm_hint 里
+         *   明说"服药确认"，对它们是错的，会让老人以为要吃错东西。 */
         elder_ui_set_state(ELDER_UI_MISSED, 0);
-        if (!elder_clip_play(ELDER_CLIP_ESCALATED)) {
+        if (item->type == ELDER_RMD_TYPE_MEDICINE) {
+            if (!elder_clip_play(ELDER_CLIP_CONFIRM_HINT)) {
+                elder_ui_play_tone(ELDER_TONE_EXCLAMATION);
+            }
+        } else if (!elder_clip_play(ELDER_CLIP_ESCALATED)) {
             elder_ui_play_tone(ELDER_TONE_EXCLAMATION);
         }
         break;
@@ -601,6 +665,68 @@ void ConfirmMedicine(int idx, uint8_t method)
     s_arming_id = -1;
 }
 
+/* 「先说一句、再进对话」的专用任务（2026-11-03，多药提醒）。
+ *
+ * 为什么顺序必须是「先说 → 等说完 → 再听」，三条都是 application.cc 的硬约束：
+ *   ① TTS 只能从**待机**发起：OnSpeak() 里 `if (GetDeviceState()==kDeviceStateIdle)`
+ *      才发 SendMcpMessage，其余状态**静默丢弃**（见本文件 OnSpeak）；
+ *   ② StartListening()（application.cc:400-433）只在 Idle / Speaking 两个状态
+ *      有动作：Idle → 开音频通道 + 进聆听；Speaking → **先 AbortSpeaking()**。
+ *      先听再说会把刚发出去的问题当场掐断；
+ *   ③ 它进入的是 kListeningModeManualStop，而 TTS 播完时固件在 ManualStop 下
+ *      回 Idle（application.cc:585-589）—— 所以必须在"播完之后"再显式调一次
+ *      StartListening，否则老人开口时设备已经不在听了。
+ *
+ * 为什么不在 elder_input 任务里同步做：StartListening() 里的 OpenAudioChannel()
+ * 是联网握手（几百毫秒到几秒），在按键任务上阻塞会把「长按 3 秒」的判定挤歪
+ * （elder_input.h 里已经踩过这个坑）。所以开独立任务，栈 5KB（与
+ * AnnounceTask 同值 —— 它走的也是同一条 elder_ui_speak 路径）。
+ *
+ * 前置条件（已核对代码，不是推测）：
+ *   · protocol_ 为空（未激活 / 未连上）时 StartListening 只打日志就返回，
+ *     不崩、不死循环 —— 所以离线长按的最终表现是"问不出来"，提醒仍然挂屏；
+ *   · 设备不在 Idle 时本任务直接放弃，不去抢正在进行的对话。 */
+static void AskThenListenTask(void *arg)
+{
+    auto *text = static_cast<std::string *>(arg);
+    auto &app = Application::GetInstance();
+
+    if (app.GetDeviceState() != kDeviceStateIdle) {
+        ESP_LOGW(TAG, "长按追问：设备不在待机（state=%d），不打断当前对话",
+                 (int)app.GetDeviceState());
+        delete text;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    elder_ui_speak(text->c_str());   /* 在线走 TTS，离线自动降级成提示音 */
+    delete text;
+
+    /* 等这句话真的开始播。TTS 是异步的：请求发出后 0.3~1.2 秒才收到首帧，
+     * 这段时间状态仍是 Idle。此刻立刻 StartListening 会先开麦、随后被 TTS
+     * 推到 Speaking，播完在 ManualStop 下回 Idle —— 老人开口时已经没人听。
+     * 最多等 3 秒；离线时永远等不到，直接落到下一步（由 StartListening
+     * 自己打日志失败，不在这里死等）。 */
+    int waited_ms = 0;
+    while (waited_ms < 3000 && app.GetDeviceState() == kDeviceStateIdle) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        waited_ms += 100;
+    }
+
+    /* 等播完：回到 Idle，或（AutoStop / Realtime 下）自动回到 Listening。 */
+    while (waited_ms < 15000) {
+        DeviceState st = app.GetDeviceState();
+        if (st == kDeviceStateIdle || st == kDeviceStateListening) break;
+        vTaskDelay(pdMS_TO_TICKS(100));
+        waited_ms += 100;
+    }
+
+    if (app.GetDeviceState() == kDeviceStateIdle) {
+        app.StartListening();
+    }
+    vTaskDelete(nullptr);
+}
+
 /* 这个按键**只做日程/服药确认**（2026-10-20 用户拍板取消 SOS；
  * 2026-10-27 用户进一步拍板：连"开始/结束对话"也去掉，单一功能）：
  *   提醒响铃期间（ELDER_UI_REMINDER）短按 → 直接确认，不需要任何前置手势；
@@ -677,11 +803,71 @@ void OnKey(elder_key_event_t ev, void *ctx)
          * 反馈：确认成功 → #1 闪深蓝绿 3 次（rgb.c 负责）；
          *       没确认成 → 松开时 #1 闪深粉红 5 次。
          * 先给灯再改状态：老人按下 3 秒那一刻就要看到"成了"，
-         * 而不是等提醒引擎落完 NVS 才亮。 */
+         * 而不是等提醒引擎落完 NVS 才亮。
+         *
+         * ⚠️ 2026-11-03 起，「长按 = 直接确认」只对**药数未知**的提醒成立。
+         *    挂了 1 味或 >=2 味药的服药提醒，长按改成"问一句 + 进对话"，
+         *    由服务端大模型判断哪条日程完成（见下面的分支与 AskThenListenTask）。
+         *    原因：固件只拿到"有几味药、第一味叫什么"，拿不到"老人吃了哪几味"；
+         *    直接标完成等于替老人谎报服药。 */
         int idx = FirstUndoneReminder();
         if (idx >= 0) {
-            elder_rgb_button_confirmed();
-            ConfirmMedicine(idx, ELDER_CFM_BUTTON);
+            /* ---- 多药提醒（2026-11-03 用户需求）----
+             *
+             * 服药种类 > 1：长按后**不确认**，改为问「您吃的是哪种药？」
+             * 并进入对话，由服务端大模型判断哪一条日程完成了、再追问
+             * 没完成的那几味 —— 固件不知道老人吃了哪几味，替他把整条
+             * 提醒标成"全部完成"就是谎报服药。
+             *
+             * 服药种类 == 1：同样不直接确认，改成念「我帮您确认一下，
+             * 您刚才已经服用过<药名>了吗？」，让老人答一句"吃了"再算完成。
+             * 只有一味时理论上可以直接确认，但用户明确要求"根据用户回答
+             * 确定日程是否完成"，所以走同一条对话路径。
+             *
+             * 药数 == 0（未知，典型是刚开机还没同步到 medicines）：
+             * **保持原路径直接确认**。信息缺失不能让老人确认不了 ——
+             * 这时"按了就记上"比"按了没反应"安全得多。 */
+            uint8_t med_n = elder_reminder_med_count((uint8_t)idx);
+            if (med_n == 0) {
+                elder_rgb_button_confirmed();
+                ConfirmMedicine(idx, ELDER_CFM_BUTTON);
+                break;
+            }
+
+            char prompt[192];
+            if (med_n >= 2) {
+                snprintf(prompt, sizeof(prompt), "您吃的是哪种药？");
+            } else {
+                const char *name = elder_reminder_first_med_name((uint8_t)idx);
+                if (name != nullptr && name[0] != '\0') {
+                    snprintf(prompt, sizeof(prompt),
+                             "我帮您确认一下，您刚才已经服用过%s了吗？", name);
+                } else {
+                    /* 有一味药但名字没解析到（脏数据）：不念半句药名，
+                     * 退回不带药名的问法，语义仍然成立。 */
+                    snprintf(prompt, sizeof(prompt),
+                             "我帮您确认一下，您刚才已经服用过这次的药了吗？");
+                }
+            }
+
+            /* 这里**不额外播提示音**，也不闪"确认成功"灯效：
+             *   · 闪成功会让老人以为已经记上了，然后走开不再回答 ——
+             *     这一步什么都没确认，#1 的待确认呼吸灯本来就还亮着；
+             *   · 在线时问题本身 1 秒内就会开口，再加一声 POPUP 只会占住
+             *     解码队列、把问题推后；离线时 elder_ui_speak 自己会播一声
+             *     POPUP 兜底，这里再播一次就是连响两声。 */
+            auto *payload = new std::string(prompt);
+            /* 栈 5120 与 kAnnounceTaskStack 对齐：两者都走
+             * elder_ui_speak → OnSpeak → std::string 拼 JSON + ESP_LOG，
+             * 那个值是真机验证过的，不另调小。 */
+            if (xTaskCreate(AskThenListenTask, "rmd_ask", 5120, payload, 3,
+                            nullptr) != pdPASS) {
+                ESP_LOGE(TAG, "追问任务创建失败，改为直接播报（不进对话）");
+                elder_ui_speak(prompt);
+                delete payload;
+            }
+            ESP_LOGI(TAG, "长按追问（%u 味药，提醒 #%d）：%s",
+                     (unsigned)med_n, idx, prompt);
         } else {
             /* 诊断：这是 2026-10-29「屏幕挂着提醒但按什么都没反应」的现场
              * 特征 —— 屏幕（elder_ui，4 小时独立计时）说要做，引擎里却
