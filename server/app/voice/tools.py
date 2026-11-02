@@ -1193,6 +1193,13 @@ def _confirm_reminder(db: Any, device_pk: int, device_call: Any,
     """
     said = str((args or {}).get("medicine") or "").strip()[:32]
 
+    # 没有 db 会话就查不出候选（只有单测会传 None，生产路径永远有 session）。
+    # 退回改造前的行为：让设备确认它自己挂着的那条。**不要**让这条分支去猜药名
+    # —— 没有库就没有药名清单，任何"匹配"都是瞎编。
+    if db is None:
+        log.warning("confirm_reminder：没有 db 会话，退回设备侧整条确认")
+        return _confirm_device_pending(device_call)
+
     try:
         cands = pending_medicine_events(db, device_pk)
     except Exception as exc:  # noqa: BLE001  查库失败不该崩掉整轮对话
@@ -1309,30 +1316,40 @@ def _confirm_reminder(db: Any, device_pk: int, device_call: Any,
     # ---- 通知设备：``server_id`` 是 ``reminders.id``（不是实例 id）----
     # 设备侧按这个 id 找到本地那条提醒并收屏 / 停铃。通知失败**不回滚**上面的
     # 记录，只在话术里带一句，让老人知道屏幕可能还亮着。
+    #
+    # ⚠️ **只在 ``complete`` 时才通知设备**（这条提醒挂的药全确认完）。
+    # 设备侧收到 server_id 会直落 DONE（``elder_reminder_confirm_server`` 的
+    # ``force_done`` 分支），连带收屏、停闪灯、清 ``pending_today``。一条挂
+    # 2 味药时若在确认第 1 味就通知，屏幕会提前收起来，而这边还在追问第 2 味；
+    # 第 2 味确认回来时设备已不是"待确认"，会答 false，话术里就会出现
+    # 「设备说没办成…屏幕可能还亮着」这种自相矛盾的话。
+    # 半置信时代这个问题是自愈的（后续确认还能把 HALF 推进 DONE），改成直落
+    # DONE 之后不自愈，所以必须在这里挡住。
     dev_err = ""
-    if device_call is None:
-        dev_err = "现在连不上设备"
-    else:
-        try:
-            payload = device_call("self.elder.confirm_reminder",
-                                  {"server_id": ev.reminder_id}, 3.0)
-            if not isinstance(payload, dict):
-                dev_err = "设备返回的内容看不懂"
-            elif payload.get("error"):
-                err = payload["error"]
-                dev_err = "设备说没办成"
-                log.warning("confirm_reminder：设备报错 %s",
-                            err.get("message") if isinstance(err, dict) else err)
-            else:
-                result = payload.get("result")
-                if isinstance(result, dict) and result.get("isError"):
-                    dev_err = "设备说没办成"
-        except TimeoutError:
-            dev_err = "设备 3 秒内没回包"
-            log.warning("confirm_reminder：设备 3 秒内没回包")
-        except Exception as exc:  # noqa: BLE001  设备离线 / WS 已断
+    if complete:
+        if device_call is None:
             dev_err = "现在连不上设备"
-            log.warning("confirm_reminder：下发失败 %s: %s", type(exc).__name__, exc)
+        else:
+            try:
+                payload = device_call("self.elder.confirm_reminder",
+                                      {"server_id": ev.reminder_id}, 3.0)
+                if not isinstance(payload, dict):
+                    dev_err = "设备返回的内容看不懂"
+                elif payload.get("error"):
+                    err = payload["error"]
+                    dev_err = "设备说没办成"
+                    log.warning("confirm_reminder：设备报错 %s",
+                                err.get("message") if isinstance(err, dict) else err)
+                else:
+                    result = payload.get("result")
+                    if isinstance(result, dict) and result.get("isError"):
+                        dev_err = "设备说没办成"
+            except TimeoutError:
+                dev_err = "设备 3 秒内没回包"
+                log.warning("confirm_reminder：设备 3 秒内没回包")
+            except Exception as exc:  # noqa: BLE001  设备离线 / WS 已断
+                dev_err = "现在连不上设备"
+                log.warning("confirm_reminder：下发失败 %s: %s", type(exc).__name__, exc)
 
     dev_note = (f"（{dev_err}，但记录已经写进去了 —— 可以顺口说一句"
                 "「记录好了，屏幕可能还亮着」。）" if dev_err else "")
