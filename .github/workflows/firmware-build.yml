@@ -32,6 +32,10 @@ on:
       # 固件静态闸门（fw-static job）：改断言本身也要跑一遍，
       # 否则它可能早就跟代码脱节、却一直显示绿的。
       - 'tools/smoke_wifi_trial.py'
+      # 内置语音片段的 OpusHead/帧长校验（2026-11-03）。
+      # **必须单列**：它读的是 firmware/ 下的 .ogg，但"改脚本"这件事本身
+      # 不会碰 firmware/，不列进来就会出现「改了校验逻辑但 CI 不跑」。
+      - 'tools/verify_elder_clips.py'
       - '.github/workflows/firmware-build.yml'
   workflow_dispatch:
     inputs:
@@ -101,7 +105,7 @@ jobs:
   # 「老人家里设备失联、必须上门」。这类缺陷只能静态判。
   # 放在 build 之前是因为它几毫秒就跑完，比等 8 分钟编译拿到同一句话有用得多。
   fw-static:
-    name: 固件静态闸门（改 WiFi 安全不变量）
+    name: 固件静态闸门（WiFi 不变量 / 花括号 / 内置音频片段）
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -120,6 +124,20 @@ jobs:
       # 花括号配平：多/少一个 `}` 是编译期才发现的最贵错误，本地也跑同一条命令。
       - name: 花括号配平自检
         run: python tools/check_c_braces.py
+
+      # 内置语音片段的 OpusHead / 帧长校验（2026-11-03）。
+      #
+      # 为什么必须有这一条：`AudioService::PlaySound()` 从 **OpusHead** 里读
+      # 采样率，再按**硬编码 60ms** 把每个 Opus 包当一帧推给解码器。这两条
+      # 只要有一条不满足，症状都不是报错 ——
+      #   · 采样率 ≠ 24kHz ⇒ 每次播放都走 SetDecodeSampleRate() 重建解码器
+      #     （既有 popup.ogg 就是 16kHz，是这套约束的反例）；
+      #   · 包内帧长 ≠ 60ms ⇒ 解码器按 60ms 缓冲去解一个 20ms 的包，
+      #     多出来的部分是上一帧残留，听起来像卡带/回声。
+      # 编码阶段完全不报错，所以只能在拿到文件之后逐字节核对。
+      # 本步骤不依赖 IDF 工具链（纯 Python 读字节），所以放在 fw-static 而不是 build。
+      - name: 内置语音片段 OpusHead 校验（24kHz / mono / 60ms）
+        run: python tools/verify_elder_clips.py
 
   build:
     name: 编译 ESP32-S3 固件

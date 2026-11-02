@@ -33,6 +33,7 @@
 #include "lcd_display.h"          // 需求 8：全屏提醒（ShowReminder/HideReminder）
 
 #include "elder_board.h"
+#include "elder_clip.h"
 #include "elder_rgb.h"
 #include "elder_input.h"
 #include "elder_reminder.h"
@@ -195,6 +196,102 @@ void OnPlayTone(elder_tone_t tone, void *ctx)
     });
 }
 
+/* ------------------------------------------------------- 预录语音片段 */
+/*
+ * 7 条常用话术的「提醒音 + 语音」整段 OGG，由 tools/make_elder_clips.py
+ * 用**服务端自己的 TTS**（腾讯云 601009，与线上同一音色）合成后入库，
+ * 编进 .rodata。为什么这么做见 elder_clip.h 头注释。
+ *
+ * 资源约束（改任何一条都必须先读这段）
+ * ----------------------------------
+ * * 24kHz / mono / 每帧 60ms —— 硬契约，不是风格。
+ *   `PlaySound` 从 OpusHead 读采样率、把每个包按**硬编码 60ms** 当一帧推给
+ *   解码器（audio_service.cc 的 PlaySound 与 398-411 的 SetDecodeSampleRate）。
+ *   采样率不是 24k 就会每次播放都重建解码器，带来开销和爆音；
+ *   帧长不是 60ms 就会解出"卡带/回声"。
+ *   `tools/verify_elder_clips.py` 逐字节核这两条，生成后必跑。
+ * * 文件放 firmware/xiaozhi/main/assets/common/，由 CMakeLists 的
+ *   file(GLOB COMMON_SOUNDS ...) 把该目录下全部 .ogg 自动收进 EMBED_FILES，
+ *   所以**不用改 CMakeLists 文本**，只要按 `<文件名去点>_ogg_start/_end` 取名。
+ *   ⚠️ 但 `file(GLOB)` 是 **configure 期**展开的：**新增/删除** ogg 必须重新
+ *   跑一次 cmake（本机 `python tools/idfwin.py build` 会自己重配；只 `idf.py
+ *   build` 不会），否则新文件根本不进 EMBED_FILES，报的是链接期
+ *   `undefined reference to _binary_xxx_start`。**改内容不用重配**。
+ *   CI 每次都是干净 checkout，configure 必然重跑，所以这条只坑本机构建。
+ * * 进的是 **app 分区**（EMBED_FILES → 编进 xiaozhi.bin 的 .rodata），
+ *   不是 assets 分区。所以它吃的是 ota_0 的 4.03MB 预算，与
+ *   build_default_assets.py 生成的 assets.bin（表情/字体那 8MB）互不相干。
+ * * 符号名规则：elder_medicine.ogg → _binary_elder_medicine_ogg_start / _end。
+ *   写错不会编译报错，是**链接期** undefined reference（构建最后一步才炸）。
+ */
+extern const char ogg_elder_medicine_start[] asm("_binary_elder_medicine_ogg_start");
+extern const char ogg_elder_medicine_end[] asm("_binary_elder_medicine_ogg_end");
+extern const char ogg_elder_todo_start[] asm("_binary_elder_todo_ogg_start");
+extern const char ogg_elder_todo_end[] asm("_binary_elder_todo_ogg_end");
+extern const char ogg_elder_confirm_hint_start[] asm("_binary_elder_confirm_hint_ogg_start");
+extern const char ogg_elder_confirm_hint_end[] asm("_binary_elder_confirm_hint_ogg_end");
+extern const char ogg_elder_done_start[] asm("_binary_elder_done_ogg_start");
+extern const char ogg_elder_done_end[] asm("_binary_elder_done_ogg_end");
+extern const char ogg_elder_escalated_start[] asm("_binary_elder_escalated_ogg_start");
+extern const char ogg_elder_escalated_end[] asm("_binary_elder_escalated_ogg_end");
+extern const char ogg_elder_skipped_start[] asm("_binary_elder_skipped_ogg_start");
+extern const char ogg_elder_skipped_end[] asm("_binary_elder_skipped_ogg_end");
+extern const char ogg_elder_no_reminder_start[] asm("_binary_elder_no_reminder_ogg_start");
+extern const char ogg_elder_no_reminder_end[] asm("_binary_elder_no_reminder_ogg_end");
+
+// id → 内嵌 OGG 的视图。返回空的 string_view 表示"没有这条片段"，
+// 调用方（elder_clip_play 的上游）据此回落 TTS。
+static std::string_view ClipSound(int id)
+{
+    switch (id) {
+    case ELDER_CLIP_MEDICINE:
+        return {static_cast<const char *>(ogg_elder_medicine_start),
+                static_cast<size_t>(ogg_elder_medicine_end - ogg_elder_medicine_start)};
+    case ELDER_CLIP_TODO:
+        return {static_cast<const char *>(ogg_elder_todo_start),
+                static_cast<size_t>(ogg_elder_todo_end - ogg_elder_todo_start)};
+    case ELDER_CLIP_CONFIRM_HINT:
+        return {static_cast<const char *>(ogg_elder_confirm_hint_start),
+                static_cast<size_t>(ogg_elder_confirm_hint_end - ogg_elder_confirm_hint_start)};
+    case ELDER_CLIP_DONE:
+        return {static_cast<const char *>(ogg_elder_done_start),
+                static_cast<size_t>(ogg_elder_done_end - ogg_elder_done_start)};
+    case ELDER_CLIP_ESCALATED:
+        return {static_cast<const char *>(ogg_elder_escalated_start),
+                static_cast<size_t>(ogg_elder_escalated_end - ogg_elder_escalated_start)};
+    case ELDER_CLIP_SKIPPED:
+        return {static_cast<const char *>(ogg_elder_skipped_start),
+                static_cast<size_t>(ogg_elder_skipped_end - ogg_elder_skipped_start)};
+    case ELDER_CLIP_NO_REMINDER:
+        return {static_cast<const char *>(ogg_elder_no_reminder_start),
+                static_cast<size_t>(ogg_elder_no_reminder_end - ogg_elder_no_reminder_start)};
+    default:
+        return {};
+    }
+}
+
+void OnPlayClip(int id, void *ctx)
+{
+    (void)ctx;
+
+    std::string_view sound = ClipSound(id);
+    if (sound.empty()) {
+        // 不抛错：id 越界是编码错误，但让它变成"没声音"比让设备重启好。
+        // 真正需要回落的地方在调用方（elder_clip_play 返回 false 那条路）。
+        ESP_LOGW(TAG, "预录片段 id=%d 无对应资源", id);
+        return;
+    }
+
+    /* ⚠️ 必须 Schedule，不能就地 PlaySound —— 理由与 OnPlayTone 完全相同，
+     * 但这里的代价更明显：片段长 2~7 秒，PlaySound 是同步推 I2S 的，
+     * 就地调用会把调用方所在的任务（提醒引擎任务 / elder_input 任务）
+     * 整个卡住 1~3.5 秒。在 elder_input 任务上卡住 = 长按 3 秒的判定被
+     * 音频播放挤歪；在主事件循环里跑则只占一个队列任务，不影响任何计时。 */
+    Application::GetInstance().Schedule([sound]() {
+        Application::GetInstance().PlaySound(sound);
+    });
+}
+
 // 联网 TTS：通过 MCP/协议让服务端合成并播报一段话。
 //
 // ⚠️ 离线时**不能**走这里 —— 服务端不可达，SendMcpMessage 会静默失败，
@@ -238,6 +335,11 @@ void OnSpeak(const char *text, void *ctx)
 /* ---------------------------------------------------------------- 提醒 */
 /* 提醒的节奏：**先响音乐，再念事项**。
  *
+ * ⚠️ 2026-11-03：这条节奏现在只用于**回落路径**。正常路径播预录片段
+ *    （音乐与话术已合成在同一条 OGG 里，天然串行、不需要任何延时），
+ *    见 OnReminder(ELDER_RMD_PENDING) 与 elder_clip.h。
+ *    下面的说明保留，是因为回落路径仍然照它执行。
+ *
  * 为什么用延时任务而不是"等播放结束回调"：`PlaySound` 只是把 OGG 入队给
  * 音频服务，没有任何完成回调可用；按已知时长 + 余量延后，是这套 API 下
  * 唯一确定的顺序保证。余量 400ms 给解码器起播与 I2S 缓冲 —— 宁可晚一点，
@@ -252,6 +354,13 @@ void OnSpeak(const char *text, void *ctx)
  * 格式化）—— 栈溢出的表现是随机的 LoadProhibited，事后极难归因。
  * 专用任务可以自己定栈大小，做完自删，代价只有一次 xTaskCreate。 */
 /* 提醒音乐多长（毫秒）→ 到点后开始念事项内容。
+ *
+ * ⚠️ 2026-11-03 起，这个常数**只服务于 TTS 回落路径**。
+ *    正常路径已经改成播预录片段（ELDER_CLIP_MEDICINE / ELDER_CLIP_TODO，
+ *    音乐与话术在同一条 OGG 里），根本不进 AnnounceTask，也就没有"等 4.9 秒"
+ *    这一步。只有 elder_clip_play() 返回 false（没有资源/没有钩子）时，
+ *    才会走「播音乐 + 延时 + TTS」这条老路。
+ *    ⇒ 改这里的值不会影响预录片段的行为。片段时长见 elder_clip.c 的 kClipMs。
  *
  * 2026-10-22 实测（串口日志 151442 响铃 / 158282 才开始 TTS）：
  * 原来写 4900+400，但真正卡住间隔的不是这个常数，而是 AnnounceTask 里
@@ -341,24 +450,81 @@ void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
         snprintf(screen_text, sizeof(screen_text), "%s\n\n长按按钮 3 秒确认", text);
         elder_ui_show_reminder(screen_text);
 
-        /* 1) 先响固件内置的提醒音乐（约 4.9 秒，离线也有声音）
-         * 2) 音乐放完再念事项内容（在线 TTS；离线只屏显+说明）
-         * 两步分开而不是"边响边说"：见 ScheduleAnnounce 上方的注释。 */
-        elder_ui_play_tone(ELDER_TONE_REMINDER);
-        ScheduleAnnounce(text);
+        /* 1) 优先播**预录片段**（2026-11-03）。
+         *
+         * 片段里已经包含「提醒音 + 话术」，所以这一条路径上：
+         *   · 不再单独 play_tone（会变成音乐响两遍）；
+         *   · 不再 ScheduleAnnounce（片段自己就把话说完了，再发 TTS 等于
+         *     同一句话听两遍，而且 TTS 首帧还要多等 0.8~1.2 秒）。
+         *
+         * 老人听到的间隔从「4.9 秒音乐 + TTS 首帧」缩短到「0」——
+         * 音乐结束紧接着就是人声，这是本方案的全部收益。
+         *
+         * 2) 没有片段资源 / 没有 play_clip 钩子 ⇒ **必须回落**原逻辑：
+         *    先响音乐、4.9 秒后再念。少了这个回落，任何一块没接音频的
+         *    板子都会"提醒响了但一句话都没有"，而屏幕和日志一切正常。
+         *
+         * ⚠️ TODO（2026-11-03，多药提醒实现时必须先读这段）：
+         *    预录片段是**编译进 .rodata 的固定资源**，`PlaySound` 只吃一个
+         *    `string_view`，运行时零参数化能力 —— 它永远只会说「您有一条
+         *    服药提醒」，**念不出药名**。
+         *    所以一条提醒挂 **>= 2 味药**时（多药合并播报），必须走 TTS
+         *    分支（`ScheduleAnnounce(text)`），**不许播 ELDER_CLIP_MEDICINE**。
+         *    否则老人听到的是"您有一条服药提醒"，却完全不知道要吃哪几味、
+         *    各几粒 —— 对服药场景这是事故，不是瑕疵。
+         *
+         *    现在还不判药数，因为设备侧根本还没有这个数据：
+         *    `elder_rmd_item_t` 没有 medicines 字段，`sync.c` 也完全没有解析
+         *    服务端的 medicines 数组。等那条链路落地后，**判据加在这里**
+         *    （拿到 item 的这一层才知道有几味药），不要加进 elder_clip.c ——
+         *    那里是"只认 id"的纯转发层，让它认识业务数据会把两件事绑死。
+         *
+         *    还有一处容量风险要一起处理：`text[96]`（上面 :415）装不下
+         *    "该吃A、B、C、D了" 这种带剂量的多药句子（约 28 个汉字上限），
+         *    `screen_text[160]` 也只剩约 44 个汉字。多药落地时要同步放大
+         *    这两个缓冲区，否则是**静默截断**（snprintf 不报错）。 */
+        elder_clip_id_t clip = (item->type == ELDER_RMD_TYPE_MEDICINE)
+                                   ? ELDER_CLIP_MEDICINE : ELDER_CLIP_TODO;
+        if (!elder_clip_play(clip)) {
+            ESP_LOGW(TAG, "预录片段不可用 ⇒ 回落「提示音 + TTS」");
+            elder_ui_play_tone(ELDER_TONE_REMINDER);
+            ScheduleAnnounce(text);
+        }
         break;
     }
     case ELDER_RMD_DONE:
         elder_ui_hide_reminder();          /* 确认完成 ⇒ 全屏提醒立刻收起 */
         elder_ui_set_state(ELDER_UI_CONFIRMED, 8000);
+        /* ⚠️ 2026-11-03：**故意不接** ELDER_CLIP_DONE，仍然播 0.5 秒的
+         * SUCCESS 哔声。不是漏接，别"顺手补上"。
+         *
+         * 原因：`PlaySound` 把包推进解码队列，队列满就阻塞等（上限 40 包 =
+         * 2.4 秒，见 elder_clip.h 的算式）。所以任何后到的声音都必须等
+         * **前面整段播完**才开始。老人按确认时 MEDICINE 片段往往还在播
+         * （10.56 秒），此刻 DONE 无论播片段（2.58 秒）还是播 tone（0.5 秒），
+         * 起点都是"片段播完那一刻"—— 也就是说延迟是片段长度决定的，
+         * **换实现并不能让它更早响**。
+         * 那为什么还要用 tone：tone 只有 0.5 秒，不会在老人已经确认之后
+         * 再占住音频通道 2.6 秒（这段时间里他想再说一句话就排不进去）。
+         * 按下的即时反馈由 #1 指示灯（闪深蓝绿 3 次）+ 屏幕切确认态提供，
+         * 不依赖声音。
+         * ⇒ 要真正缩短"按了键才听到已记录"的延迟，只能缩短 MEDICINE/TODO
+         *    的话术（每减 1 个汉字约省 0.21 秒），或动音频通路加打断（红线）。 */
         elder_ui_play_tone(ELDER_TONE_SUCCESS);
         break;
     case ELDER_RMD_ESCALATED:
         /* 超时升级：**不收全屏提醒**（用户明确要求"没确认就一直显示"），
-         * 只换表情 + 响一声感叹音。灯也不再改成"一直闪"——
-         * 交给 elder_rgb 的 2 小时节奏，见 reminder.c 的说明。 */
+         * 只换表情 + 说一句「该吃药了，请长按按钮」。
+         * 灯也不再改成"一直闪"——交给 elder_rgb 的 2 小时节奏，
+         * 见 reminder.c 的说明。
+         *
+         * 2026-11-03：升级这里**可以**换成预录片段 —— 与 DONE 不同，
+         * 升级时老人已经 15 分钟没确认、本来也不在等他说话，2.5 秒的
+         * 人声比一声感叹音更能说清"该干什么"。失败回落原来的感叹音。 */
         elder_ui_set_state(ELDER_UI_MISSED, 0);
-        elder_ui_play_tone(ELDER_TONE_EXCLAMATION);
+        if (!elder_clip_play(ELDER_CLIP_ESCALATED)) {
+            elder_ui_play_tone(ELDER_TONE_EXCLAMATION);
+        }
         break;
     case ELDER_RMD_SKIPPED:
     case ELDER_RMD_HALF_EXPIRED:
@@ -800,6 +966,7 @@ extern "C" void elder_bridge_start(void)
     hooks.is_online = OnIsOnline;
     hooks.show_reminder = OnShowReminder;
     hooks.hide_reminder = OnHideReminder;
+    hooks.play_clip = OnPlayClip;
     hooks.ctx = nullptr;
     elder_ui_set_hooks(&hooks);
     elder_ui_set_state(ELDER_UI_IDLE, 0);

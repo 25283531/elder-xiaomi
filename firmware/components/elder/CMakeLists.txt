@@ -8,6 +8,9 @@ idf_component_register(
         "src/elder_rmd_sched.c"
         "src/activation.c"
         "src/ui.c"
+        # 预录语音片段的 id 转发与时长表（2026-11-03）。纯 C、零依赖：
+        # 资源是链接期符号，只存在于 main，所以真正播放在 elder_bridge.cc。
+        "src/elder_clip.c"
         "src/net.c"
         "src/sync.c"
         "src/rtc.c"

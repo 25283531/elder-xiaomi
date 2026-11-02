@@ -65,6 +65,17 @@ TARGETS = {
     # 而漏改的表现是**用户换了效果灯没变、两端日志都正常**。
     # 它之前一直不在检查清单里，等于这块改动从来没有过编译级门禁。
     "sync.c": ROOT / "firmware" / "xiaozhi" / "components" / "elder" / "src" / "sync.c",
+    # 2026-11-03 加：预录语音片段把 ui.c 的钩子结构体加了一个字段
+    # （elder_ui_hooks_t::play_clip，**只能追加在末尾**），并新增 elder_clip.c。
+    # 这两处错的代价特别高：
+    #   * 字段插到中间 ⇒ 所有初始化器错位，**编译不报错**，表现是"按 A 播 B"；
+    #   * elder_clip.c 的 kClipMs 下标与 elder_clip_id_t 顺序对不上 ⇒ 同样静默。
+    # 编译级只能挡住"括号/类型/头文件"这类硬错，所以先把它纳入门禁，
+    # 顺序一致性另由 tools/verify_elder_clips.py 与人工核对保证。
+    # ⚠️ elder_clip.c 是新增文件，build/compile_commands.json 里还没有它，
+    #    base_command() 会回退到同后缀模板（rgb.c）—— 这是脚本设计好的行为。
+    "elder_clip.c": ROOT / "firmware" / "components" / "elder" / "src" / "elder_clip.c",
+    "ui.c": ROOT / "firmware" / "xiaozhi" / "components" / "elder" / "src" / "ui.c",
 }
 
 #: 需要确保存在的宏（见坑 3）。
