@@ -18,11 +18,19 @@ extern "C" {
  *   - 组件可脱离 xiaozhi 单独编译（firmware/ 下的自测工程就是这么用的）
  *   - 换屏幕 / 换形象引擎只需替换 bridge，业务代码不动
  *
- * EAF 素材来自 esp_emote_gfx（managed component，由 IDF 组件管理器拉取），
- * 立创板可用的情绪名见 main/boards/lichuang-dev/emote.json：
+ * 情绪名的唯一真源是 **twemoji 图片集**（`78__xiaozhi-fonts/png/twemoji_64`，
+ * 由 `main/CMakeLists.txt` 的 DEFAULT_EMOJI_COLLECTION 选中，随 assets 打包），
+ * `Display::SetEmotion()` 用 `LvglTheme::emoji_collection()->GetEmojiImage(name)`
+ * 按名取图。可用名即该目录下的 21 个文件名：
  *   happy / laughing / funny / loving / embarrassed / confident / delicious /
  *   sad / crying / sleepy / silly / angry / surprised / shocked / thinking /
- *   winking / relaxed / confused / neutral / idle
+ *   winking / relaxed / confused / neutral / cool / kissy
+ *
+ * ⚠️ 2026-11-02 删除了 emote（esp_emote_gfx）那一套：它的引擎源文件
+ *    2026-10-20 已整体移除，只剩 `boards/lichuang-dev/emote.json` 与
+ *    `layout.json` 两个无人读取的孤儿数据文件（已一并删除）。
+ *    取不到图时 SetEmotion() 会回落到 FontAwesome 图标，不会崩 ——
+ *    但名字写错就是"静默换了张图"，所以名字必须与上述目录逐字一致。
  */
 
 typedef enum {

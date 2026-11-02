@@ -68,8 +68,9 @@ elder_ui_state_t MapDeviceState(DeviceState st)
     }
 }
 
-// 切 EAF 形象：走 Display::SetEmotion()，名字必须与
-// main/boards/lichuang-dev/emote.json 中的 emote 字段一致。
+// 切表情：走 Display::SetEmotion()，名字必须与 twemoji_64 目录下的文件名
+// 逐字一致（`78__xiaozhi-fonts/png/twemoji_64/<name>.png`）。写错不会报错，
+// 只会静默回落到 FontAwesome 图标 —— 即"表情没变"，很难在现场看出来。
 void OnSetEmotion(const char *name, void *ctx)
 {
     (void)ctx;
