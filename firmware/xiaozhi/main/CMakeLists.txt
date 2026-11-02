@@ -840,6 +840,11 @@ function(build_default_assets_bin)
         DEPENDS
             ${SDKCONFIG}
             ${PROJECT_DIR}/scripts/build_default_assets.py
+            # 表情 PNG->cbin 的转换器。漏掉这一行的话，只改转换器不改
+            # build_default_assets.py 时 assets.bin 不会重建 —— 症状是
+            # 「改了转换逻辑但屏上表情没变」，与 2026-10-19 那次
+            # 「改了配置但固件没变」同一类坑。
+            ${PROJECT_DIR}/scripts/emoji_cbin.py
         COMMENT "Building default assets.bin based on configuration"
         VERBATIM
     )

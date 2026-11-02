@@ -30,6 +30,59 @@ struct mmap_assets_table {
     uint16_t asset_height;        /*!< Height of the asset */
 };
 
+#ifdef HAVE_LVGL
+namespace {
+
+/* 表情 cbin 的启动自检。
+ *
+ * 为什么必须有：cbin 的 dsc 是**盲拷**出来的 —— cbin_img_dsc_create() 用
+ * malloc_cpy 拷 sizeof(lv_img_dsc_t) 字节，再把 data 字段当偏移重定位，
+ * 中间没有任何校验。一旦喂进去的字节不是 cbin（最典型：assets 分区里还是
+ * 上一版固件的 PNG 表情；其次是 LVGL 被抬到 9.6，lv_font_t/lv_img_dsc_t
+ * 布局从 36/28 字节变了），LVGL 会拿随机字节当 w/h/stride 去读像素，症状是
+ * 整屏花屏/白屏。2026-10-22 的 cbin 字库版本耦合白屏就是这一类（见
+ * main/idf_component.yml:45 起的长注释），那次教训是「宁可少一张表情，
+ * 也不能把坏 dsc 塞进表情集合」。
+ *
+ * 判据**不含**「w == 64」：twemoji_32 是 32x32，写死 64 会让所有用 32 的
+ * 板卡表情全灭。按自洽性判更准 —— stride 必须是 w*2、data_size 必须等于
+ * stride*h + w*h、且不能超出资产的实际大小（防截断）。
+ */
+bool IsValidEmojiCbin(const char* name, const lv_img_dsc_t* dsc, size_t size) {
+    if (dsc == nullptr) {
+        return false;
+    }
+    const lv_image_header_t& h = dsc->header;
+    const uint32_t expect_data_size = (uint32_t)h.w * 2u * h.h + (uint32_t)h.w * h.h;
+    const char* why = nullptr;
+    if (h.magic != LV_IMAGE_HEADER_MAGIC) {
+        why = "magic 不是 0x19（不是 cbin，多半是旧版 PNG 资源，需重烧 assets 分区）";
+    } else if (h.cf != LV_COLOR_FORMAT_RGB565A8) {
+        why = "颜色格式不是 RGB565A8(0x14)";
+    } else if (h.w == 0 || h.h == 0) {
+        why = "宽或高为 0";
+    } else if (h.stride != (uint32_t)h.w * 2u) {
+        why = "stride 不等于 w*2";
+    } else if (dsc->data_size != expect_data_size) {
+        why = "data_size 与 w/h 不匹配";
+    } else if (size < sizeof(lv_img_dsc_t) + (size_t)dsc->data_size) {
+        why = "资产被截断（长度小于头部声明的 data_size）";
+    }
+    if (why != nullptr) {
+        ESP_LOGE(TAG,
+                 "表情 \"%s\" 的 cbin 头不合法：%s（magic=0x%02x cf=0x%02x "
+                 "%ux%u stride=%u data_size=%u 资产=%u B）",
+                 name, why, (unsigned)h.magic, (unsigned)h.cf, (unsigned)h.w,
+                 (unsigned)h.h, (unsigned)h.stride, (unsigned)dsc->data_size,
+                 (unsigned)size);
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+#endif  // HAVE_LVGL
+
 
 Assets::Assets() {
     // Initialize the partition
@@ -214,7 +267,23 @@ bool Assets::Apply() {
                         ESP_LOGE(TAG, "Emoji %s image file %s is not found", name->valuestring, file->valuestring);
                         continue;
                     }
-                    custom_emoji_collection->AddEmoji(name->valuestring, new LvglRawImage(ptr, size));
+                    /* 2026-11-02：表情资源从 PNG 换成 cbin。
+                     *
+                     * 原来这里 new LvglRawImage(ptr, size)，把 cf 设成
+                     * LV_COLOR_FORMAT_RAW_ALPHA 让 LVGL 自己嗅探 PNG —— 而
+                     * 本机 CONFIG_LV_CACHE_DEF_SIZE=0（图片缓存关着），于是
+                     * 每次重绘都重新 lodepng 解一遍（64x64 解成 RGBA8888
+                     * 峰值 16KB）。静态表情勉强能忍，待机跑马灯是逐帧重绘，
+                     * 每帧重解四五张会直接把 LVGL 任务拖死。
+                     * 现在打包期就转成裸 RGB565A8，LVGL 拿到的 dsc 一个字节
+                     * 都不用解，跑马灯和常规表情共用同一份资源。
+                     * 格式与「为什么不用 Pillow」见 scripts/emoji_cbin.py。 */
+                    auto* emoji_image = new LvglCBinImage(ptr);
+                    if (!IsValidEmojiCbin(name->valuestring, emoji_image->image_dsc(), size)) {
+                        delete emoji_image;
+                        continue;
+                    }
+                    custom_emoji_collection->AddEmoji(name->valuestring, emoji_image);
                 }
             }
         }

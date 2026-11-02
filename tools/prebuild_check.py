@@ -1089,6 +1089,210 @@ def main() -> int:
               "标志由 StartAntiBurnInTimer() 注册的状态回调写入",
               fatal=True)
 
+    # ------------------------------------------- C17 表情资源必须是 cbin
+    # 2026-11-02：表情图从「PNG 原样打包 + 设备端 lodepng 每次重绘解一遍」
+    # 改成「打包期转 cbin（裸 RGB565A8），设备端零解码」。
+    #
+    # 这条链路有两个**静默失败**面，编译期全绿、串口也不报错：
+    #   ① 打包退回 PNG：assets 里又出现 .png，设备端拿到 PNG 字节当 cbin 头
+    #      读 ⇒ 表情不显示（有自检时报错、没自检时花屏）。
+    #   ② cbin 头写错：头是 lv_img_dsc_t 的**内存镜像**，28 字节、位域落序，
+    #      写错一个字段（尤其把 data 偏移当 24、或 stride 写成 w）就是整屏
+    #      花屏/白屏 —— 与 2026-10-22 那次 cbin 字库版本耦合白屏同一类。
+    #
+    # 所以这里做三件事：把转换器**真的跑一遍**（不是看代码猜）、用**独立的
+    # 解析器**逐字段校验产物（不复用转换器的 struct 格式，否则等于自己证明
+    # 自己）、再静态确认打包侧没有「PNG 原样拷贝」的回头路。
+    #
+    # ⚠️ 源 PNG 在 managed_components/ 里（不进 git）：CI 第一次自检时组件
+    # 还没下载 ⇒ 无判据，必须 SKIP；set-target 之后那次自检才会真跑。
+    _c17_png_root = None
+    _mc_dir = XIAOZHI / "managed_components"
+    if _mc_dir.is_dir():
+        for _cand in sorted(_mc_dir.glob("*xiaozhi-fonts")):
+            if (_cand / "png").is_dir():
+                _c17_png_root = _cand / "png"
+                break
+
+    _c17_bad: list[str] = []
+
+    # ---- (a) 静态：打包侧不许再有 PNG 原样拷贝 ----
+    # ⚠️ 打包脚本是 **Python**，不能用上面的 _func_body（它按 C 的花括号配平
+    # 切函数体）——对 .py 用它会切出完全无关的一段，判据就成了瞎判。
+    def _c17_py_body(src: str, name: str) -> str | None:
+        """按缩进切出 Python 函数体（含 def 行，到下一个同级语句为止）。"""
+        lines = src.splitlines()
+        start = None
+        for i, ln in enumerate(lines):
+            if ln.lstrip().startswith(f"def {name}("):
+                start = i
+                break
+        if start is None:
+            return None
+        indent = len(lines[start]) - len(lines[start].lstrip())
+        out = [lines[start]]
+        for ln in lines[start + 1:]:
+            if ln.strip() and (len(ln) - len(ln.lstrip())) <= indent:
+                break
+            out.append(ln)
+        return "\n".join(out)
+
+    _c17_bda = XIAOZHI / "scripts" / "build_default_assets.py"
+    if not _c17_bda.is_file():
+        _c17_bad.append("scripts/build_default_assets.py 不存在")
+    else:
+        _c17_body = _c17_py_body(
+            _c17_bda.read_text(encoding="utf-8", errors="replace"),
+            "process_emoji_collection")
+        if _c17_body is None:
+            _c17_bad.append("取不到 process_emoji_collection() 的函数体")
+        else:
+            if "png_to_cbin(" not in _c17_body:
+                _c17_bad.append("process_emoji_collection() 没调用 png_to_cbin()")
+            if "copy_file(" in _c17_body:
+                _c17_bad.append("process_emoji_collection() 里还有 copy_file() —— "
+                                "PNG 又被原样拷进 assets 了")
+            if ".bin" not in _c17_body:
+                _c17_bad.append("process_emoji_collection() 没有把产物命名成 .bin")
+
+    # ---- (b) 静态：设备端必须用 cbin 图并过自检 ----
+    _c17_acc = XIAOZHI / "main" / "assets.cc"
+    if not _c17_acc.is_file():
+        _c17_bad.append("main/assets.cc 不存在")
+    else:
+        _c17_acc_code = _strip_comments(
+            _c17_acc.read_text(encoding="utf-8", errors="replace"))
+        if "new LvglCBinImage(ptr)" not in _c17_acc_code:
+            _c17_bad.append("assets.cc 的表情分支没有 `new LvglCBinImage(ptr)`")
+        if "new LvglRawImage(ptr, size)" in _c17_acc_code:
+            _c17_bad.append("assets.cc 里还有 `new LvglRawImage(ptr, size)` —— "
+                            "表情又回到运行时解码 PNG 了")
+        if "IsValidEmojiCbin(" not in _c17_acc_code:
+            _c17_bad.append("assets.cc 没有调 IsValidEmojiCbin() —— 坏头会被"
+                            "直接塞进表情集合（花屏/白屏）")
+
+    # ---- (c) 动态：跑一遍转换器，用独立解析器校验产物 ----
+    _c17_total = 0
+    if _c17_png_root is None:
+        # 组件还没下载 ⇒ 动态部分无判据；但静态问题照样要拦。
+        if _c17_bad:
+            check("C17 表情资源必须是打包期转好的 cbin（RGB565A8 零解码）",
+                  False, "⚠️ " + "；".join(_c17_bad[:6]), fatal=True)
+        else:
+            check("C17 表情资源必须是打包期转好的 cbin（RGB565A8 零解码）",
+                  SKIP,
+                  "找不到 managed_components/*xiaozhi-fonts/png（组件还没下载，"
+                  "首次自检必然如此）⇒ 只做了静态部分：打包侧已转 cbin、"
+                  "设备端已用 LvglCBinImage + 头自检。set-target 之后那次"
+                  "自检会把每个表情集里的 PNG 真正跑一遍。")
+    else:
+        import importlib.util
+
+        _c17_mod = None
+        _c17_mod_err = ""
+        _c17_py = XIAOZHI / "scripts" / "emoji_cbin.py"
+        try:
+            _spec = importlib.util.spec_from_file_location("_emoji_cbin", _c17_py)
+            _c17_mod = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_c17_mod)
+        except Exception as exc:            # noqa: BLE001 - 要把原因打进详情
+            _c17_mod_err = f"加载 scripts/emoji_cbin.py 失败: {exc}"
+
+        def _c17_parse(blob: bytes) -> tuple[tuple[int, int] | None, str]:
+            """按 cbin 头的**字节表**独立解析（不复用转换器的打包代码）。
+
+            字段偏移逐条写字面量：0=magic 1=cf 2..3=flags 4..5=w 6..7=h
+            8..9=stride 10..11=reserved_2 12..15=data_size 16..19=data 偏移
+            20..23/24..27=reserved。头长 28（lv_img_dsc_t = 12 字节 header
+            + data_size + data + reserved + reserved_2）。
+            """
+            if len(blob) < 28:
+                return None, f"只有 {len(blob)} 字节，不足 28 字节头"
+            magic = blob[0]
+            cf = blob[1]
+            flags = int.from_bytes(blob[2:4], "little")
+            w = int.from_bytes(blob[4:6], "little")
+            h = int.from_bytes(blob[6:8], "little")
+            stride = int.from_bytes(blob[8:10], "little")
+            rsv2 = int.from_bytes(blob[10:12], "little")
+            data_size = int.from_bytes(blob[12:16], "little")
+            data_off = int.from_bytes(blob[16:20], "little")
+            rsv_a = int.from_bytes(blob[20:24], "little")
+            rsv_b = int.from_bytes(blob[24:28], "little")
+            errs = []
+            if magic != 0x19:
+                errs.append(f"magic=0x{magic:02x}（应 0x19）")
+            if cf != 0x14:
+                errs.append(f"cf=0x{cf:02x}（应 0x14 RGB565A8）")
+            if flags != 0:
+                errs.append(f"flags={flags}（应 0）")
+            if w == 0 or h == 0:
+                errs.append(f"宽高 {w}x{h}")
+            if stride != w * 2:
+                errs.append(f"stride={stride}（应 w*2={w * 2}）")
+            if rsv2 != 0:
+                errs.append(f"reserved_2={rsv2}（应 0）")
+            if data_off != 28:
+                errs.append(f"data 偏移={data_off}（应 28）")
+            if data_size != stride * h + w * h:
+                errs.append(f"data_size={data_size}（应 stride*h+w*h="
+                            f"{stride * h + w * h}）")
+            if len(blob) != 28 + data_size:
+                errs.append(f"文件长 {len(blob)}（应 28+data_size="
+                            f"{28 + data_size}）")
+            if rsv_a or rsv_b:
+                errs.append("reserved 非 0")
+            return (w, h), "；".join(errs)
+
+        if _c17_mod is None:
+            _c17_bad.append(_c17_mod_err)
+        else:
+            _c17_checked = 0
+            for _coll in sorted(p for p in _c17_png_root.iterdir() if p.is_dir()):
+                _pngs = sorted(_coll.glob("*.png"))
+                if not _pngs:
+                    continue
+                _c17_total += len(_pngs)
+                for _png in _pngs:
+                    try:
+                        _blob = _c17_mod.png_to_cbin(str(_png))
+                    except Exception as exc:   # noqa: BLE001
+                        _c17_bad.append(f"{_coll.name}/{_png.name} 转换抛异常: {exc}")
+                        continue
+                    _wh, _why = _c17_parse(_blob)
+                    if _why:
+                        _c17_bad.append(f"{_coll.name}/{_png.name}: {_why}")
+                        continue
+                    # 与源 PNG 的 IHDR 对账（宽高必须一致，否则就是转错图）
+                    _raw = _png.read_bytes()
+                    if _raw[:8] != b"\x89PNG\r\n\x1a\n":
+                        _c17_bad.append(f"{_coll.name}/{_png.name} 不是 PNG")
+                        continue
+                    _pw = int.from_bytes(_raw[16:20], "big")
+                    _ph = int.from_bytes(_raw[20:24], "big")
+                    if _wh != (_pw, _ph):
+                        _c17_bad.append(
+                            f"{_coll.name}/{_png.name}: 产物 {_wh[0]}x{_wh[1]} "
+                            f"≠ 源图 {_pw}x{_ph}")
+                        continue
+                    _c17_checked += 1
+            # 一一对应：产物数量必须等于源 PNG 数量（每个 PNG 都过了一遍）
+            if _c17_total == 0:
+                _c17_bad.append(f"{_c17_png_root} 下没有任何 PNG")
+            elif _c17_checked != _c17_total:
+                _c17_bad.append(f"只有 {_c17_checked}/{_c17_total} 张 PNG 通过校验")
+
+        check("C17 表情资源必须是打包期转好的 cbin（RGB565A8 零解码）",
+              not _c17_bad,
+              ("⚠️ " + "；".join(_c17_bad[:6]) +
+               "。设备端拿到坏头会把随机字节当 w/h/stride 读，症状是整屏"
+               "花屏/白屏（2026-10-22 同类事故），编译和串口都不会报。"
+               ) if _c17_bad else
+              f"{_c17_total} 张 PNG 全部转出合法 cbin（头 28 字节 / magic "
+              f"0x19 / cf 0x14 / stride=w*2 / data_size 自洽 / 宽高与源图一致）；"
+              "打包侧无 PNG 原样拷贝，设备端走 LvglCBinImage + 头自检",
+              fatal=True)
+
     # ------------------------------------------------------ 汇总
     failed = [r for r in results if not r[1] and r[3]]
     warned = [r for r in results if not r[1] and not r[3]]
