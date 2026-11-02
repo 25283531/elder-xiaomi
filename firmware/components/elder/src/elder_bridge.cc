@@ -741,9 +741,11 @@ void OnDeviceStateChanged(DeviceState prev, DeviceState cur)
 
     if (cur == kDeviceStateIdle) {
         elder_rgb_set_emotion(ELDER_EMO_NEUTRAL);
-        /* 需求 7（2026-10-22 用户新需求）：进待机立刻播动态熊猫 ——
-         * 「进入待机状态强制切换到待机动态熊猫图案，以便区分硬件是否
+        /* 需求 7（2026-10-22 用户新需求）：进待机立刻播待机指示灯 ——
+         * 「进入待机状态强制切换到待机动态图案，以便区分硬件是否
          * 在监听声音，让用户知道是否需要唤醒词进行唤醒」。
+         * 2026-11-03 用户定调：原「待机熊猫」删掉，这个位置改放跑马灯
+         * （表情逐张从右往左滚过图片区），见 LcdDisplay::StartIdleMarquee()。
          * 详见 LcdDisplay::PlayIdleAnimation() 的注释（为什么不能等
          * 防烧屏的 60 秒）。
          *
@@ -753,7 +755,7 @@ void OnDeviceStateChanged(DeviceState prev, DeviceState cur)
          *     这里必须再确认一次 overlay 没挂着 —— 提醒中抢屏 = 老人
          *     看不到该做什么（吃药/喝水），那是医疗级事故；
          *   ② AsLcdDisplay() 可能返回 nullptr（无屏/非本板卡），那时
-         *      静默跳过：待机本身（收音/唤醒词）不受影响，只是没熊猫。 */
+         *      静默跳过：待机本身（收音/唤醒词）不受影响，只是没跑马灯。 */
         if (!elder_ui_reminder_showing()) {
             if (auto *lcd = AsLcdDisplay()) {
                 lcd->PlayIdleAnimation();
@@ -860,11 +862,12 @@ extern "C" void elder_enter_standby(void)
     ESP_LOGI(TAG, "进入待机：关闭收音、重新打开唤醒词（下次唤醒前不监听不应答）");
     app.Schedule([]() {
         Application::GetInstance().SetDeviceState(kDeviceStateIdle);
-        /* 需求 7（2026-10-22）：待机屏立刻换成动态熊猫。
+        /* 需求 7（2026-10-22）：待机屏立刻换成待机指示灯（2026-11-03 起
+         * 是跑马灯，原动态熊猫已删除）。
          *
          * 为什么这里还要再调一次：设备**已经**是 idle 时
          * SetDeviceState 不产生状态变化事件，OnDeviceStateChanged 里
-         * 的播放不会发生 —— 只有直接调才能保证熊猫一定播上。
+         * 的播放不会发生 —— 只有直接调才能保证跑马灯一定播上。
          *
          * 全屏提醒挂着时不播：提醒占着整屏，抢屏就是让老人看不到
          * 「该吃药了」。AsLcdDisplay() 为 nullptr（无屏设备）时静默

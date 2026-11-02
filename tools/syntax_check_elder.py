@@ -76,6 +76,16 @@ TARGETS = {
     #    base_command() 会回退到同后缀模板（rgb.c）—— 这是脚本设计好的行为。
     "elder_clip.c": ROOT / "firmware" / "components" / "elder" / "src" / "elder_clip.c",
     "ui.c": ROOT / "firmware" / "xiaozhi" / "components" / "elder" / "src" / "ui.c",
+    # 2026-11-03 加 lcd_display.cc：待机熊猫删除 + 待机跑马灯（1 个 lv_image +
+    # lv_anim 驱动 x）全落在这个文件里，而它恰好是**改动最频繁的"直接改上游"
+    # 文件**（70/30 布局、全屏提醒、跑马灯都在这里），却一直没有任何编译级门禁。
+    # 为什么检查 .cc 而不是 .h：头文件没有独立编译单元，改坏了只会炸在**引用
+    # 它的**编译单元上（2026-11-03 真实发生过：lcd_display.h 多一个 `};` 把
+    # class 提前闭合，报错全落在 elder_bridge.cc 的 ShowReminder 上，让人以为
+    # 是 elder 的回归）。lcd_display.cc 自己就 include 这个头，改坏了当场红。
+    # ⚠️ 它属于 main 组件，-I 集合与 elder 组件不同 —— 靠 base_command() 优先
+    #    用该文件自己那条命令来保证正确（回退模板会给出一堆假红）。
+    "lcd_display.cc": ROOT / "firmware" / "xiaozhi" / "main" / "display" / "lcd_display.cc",
 }
 
 #: 需要确保存在的宏（见坑 3）。
