@@ -49,6 +49,7 @@ from ..macs import norm_mac
 from ..chat_quota import local_date_str, quota_snapshot, record_chat_usage
 from ..memory import bridge as memory_bridge
 from ..memory.persona import tone_profile
+from ..memory.textutil import sanitize_for_prompt
 from ..models import InteractionKind
 from ..security import decode_token
 from .. import models as _m
@@ -65,7 +66,8 @@ from .prompts import (
     now_context,
     reminder_context,
 )
-from .tools import TOOL_DEFS, clock_mentions, execute_tool
+from .tools import (TOOL_DEFS, clock_mentions, execute_tool, medicine_names,
+                    pending_medicine_events)
 
 log = logging.getLogger(__name__)
 
@@ -425,47 +427,75 @@ _NEG_RE: Final[re.Pattern[str]] = re.compile(
 #: 差别在**上下文** —— 创建时老人说「提醒我八点吃药」，意图自明；而
 #: 「我已经喝完水了」在模型眼里就是一句闲聊，它不知道屏上正挂着一条提醒。
 #: 把状态摆到 system 里，模型才有依据去调 confirm_reminder。
+#:
+#: 2026-11-03 改：从「一个标题」升级成「清单 + 追问纪律」。固件 a85f21f 之后
+#: 长按确认键只负责进对话、把话说清（「您吃的是哪种药？」），"哪条日程被确认了"
+#: 完全落在服务端 + 模型身上。清单里同时给出逐味进度，模型才知道还剩哪味要问。
 _PENDING_REMINDER_HINT: Final[str] = (
-    "【当前状态】设备上有一条**已响铃、尚未确认**的提醒：「{title}」。"
-    "屏幕正全屏显示它的内容，老人不确认就一直不会消失。\n"
-    "他只要表示这件事已经办完（「我吃过了」「喝完了」「弄好了」），"
-    "就**必须调用 confirm_reminder**，不能只口头答应 —— 不调用的话屏幕不会退，"
-    "老人会以为设备坏了。\n"
-    # 2026-10-27 改：GPIO11 的按键已经接上并可用（用户实测确认），
-    # 而且确认流程改成两档置信度 —— 语音只能算半置信，必须按键复核。
-    # 原先这段明令"不要说按按钮"，现在会直接和产品行为对着干。
-    "调用 confirm_reminder 之后，**照着工具返回的话术**让老人长按设备上那颗"
-    "亮橙色指示灯的按钮 3 秒，等它闪蓝色三次再松手；这一次按键才是真正的确认。"
-    "他如果问「怎么关掉/怎么消掉」，也是这个回答：说一声办完了，再长按按钮 3 秒。"
+    "【当前状态】设备上有**已到点、尚未确认**的服药提醒，清单如下"
+    "（括号里是逐味确认进度）：\n{block}\n"
+    "屏幕正在（或马上）全屏显示这些内容，老人不确认就不会消失。下面是确认纪律，"
+    "必须照做 —— 你要写进的是服药记录，**认错药比多问一句危险得多**：\n"
+    "· 老人点了名（「降压药吃了」「氨氯地平吃了」）→ 调用 confirm_reminder，"
+    "把他说出的那个词**原样**填进 medicine 参数。**不要**自己把「降压药」换成"
+    "具体药名：服务端有一张专门的匹配表，你猜的药名很可能猜错。\n"
+    "· 老人只说了「吃了」「吃过了」，而清单里不止一条、或那条提醒挂着两味以上"
+    "却没说是哪一味 → **必须先问清是哪一种**，不许把几条一起确认，更不许只凭"
+    "「吃了」两个字替他挑一条。\n"
+    "· 工具返回 ambiguous（候选药名）→ 把候选药名一个一个念给他听，让他挑一个，"
+    "再带他挑的那个词重新调用。\n"
+    "· 工具返回 matched=false → 复述一遍候选药名再问一次；**最多再问两轮**，"
+    "仍然问不出来就如实说「我先记着，您方便时看一眼药盒」，然后结束这个话题，"
+    "不要无限追问。\n"
+    "· 确认完一条后，如果清单里还有别的待确认提醒，主动追问下一条"
+    "（「那降糖药吃了吗？」），直到每条都有确切答案。\n"
+    "· 老人含糊其辞（「好像吃了」「应该吃了吧」）**不算确认**，继续问，"
+    "绝不许替他确认。\n"
+    "· 他如果问「怎么关掉 / 怎么消掉」，回答就是：说清吃了哪种药，记下之后"
+    "屏幕就会退。\n"
+    "· 只陈述「记下了」；**不许报剂量、不许建议加量减量或停药**。"
 )
 
 
 def _pending_reminder_label(device_pk: int) -> str:
-    """设备上「已响铃、尚未确认」的提醒标题；没有则返回空串。
+    """当前待确认服药提醒的**清单**（渲染成多行文本）；没有则返回空串。
 
-    数据源是 ``reminder_events.state == FIRED`` —— 设备响铃时会回传
-    ``state=1``，确认后变 CONFIRMED，超时变 MISSED。所以这一条查询
-    恰好等价于「屏幕现在是不是正挂着一条提醒」。
+    数据源直接复用 ``tools.pending_medicine_events`` —— 这份清单的用途是让模型
+    知道"还有哪几条没确认"，它必须与 ``confirm_reminder`` 眼里的候选集**是同一
+    批**，否则模型会追问一条工具根本确认不了的提醒（典型症状：老人回答了，
+    工具却答「没有等着确认的提醒」）。所以这里不再另写一份 SQL。
+
+    性能：那个函数是一次 ``join`` 把 ``Reminder`` 一起捞出来的（不是逐条
+    ``db.get``）。本函数每轮对话开头都会调一次（见 ``_run_turn``），N+1 会让
+    每一轮多出几条查询。
+
+    ⚠️ 换行：模板里的换行是我们自己拼的，不会被 ``sanitize_for_prompt`` 压平；
+    但**每个字段都要单独过 sanitize**。整段过一遍会把多行压成一行
+    「- 「早上吃药」：氨氯地平（0/1 味） - 「中午吃药」：…」，模型分不清哪句
+    属于哪条 —— 而且不会报错，只会答得含糊。药名/标题是家属可控输入，也必须
+    防它靠换行伪造出角色行（见 ``textutil.has_role_marker``）。
 
     任何异常都吞掉返回空串：这条提示是**加分项**，查不到就不注入，
     绝不能因为它把整轮对话打挂。
     """
     try:
         with SessionLocal() as db:
-            row = db.execute(
-                select(_m.Reminder.title)
-                .join(_m.ReminderEvent,
-                      _m.ReminderEvent.reminder_id == _m.Reminder.id)
-                .where(_m.ReminderEvent.device_id == device_pk,
-                       _m.ReminderEvent.state == int(_m.EventState.FIRED),
-                       # 软删除（2026-10-30）：已删除的提醒不该再被当成
-                       # 「屏幕上正挂着的那条」。否则老人删掉提醒后，模型仍
-                       # 会对着一条不存在的提醒说"您先把药吃了再确认"。
-                       _m.Reminder.deleted_at.is_(None))
-                .order_by(_m.ReminderEvent.due_at.desc())
-                .limit(1)
-            ).first()
-            return str(row[0]) if row and row[0] else ""
+            rows = pending_medicine_events(db, device_pk)
+            if not rows:
+                return ""
+            lines: list[str] = []
+            for ev, rule in rows:
+                names = medicine_names(rule)
+                done = [n for n in (ev.confirmed_medicines or []) if n in names]
+                title = sanitize_for_prompt(str(rule.title or ""), limit=40)
+                if names:
+                    meds = "、".join(sanitize_for_prompt(n, limit=32)
+                                    for n in names)
+                    progress = f"（已确认 {len(done)}/{len(names)} 味）"
+                else:
+                    meds, progress = "未登记药名", ""
+                lines.append(f"- 「{title}」：{meds}{progress}")
+            return "\n".join(lines)
     except Exception:  # noqa: BLE001
         log.debug("查询待确认提醒失败（不影响本轮对话）", exc_info=True)
         return ""
@@ -785,8 +815,9 @@ class VoiceSession:
         # 本轮命中了"强确认"措辞（喝完了/吃过了…）。模型若没自己调
         # confirm_reminder，由服务端补一刀 —— 理由见 _CONFIRM_RE 上方注释。
         self._confirm_candidate: bool = False
-        # 设备上「已响铃未确认」的提醒标题（每轮开头查一次）。
-        # 非空时 system 里会多一段状态说明，模型才知道该调 confirm_reminder。
+        # 设备上「已响铃未确认」的服药提醒**清单**（每轮开头查一次，多行文本）。
+        # 非空时 system 里会多一段状态说明 + 追问纪律，模型才知道该调
+        # confirm_reminder、以及还剩哪一味没问。空串 = 不注入（行为与旧版一致）。
         self._pending_reminder: str = ""
 
         # 当前这一轮的播报器（_ReplySpeaker）。abort 时要能立刻丢掉它
@@ -2099,8 +2130,8 @@ class VoiceSession:
         # 那一刻会话已经结束了。放在 ASR 空结果之后同理（空识别不是内容）。
         self._last_active_at = time.monotonic()
 
-        # ---- 屏上是否正挂着一条待确认的提醒 ----
-        # 两个用途：① 注入 system 让模型知道该调 confirm_reminder；
+        # ---- 屏上是否正挂着待确认的服药提醒（清单，可能多条）----
+        # 两个用途：① 注入 system 让模型知道该调 confirm_reminder、还剩哪味要问；
         # ② 模型漏调时由服务端补一刀（见下面 _confirm_candidate 的收尾）。
         self._pending_reminder = _pending_reminder_label(self.dev.id)
         # 有确认措辞 **且** 没有否定措辞才算。见 _NEG_RE 上方注释：
@@ -2108,8 +2139,10 @@ class VoiceSession:
         self._confirm_candidate = (bool(_CONFIRM_RE.search(utterance))
                                    and not _NEG_RE.search(utterance))
         if self._pending_reminder:
-            log.info("[%s] 设备上有待确认提醒「%s」，已注入 system%s",
-                     self.session_id, self._pending_reminder,
+            # 清单是多行的，日志里压成一行，免得一条日志刷十几行。
+            log.info("[%s] 待确认提醒清单：%s%s",
+                     self.session_id,
+                     self._pending_reminder.replace("\n", " | "),
                      "；本轮命中强确认措辞" if self._confirm_candidate else "")
 
         log.info("[%s] 识别：%s", self.session_id, utterance)
@@ -2236,7 +2269,7 @@ class VoiceSession:
         # 屏幕就永远不退（2026-10-22 真机：白屏挂了 20 分钟）。
         if self._pending_reminder:
             system = system + "\n\n" + _PENDING_REMINDER_HINT.format(
-                title=self._pending_reminder)
+                block=self._pending_reminder)
 
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend(self._history[-config.VOICE_HISTORY_TURNS * 2:])
