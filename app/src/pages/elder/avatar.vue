@@ -48,10 +48,6 @@ async function onClear() {
   catch { /* 已提示 */ }
 }
 
-function clipCount(a: Avatar) {
-  return Object.keys(a.clips || {}).length
-}
-
 // 灯效摘要：只取"待机"和"提醒"两个用户最能感知的状态。
 // 2026-10-31 起灯效**已由固件消费**（服务端 device.sync 下发 lights，
 // 固件 sync.c 的 apply_lights → rgb.c 的 elder_rgb_apply_config）。
@@ -104,12 +100,12 @@ onShow(() => { refresh() })
       </view>
       <text class="sub">{{ a.description || '暂无描述' }}</text>
       <text class="sub">{{ lightSummary(a) }}</text>
-      <!-- 资源包 / 片段 / 分辨率这三项固件当前**都不消费**，
+      <!-- 资源包 / 分辨率这两项固件当前**都不消费**，
            所以只在下面用小字如实说明，不放在主信息行里冒充"生效中"。 -->
       <text class="sub dim">
-        资源包 {{ a.eaf_pack_name || '—' }} · 片段 {{ clipCount(a) }} 个 · {{ a.screen_width }}×{{ a.screen_height }}
+        资源包 {{ a.eaf_pack_name || '—' }} · {{ a.screen_width }}×{{ a.screen_height }}
       </text>
-      <text class="sub dim">以上三项当前固件尚未消费，暂不影响设备显示</text>
+      <text class="sub dim">以上两项当前固件尚未消费，暂不影响设备显示</text>
     </view>
 
     <view v-if="avatars.length === 0" class="tip">还没有形象，请先到 WEB 管理后台添加</view>

@@ -368,10 +368,15 @@ class AvatarIn(ORMBase):
     device_api.sync 只取 ``role.tts_voice``，形象编辑表单也不再带这个字段 ——
     "角色优先、形象兜底"那条兼容路径已按"开发测试阶段不留兼容代码"拆掉。
 
-    clips / emotion_lights 在**序列化时也归一**：老库里只有 ``rgb``/``effect``
+    ``emotion_lights`` 在**序列化时也归一**：老库里只有 ``rgb``/``effect``
     两项，不补 ``brightness``/``interval_ms`` 的话前端滑杆显示空值、保存时
     把 undefined 写成 null。归一函数本身不抛错（缺什么补默认），所以对
     脏数据是"降级"而不是"整个列表接口 500"。
+
+    ``clips`` **已彻底摘除**（2026-11-02）：它描述的动画片段映射只给已删除的
+    emote 引擎用，固件从来没有消费者。库里那一列还在（没有 Alembic，删不掉），
+    但既不读也不写 —— 老前端继续提交 ``clips`` 也不会 422（本模型
+    ``extra`` 走 Pydantic v2 默认的 ``ignore``），只是被静默丢弃。
     """
 
     name: str
@@ -381,20 +386,13 @@ class AvatarIn(ORMBase):
     eaf_pack_sha256: str = ""
     screen_width: int = 320
     screen_height: int = 240
-    clips: dict[str, str] = Field(default_factory=dict, validate_default=True)
     emotion_lights: dict[str, Any] = Field(default_factory=dict, validate_default=True)
     enabled: bool = True
 
     # ⚠️ ``validate_default=True`` 不能省。Pydantic v2 默认**不校验默认值** ——
-    # 不传 clips 时 default_factory 直接产出 {}，validator 根本不跑，
-    # 于是"AvatarIn 的 clips 永远是完整 9 项"这条约定在"新建时不传"这条
-    # 最常见的路径上悄悄不成立（表现为设备上待机表情不动）。
-    @field_validator("clips", mode="after")
-    @classmethod
-    def _norm_clips(cls, v: dict[str, str]) -> dict[str, str]:
-        from .avatar_style import normalize_clips
-        return normalize_clips(v)
-
+    # 不传 emotion_lights 时 default_factory 直接产出 {}，validator 根本不跑，
+    # 于是"归一后的 emotion_lights 永远是完整 7 状态"这条约定在"新建时不传"
+    # 这条最常见的路径上悄悄不成立（表现为设备上灯效退回固件默认）。
     @field_validator("emotion_lights", mode="after")
     @classmethod
     def _norm_lights(cls, v: dict[str, Any]) -> dict[str, Any]:

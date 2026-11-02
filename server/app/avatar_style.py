@@ -1,8 +1,8 @@
-"""形象「外观资产」的唯一真源：clips（动画片段映射）+ 情绪灯效。
+"""形象「外观资产」的唯一真源：情绪灯效。
 
 为什么单独一个模块而不是塞在 ``routers/avatars.py`` 里
 ------------------------------------------------------
-这三样东西被**三方**同时需要：
+这些常量被**三方**同时需要：
   1. ``routers/avatars.py`` —— 增删改查时归一；
   2. ``schemas.py`` —— ``AvatarOut`` 序列化时归一（老库里只有 rgb/effect，
      不补全的话前端滑杆显示空值）；
@@ -18,33 +18,6 @@
 from __future__ import annotations
 
 import re
-
-# ================================================================ clips
-# 端侧约定的语义片段名，作为默认映射，便于管理页一键填充
-DEFAULT_CLIPS: dict[str, str] = {
-    "idle": "idle",
-    "listening": "listening",
-    "thinking": "thinking",
-    "mouth_open": "mouth_open",
-    "mouth_half": "mouth_half",
-    "smile": "smile",
-    "blink": "blink",
-    "sleepy": "sleepy",
-    "alert": "alert",
-}
-
-# clips 每一项的含义。前端据此渲染"状态 → 片段名"的表单，**不硬编码中文**。
-CLIP_STATES: tuple[tuple[str, str], ...] = (
-    ("idle", "待机"),
-    ("listening", "聆听中"),
-    ("thinking", "思考中"),
-    ("mouth_open", "说话·张嘴"),
-    ("mouth_half", "说话·半张"),
-    ("smile", "微笑"),
-    ("blink", "眨眼"),
-    ("sleepy", "困倦"),
-    ("alert", "警示（未服药）"),
-)
 
 # ================================================================ 灯效
 # 状态键即 ``emotion_lights`` 的 key。顺序 = 前端展示顺序。
@@ -256,19 +229,4 @@ def normalize_lights(raw: object) -> dict[str, dict]:
             "rgb": rgb, "effect": effect,
             "brightness": brightness, "interval_ms": interval,
         }
-    return out
-
-
-def normalize_clips(raw: object) -> dict[str, str]:
-    """clips 归一成 9 个状态全在的映射；缺的补默认，多的丢掉。
-
-    丢多的而不是原样保留：固件侧按键名查表，多出来的键永远查不到，
-    留着只会让"我明明配了 12 个片段"变成一句查不出所以然的抱怨。
-    """
-    src = raw if isinstance(raw, dict) else {}
-    out: dict[str, str] = {}
-    for key, _label in CLIP_STATES:
-        val = src.get(key)
-        out[key] = (str(val).strip()
-                    if isinstance(val, str) and val.strip() else DEFAULT_CLIPS[key])
     return out

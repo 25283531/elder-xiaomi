@@ -305,16 +305,9 @@ class Avatar(Base):
         ``role.tts_voice``），形象侧既不读也不写。原先那条"角色优先、形象兜底"
         已按"开发测试阶段不留兼容代码"的要求拆掉。
 
-    clips 约定（对应端侧 EAF 资源包内的片段名）：
-        idle        待机
-        listening   聆听中
-        thinking    思考中
-        mouth_open  说话·张嘴
-        mouth_half  说话·半张
-        smile       微笑
-        blink       眨眼
-        sleepy      困倦
-        alert       警示（未服药）
+    ``clips`` **已死**（2026-11-02）：动画片段映射只服务已删除的 emote 引擎，
+    固件从来没有消费者。API 已不再收发它（AvatarIn/Out 都摘掉了），
+    列保留只是因为本项目没有 Alembic、删不掉列 —— 别再把它捡回来当兜底。
     """
 
     __tablename__ = "avatars"
@@ -342,7 +335,9 @@ class Avatar(Base):
     screen_width: Mapped[int] = mapped_column(Integer, default=320)
     screen_height: Mapped[int] = mapped_column(Integer, default=240)
 
-    # 片段名映射，键为上面约定的语义名，值为资源包内实际片段名
+    # **已停用**（2026-11-02）：动画片段映射，随 emote 引擎一起废弃。
+    # 列还在是因为删不掉，但没有任何读写路径会碰它 —— 保留 ORM 映射只是为了让
+    # qa3_migration 的「模型列 vs 老库基线」对账继续成立（老库里本来就有这一列）。
     clips: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
 
     # ---- 已降级的人格字段（保留列，不再对外暴露，理由见类注释）----

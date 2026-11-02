@@ -138,8 +138,7 @@ def _seed() -> None:
     """
     from . import models
     from .persona import catalog, guardrails
-    from .routers.avatars import (DEFAULT_CLIPS, normalize_clips,
-                                  normalize_lights)
+    from .routers.avatars import normalize_lights
 
     with SessionLocal() as db:
         if db.query(models.User).count() == 0:
@@ -253,7 +252,6 @@ def _seed() -> None:
                 # 归一而不是 dict(DEFAULT_LIGHTS)：DEFAULT_LIGHTS 的值是嵌套 dict，
                 # dict() 只拷外层，seed 出来的这一行会和模块常量**共享内层对象**，
                 # 之后任何一次就地修改都会污染"出厂默认"。
-                clips=normalize_clips(dict(DEFAULT_CLIPS)),
                 # 音色**不在这里设**：形象已不持有音色，音色只来自角色
                 # （device_api.sync 只读 role.tts_voice）。种子形象不写这一列，
                 # 免得下次有人看到库里有值又把它当兜底捡回来。

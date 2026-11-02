@@ -659,7 +659,7 @@
               <td class="muted">{{a.description}}</td>
               <td><span class="tag" :class="a.record_type==='preset'?'':'ok'">
                 {{a.record_type==='preset'?'平台':'我的'}}</span></td>
-              <!-- 形象只管灯效 / EAF / clips / 资源包，音色已归人格 —— 这一列改成灯效摘要。
+              <!-- 形象只管灯效 / EAF / 资源包，音色已归人格 —— 这一列改成灯效摘要。
                    取待机与提醒两个最有代表性的状态，让用户一眼看出这个形象的"气质"。 -->
               <td>{{lightSummary(a)}}</td>
               <td>
@@ -709,19 +709,6 @@
             <label>简介</label><input v-model="aForm.description" style="width:100%" />
           </div>
           <div style="margin-top:12px">
-            <label>动画片段映射（设备处于某状态时播资源包里的哪段动画）</label>
-            <div class="muted" style="font-size:12px;line-height:1.6;margin:4px 0 8px">
-              右边填<b>EAF 资源包里的片段名</b>，留空则用默认同名片段。<br>
-              ⚠️ 当前固件<b>尚未消费</b>本映射，保存后不会改变设备表情。
-            </div>
-            <div class="grid g2">
-              <div v-for="cs in clipStates" :key="cs.key">
-                <label style="font-size:12px">{{cs.label}}</label>
-                <input v-model="aForm.clips[cs.key]" style="width:100%" :placeholder="cs.key" />
-              </div>
-            </div>
-          </div>
-          <div style="margin-top:14px">
             <label>情绪灯效（每个状态一行）</label>
             <div class="muted" style="font-size:12px;line-height:1.6;margin:4px 0 8px">
               每个状态选一个<b>效果</b>和一个<b>颜色</b>，两者独立。保存后随心跳下发到设备，
@@ -1360,8 +1347,8 @@ createApp({
       // 记忆
       memories: [], tone: null, personaPrompt: '',
       // 形象
-      // 形象只管灯效 / EAF / clips / 资源包；音色归人格预设。
-      // light* / clipStates 全部来自 GET /api/avatars/light-presets —— 状态 /
+      // 形象只管灯效 / EAF / 资源包；音色归人格预设。
+      // light* 全部来自 GET /api/avatars/light-presets —— 状态 /
       // 动效 / 色板清单是后端说了算的（固件按 key 与 effect 字符串匹配），
       // 前端不写死，否则加一个状态就得改三处（后端 + 网页 + APP）。
       avatars: [], aBox: null, aForm: null,
@@ -1370,7 +1357,6 @@ createApp({
       // 颜色弹窗：open + 目标状态 + 当前值 + 视口坐标（fixed 定位，见模板注释）
       lightPick: {open:false, key:'', rgb:'', top:0, left:0, randomAllowed:false},
       lightMeta: {brightness:{min:1,max:100}, interval_ms:{min:200,max:5000}, defaults:{}},
-      clipStates: [],
       // 角色
       rolePresets: [], myRoles: [], traitSpecs: [],
       deriveBox: null, deriveName: '',
@@ -1932,7 +1918,7 @@ createApp({
         const r = await this.api('/api/avatars'); if(r) this.avatars = r;
       }catch(e){ this.err = '形象列表加载失败：' + e.message; }
     },
-    // 灯效元数据：7 个状态、5 种动效、安全色板 + "随机"哨兵、9 个片段键、
+    // 灯效元数据：7 个状态、5 种动效、安全色板 + "随机"哨兵、
     // 亮度/间隔的取值范围。全部由后端下发 —— 固件按 key / effect 字符串匹配，
     // 前端写死一份必然漂移。
     async loadLightMeta(){
@@ -1944,12 +1930,11 @@ createApp({
         const rnd = r.random || {};
         this.lightRandomRgb = rnd.rgb || '#000000';
         this.lightRandomEffects = rnd.effects || [];
-        this.clipStates   = r.clip_states || [];
         this.lightMeta    = r;
         // 元数据可能比弹窗晚到（loadAll 是并行拉的）。那一刻 lightStates 已经
         // 有值、aForm.emotion_lights 还是 {} —— 模板会在 undefined 上取 .effect
         // 直接抛渲染错误，整个弹窗变空白。补一次归一即可，成本为零。
-        if (this.aBox && this.aForm){ this.fillClips(); this.fillLights(); }
+        if (this.aBox && this.aForm){ this.fillLights(); }
       }catch(e){ this.err = '灯效元数据加载失败：' + e.message; }
     },
     // 颜色的展示名：关灯不显示色名，随机显示"随机"，色板内的显示中文名，
@@ -1977,20 +1962,6 @@ createApp({
         return label + ' ' + (e ? e.label : l.effect) + (name ? '·' + name : '');
       };
       return one('neutral', '待机') + ' / ' + one('alert', '提醒');
-    },
-    // 保证 clips 9 个键都在：模板里直接 v-model="aForm.clips[cs.key]"，
-    // 键不存在时界面首次渲染是空的。
-    fillClips(){
-      const def = {idle:'idle',listening:'listening',thinking:'thinking',
-                   mouth_open:'mouth_open',mouth_half:'mouth_half',smile:'smile',
-                   blink:'blink',sleepy:'sleepy',alert:'alert'};
-      const src = this.aForm.clips || {};
-      const out = {};
-      this.clipStates.forEach(cs => {
-        out[cs.key] = (typeof src[cs.key] === 'string' && src[cs.key].trim())
-          ? src[cs.key] : (def[cs.key] || cs.key);
-      });
-      this.aForm.clips = out;
     },
     // 保证 emotion_lights 7 个状态 × 4 个字段都在。
     fillLights(){
@@ -2057,11 +2028,10 @@ createApp({
       // 形象不含音色：音色归人格预设。这里不再对 tts_voice 做任何回落/回传，
       // 提交时也不会带上它 —— 让后端 PATCH 走 exclude_unset 根本不碰那一列。
       this.aForm = a ? JSON.parse(JSON.stringify(a))
-                     : {name:'', description:'', clips:{}, emotion_lights:{}};
+                     : {name:'', description:'', emotion_lights:{}};
       delete this.aForm.tts_voice;
       // 必须在 aBox=true 之前补齐：模板里直接读 emotion_lights[st.key].effect，
       // 晚一步就会在首帧拿到 undefined 而报错。
-      this.fillClips();
       this.fillLights();
       this.aBox = true;
     },
@@ -2069,9 +2039,8 @@ createApp({
       if (!this.aForm.name){ this.err = '请填写形象名称'; return; }
       const body = JSON.parse(JSON.stringify(this.aForm));
       delete body.id; delete body.record_type; delete body.owner_id; delete body.created_at;
-      // 预置清单没取到时 fillClips / fillLights 补不出键，此时发空对象会**清掉**
-      // 库里已有的 clips / emotion_lights。宁可这一项不带，也不能拿空值覆盖。
-      if (!body.clips || !Object.keys(body.clips).length) delete body.clips;
+      // 预置清单没取到时 fillLights 补不出键，此时发空对象会**清掉**
+      // 库里已有的 emotion_lights。宁可这一项不带，也不能拿空值覆盖。
       if (!body.emotion_lights || !Object.keys(body.emotion_lights).length) delete body.emotion_lights;
       try{
         if (this.aForm.id) await this.api('/api/avatars/'+this.aForm.id, {method:'PATCH', body:JSON.stringify(body)});
