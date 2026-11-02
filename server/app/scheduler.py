@@ -24,6 +24,7 @@ from .db import SessionLocal
 from .device_state import mark_offline_devices
 from .models import Device, EventState, Reminder, ReminderEvent
 from .schedule import event_due_utc, local_now, materialize_events
+from .schemas import derive_medicines
 
 log = logging.getLogger("elder.scheduler")
 
@@ -99,6 +100,28 @@ def _warm_weather(session: Session, *, force: bool = False) -> None:
         log.debug("天气缓存清理失败（忽略）：%s", exc)
 
 
+def _timeout_note(rule: Reminder, ev: ReminderEvent) -> str:
+    """超时升级时写进 ``note`` 的一句话（含逐味确认进度）。
+
+    为什么进度必须写在这里：一条提醒挂多味药时，确认了 2/4 味**不能**置
+    CONFIRMED（依从率、漏服告警全看 state），于是它停在 FIRED、等着超时升级。
+    而 ``escalated`` 目前**没有任何推送实现** —— 家属能看到的中间态只有这个
+    ``note``（首页读它）。不写进度的话，"吃了两味、差两味"与"一味没吃"在家属
+    眼里长得一模一样。
+
+    全未确认时保持原来的「超时未确认」四个字，别让存量文案漂移。
+    """
+    names = [m.name for m in derive_medicines(
+        rule.title, rule.medicines, rule.dose or "")]
+    done = [n for n in (ev.confirmed_medicines or []) if n in names]
+    if not names or not done or len(done) >= len(names):
+        # len(done) >= len(names) 说明其实全确认过（老固件回执没改 state），
+        # 这时写「已确认 2/2」会自相矛盾，退回中性文案。
+        return "超时未确认"
+    return (f"超时未确认，已确认 {len(done)}/{len(names)} 味："
+            + "、".join(done))
+
+
 def _tick(session: Session) -> None:
     now = local_now()
 
@@ -136,7 +159,7 @@ def _tick(session: Session) -> None:
         if now > deadline:
             ev.state = int(EventState.MISSED)
             ev.escalated = True
-            ev.note = ev.note or "超时未确认"
+            ev.note = ev.note or _timeout_note(rule, ev)
     session.commit()
 
     # 3) 离线清扫：devices.online 只在设备上报时被置 True，
