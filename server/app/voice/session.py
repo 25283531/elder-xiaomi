@@ -63,6 +63,7 @@ from .prompts import (
     TOOL_LOOP_FALLBACK,
     build_system_prompt,
     now_context,
+    reminder_context,
 )
 from .tools import TOOL_DEFS, clock_mentions, execute_tool
 
@@ -2160,7 +2161,7 @@ class VoiceSession:
         # 为什么要和召回放在**同一个线程池任务**里：两者都要一个 DB 会话，
         # 分两次 run_in_threadpool 就多一次线程切换 + 多一个会话；
         # 而 memory_ctx 又正是 prompt 的输入，分开拿反而多一层拼装。
-        def _recall() -> str:
+        def _recall() -> tuple[str, str]:
             with SessionLocal() as db:
                 try:
                     ctx = memory_bridge.recall_for_reply(
@@ -2173,18 +2174,46 @@ class VoiceSession:
                 # examples_prompt 传空串：偏好示例已由 recall_for_reply
                 # （内部 build_persona_prompt）注入在 ctx 里，再传一次就是
                 # 同一段话在 prompt 里出现两遍（白烧 token + 诱导复读）。
-                return build_system_prompt(
+                system = build_system_prompt(
                     db, self.dev.owner_id, self.dev.agent_id,
                     memory_ctx=ctx, examples_prompt="")
+                # ---- 这位老人的全部启用提醒（每轮确定性全量注入）----
+                # 为什么走全量注入而不是记忆召回：记忆是每轮按**这句话**检索
+                # top-6，而设备提醒上限 16 条 ⇒ 第 7 条以后永远召不回来。
+                # 「不许说错药名用量」要的是完备性，不是相关性（详见
+                # prompts.reminder_context 的模块注释）。
+                #
+                # 为什么和召回共用这个 DB 会话：两者都只要一个 Session，
+                # 分开跑就多一次线程切换 + 多一个连接（与上面同一条理由）。
+                # 单独 try：提醒渲染失败只该"这一段没有"，不该把整份 prompt
+                # 打回 BASE（那会连带丢掉人格与记忆）。
+                try:
+                    reminder_ctx = reminder_context(db, self.dev.id)
+                except Exception as exc:  # noqa: BLE001  提醒是增益
+                    log.warning("[%s] 提醒注入失败，本轮按无提醒回答：%s: %s",
+                                self.session_id, type(exc).__name__, exc)
+                    reminder_ctx = ""
+                return system, reminder_ctx
 
         try:
-            system = await run_in_threadpool(_recall)
+            system, reminder_ctx = await run_in_threadpool(_recall)
         except Exception as exc:  # noqa: BLE001  连兜底都失败就退回基础口令
             log.warning("[%s] 组装口令失败，用基础口令回答：%s: %s",
                         self.session_id, type(exc).__name__, exc)
             system = BASE_VOICE_PROMPT
+            reminder_ctx = ""
 
         system = system + "\n\n" + now_context()
+        # ---- 提醒块：**放在 now_context 之后**（"下次：今天下午三点"要靠
+        # 上面那行的时间才对得上），且**非空才追加** —— 没有启用提醒时
+        # 追加一段只有标题的空块，模型会开始编提醒。
+        #
+        # 为什么是"build_system_prompt 返回后再追加"而不是塞进它的 join：
+        # 它内部有红线首尾不变式（persona/guardrails.assert_present），塞进去
+        # 要重新验证；而"返回后追加"已有四个先例（now_context / 说话人身份 /
+        # 待机复核 / 待确认提醒），风险最低，异常回退路径也自动覆盖到。
+        if reminder_ctx:
+            system = system + "\n\n" + reminder_ctx
         # ---- F3：说话人身份注入 system（仅该说话人在本会话首次出现时）
         # 与 user 消息的 JSON 包装是同一思路的两半：system 给"他是谁、
         # 该怎么介绍他"（description 在这里才派上用场），JSON 让模型自然

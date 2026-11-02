@@ -143,6 +143,16 @@ jobs:
       - name: 一次性提醒缺日期（回填 / 422 / 读路径不被拦）
         run: python tools/run_smoke.py logs/smoke_check_reminder_once.log python tools/check_reminder_once.py
 
+      # 提醒（时间 / 药名 / 每味剂量 / 类别）**每轮全量注入** system prompt。
+      # 这条门禁守的是「模型不许说错药名和用量」：它一旦失效，模型会照记忆
+      # 瞎编剂量、或者把已删/已停用的提醒继续念给老人听 —— 两者都**零报错**，
+      # 只在老人耳朵里表现为"设备记错了药"。A5（渲染结果必须有换行）尤其关键：
+      # 整段一旦过了 sanitize_for_prompt 就会被压成一行，16 条提醒糊成一句，
+      # 模型分不清哪句属于哪条，而这种退化在日志里完全看不出来。
+      # 进程内直跑（不需要起服务，自带临时库与固定"现在"），所以不占端口。
+      - name: 提醒注入 system prompt（全量 / 多味药剂量 / 时区 / 注入防护）
+        run: python tools/run_smoke.py logs/smoke_smoke_reminder_context.log python tools/smoke_reminder_context.py
+
       # P0：`devices.id` 无 AUTOINCREMENT ⇒ 删掉最大行后 pk 被复用，而已删设备的
       # 旧 device_token（ep 与代次都是 0）会**通过鉴权读到另一家人**的提醒与回执；
       # 同一根因还有一条不需要 token 的通道（Interaction / ChatUsage 无 cascade ⇒
