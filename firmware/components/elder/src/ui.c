@@ -28,7 +28,9 @@ static struct {
 /* 需求 8：全屏提醒最长显示多久。用户原话「持续时间 4 个小时」。 */
 #define ELDER_UI_REMINDER_HOLD_US (4LL * 60 * 60 * 1000 * 1000)
 
-/* 状态 → EAF 情绪名（与 main/boards/lichuang-dev/emote.json 对齐） */
+/* 状态 → 表情名（对应 twemoji_64 目录下的文件名，见 elder_ui.h 顶部说明）。
+ * 这些名字只用于屏上表情；灯效走另一条路（elder_rgb_set_emotion），
+ * 两者是独立的两套枚举，改一个不会带动另一个。 */
 static const char *const EMOTION[] = {
     "neutral",    /* ELDER_UI_IDLE       */
     "thinking",   /* ELDER_UI_LISTENING  */
