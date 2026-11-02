@@ -726,6 +726,28 @@ class ReminderEvent(Base):
     escalated: Mapped[bool] = mapped_column(Boolean, default=False)
     note: Mapped[str] = mapped_column(String(255), default="")
 
+    # 这一实例里**已经确认过的药名**（2026-11-03 加）。
+    #
+    # 为什么单开一列而不是复用 ``state``：``state`` 是整条实例的**二值**结果
+    # （PENDING/FIRED/CONFIRMED/MISSED/SKIPPED），回答不了「四味药吃了两味」
+    # 这种中间态。设备改成逐味确认后，同一个 ``(reminder_id, due_at)`` 会被
+    # 上报多次，每次点名一味药 —— 进度必须单独记，否则家属看到的仍然是
+    # 「已确认」，而老人实际只吃了两味。
+    #
+    # 存**药名字符串**而不是 ``medicines`` 里的下标：
+    #   * 家属事后改药名/调顺序，下标会指到别的药上（"确认过"变成"确认错了药"）；
+    #   * 药名是老人和家属共同的语言，历史记录里直接可读，不必再 JOIN 回规则。
+    # 代价是药名重名时分不清（例如两味都叫「降压药」）—— 那是 ``MedicinesItem``
+    # 本身就没有的区分度，不是这一列引入的问题。
+    #
+    # 元素是字符串，``schemas.MedicineItem.name`` 同口径（≤32 字，由上报端截断）。
+    # 与 ``Reminder.medicines`` 同风格用 JSON 列（理由见那里的三条），默认 ``[]``。
+    #
+    # ⚠️ JSON 列的可变对象陷阱：**就地 append 不标脏、不会落库**。
+    # 写点必须重新赋值（``ev.confirmed_medicines = list(...) + [name]``），
+    # 见 ``routers/device_api.report_event``。
+    confirmed_medicines: Mapped[list[str]] = mapped_column(JSON, default=list)
+
     reminder: Mapped["Reminder"] = relationship(back_populates="events")
 
 

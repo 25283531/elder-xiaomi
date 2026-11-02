@@ -299,6 +299,15 @@ NEW_COLUMNS: Final[list[tuple[str, str, str, str]]] = [
     # 实例上的 tz 是 due_at 的**解读方式**，不是展示偏好：
     # 少了它 due_at 就只是一个无法还原的裸钟点（SQLite 不保留 tzinfo）。
     ("reminder_events", "tz", "VARCHAR(64) DEFAULT ''", "VARCHAR(64) DEFAULT ''"),
+    # ---- reminder_events：逐味确认进度（2026-11-03）----
+    # 元素是**已确认的药名**（字符串数组），不是下标 —— 家属事后改药名/调顺序
+    # 时下标会指到别的药上，见 models.ReminderEvent.confirmed_medicines 注释。
+    # SQLite 侧**必须**写 DEFAULT '[]'：老行补列后读出空数组，语义正是
+    # 「还没有任何一味被单独确认」（老固件只有整条确认，``state`` 已经表达了）。
+    # 漏 DEFAULT 的话老行读出 NULL ⇒ EventOut 的 ``list[str]`` 直接校验失败，
+    # 后果不是"少个字段"而是 ``/api/device/events`` 与设备列表一起 500。
+    # MySQL 的 JSON 列不允许带 DEFAULT（见本清单开头），留空由读取端 ``or []`` 兜。
+    ("reminder_events", "confirmed_medicines", "TEXT DEFAULT '[]'", "JSON"),
     ("devices", "agent_id", "INTEGER", "INT NULL"),
     # 设备 token 代次：解绑时 +1，让旧 device_token（无状态 JWT）立即失效。
     # 没有它，管理员解绑只清了归属、没清访问权 —— 旧 token 在 365 天有效期内

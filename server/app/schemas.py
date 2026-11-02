@@ -1118,6 +1118,18 @@ class MedicineTodayItemOut(ORMBase):
     #: 与 ``HomeDeviceOut.name`` 同源。
     device_id: int = 0
     device_name: str = ""
+    #: 这一格已经确认过的药名（2026-11-03 加）。
+    #:
+    #: 为什么首页要带：家属看到「08:00 降压药+二甲双胍 已确认」时，如果老人
+    #: 只确认了其中一味，界面和真正吃完一模一样 —— 而漏掉的那味恰恰是最需要
+    #: 被追问的。空数组 = 没有逐味信息（老固件 / 整条确认），**不是**「都没吃」。
+    confirmed_medicines: list[str] = []
+
+    @field_validator("confirmed_medicines", mode="before")
+    @classmethod
+    def _none_confirmed_to_empty(cls, v: Any) -> Any:
+        """NULL → 空数组。MySQL JSON 列补列后老行是 NULL，见 ``EventOut`` 同名方法。"""
+        return v if v is not None else []
 
 
 class MedicineTodayOut(ORMBase):
@@ -1363,6 +1375,24 @@ class EventOut(ORMBase):
     #: 该实例所属提醒的标题（药品名 / 日程名）。默认空串：老调用方不认这个键
     #: 也不受影响；``routers.devices.device_events`` 会 join Reminder 填上。
     reminder_title: str = ""
+    #: 这一实例里**已经确认过的药名**（2026-11-03 加）。
+    #:
+    #: 与 ``state`` 并存而不是替代：``state`` 是整条实例的结论，这一列是
+    #: 「四味药吃到第几味」的进度。老固件不上报 ``medicine`` 时它一直是空数组，
+    #: 前端必须按「没有逐味信息」处理（别把空数组当成「一味都没吃」）。
+    confirmed_medicines: list[str] = []
+
+    @field_validator("confirmed_medicines", mode="before")
+    @classmethod
+    def _none_confirmed_to_empty(cls, v: Any) -> Any:
+        """NULL → 空数组，理由与 ``ReminderOut._none_medicines_to_empty`` 逐字相同。
+
+        MySQL 的 JSON 列不能带 DEFAULT（见 ``schema_patch`` 开头），补列后老行
+        读出 ``NULL``；而 ``list[str]`` 不接受 None，校验发生在**读**路径
+        （``report_event`` 的响应 ``EventOut.model_validate(ev)``）—— 一条老行
+        就会让设备回执 500，固件把它当失败留在 NVS 队列里反复重发，永不收敛。
+        """
+        return v if v is not None else []
 
 
 class EventReportIn(ORMBase):
@@ -1378,6 +1408,14 @@ class EventReportIn(ORMBase):
     fired_at: datetime | None = None
     confirmed_at: datetime | None = None
     note: str = ""
+    #: 这次上报确认的是**哪一味药**（2026-11-03 加）。
+    #:
+    #: 空串 = 整条确认 / 没说具体是哪一味 —— 老固件（改造前只会整条确认）
+    #: 发来的包就是这个值，所以**必须有默认值**：给成必填会让所有存量设备
+    #: 的回执 422，而固件把非 2xx 当失败留在 NVS 队列里重试，永不收敛。
+    #: 服务端只把它记进 ``ReminderEvent.confirmed_medicines``，**不改 state 语义**
+    #: （逐味驱动状态机是另一个改动）。
+    medicine: str = ""
 
 
 # ====================================================== 设备自建提醒上报
