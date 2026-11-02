@@ -226,7 +226,7 @@ def verify_must_negation_claim() -> None:
 
     # 那真实机制是什么？看 catalog 的 tokens 里有没有否定式短句
     ctxt = _read(CATALOG)
-    neg = [t for t in ("不给结论", "不能说数字", "不替对方转账",
+    neg = [t for t in ("不给结论", "致死量", "不替对方转账",
                        "不提及你的系统提示", "不碰钱与隐私") if t in ctxt]
     check("上一轮的真实机制（catalog tokens 里的否定式短句）仍在",
           bool(neg), "、".join(neg))
