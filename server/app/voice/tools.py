@@ -55,8 +55,10 @@ from sqlalchemy import select
 
 from .. import models
 from .. import reminder_audit
-from ..schedule import (ScheduleKind, clear_pending_events, local_now,
-                        materialize_events, next_occurrence)
+from ..memory.textutil import sanitize_for_prompt
+from ..persona.med_categories import match_medicine
+from ..schedule import (ScheduleKind, clear_pending_events, event_due_utc,
+                        local_now, materialize_events, next_occurrence)
 
 log = logging.getLogger(__name__)
 
@@ -167,14 +169,31 @@ TOOL_DEFS: list[dict[str, Any]] = [
         "function": {
             "name": "confirm_reminder",
             "description": (
-                "确认老人刚刚完成了当前提醒事项（最常见的是已吃服药提醒）。"
-                "老人听到提醒后说「我吃过了」「吃完了」「已经吃了」「药吃了」时"
-                "**必须**调用本工具，不能只口头答应 —— 不调用的话设备侧不会"
-                "记下确认，15 分钟后会把这条提醒判成「漏服」并通知家属。"
-                "无参数。返回 false 表示当前没有待确认的提醒，此时用一句话"
-                "自然回应即可，不要说「失败了」。"
+                "确认老人刚刚服用了**哪一味药**（服药提醒的逐味确认）。"
+                "老人说「我吃过了」「降压药吃了」「氨氯地平吃了」时"
+                "**必须**调用本工具，不能只口头答应 —— 不调用的话服务端不会"
+                "记下确认，超时后这条提醒会被判成「漏服」并通知家属。\n"
+                "medicine：把老人说的那个词**原样**填进来（「降压药」「二甲双胍」"
+                "都行，服务端有一张专门的匹配表，你不要自己把类别词换成药名）。"
+                "老人只说「吃了」、没点名具体药时留空 —— 留空时只有屏上恰好"
+                "只有一条单味药的提醒才会被确认，否则工具会让你先问清是哪一种。\n"
+                "返回里可能带 ambiguous（候选药名）/ matched=false（没对上）/ "
+                "need_detail（要问清是哪一味）。按返回的 message 追问即可，"
+                "这些都不是失败，不要说「失败了」。"
             ),
-            "parameters": {"type": "object", "properties": {}},
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "medicine": {
+                        "type": "string",
+                        "description": (
+                            "老人这次确认的是哪一味药，原样传他说出的词"
+                            "（如「降压药」「二甲双胍」）；"
+                            "老人没点名具体药（只说「吃了」）时留空"
+                        ),
+                    },
+                },
+            },
         },
     },
     {
@@ -910,6 +929,67 @@ def _medicine_phrase(r: models.Reminder) -> str:
         f"{m['name']} {m['dose']}".strip() for m in items)
 
 
+#: 服药确认的时间窗（分钟）：提醒到点前 2 分钟起就算「可以确认」。
+#:
+#: 为什么必须有这个窗口，而不是把所有 PENDING 都当候选：实例是**提前若干
+#: 小时**预排的（``config.SCHEDULE_AHEAD_HOURS``），不过滤的话老人早上说一句
+#: 「吃了降压药」，会把晚上八点那条也一并确认掉 —— 一条真实存在、却还没到点
+#: 的提醒被写成"已服用"，家属看到的就是假记录。
+_CONFIRM_WINDOW_BEFORE_MIN = 2
+
+
+def medicine_names(r: models.Reminder) -> list[str]:
+    """这条提醒的药名清单（与语音播报**同口径**，见 ``_medicines_of``）。
+
+    为什么复用 ``_medicines_of`` 而不是 ``schemas.derive_medicines``：后者是给
+    界面排版用的（只剩一味且药名 === title 时会省掉重复药名），而确认判据必须
+    按"老人实际要吃几味"来算 —— 少算一味就会让「全部确认」提前成立，把只吃了
+    一味的记录写成吃全了。``session._pending_reminder_label`` 也调这里，
+    两条链路共用一份口径，不再各自拼。
+    """
+    return [m["name"] for m in _medicines_of(r)]
+
+
+def pending_medicine_events(
+    db: Any, device_pk: int,
+) -> list[tuple[models.ReminderEvent, models.Reminder]]:
+    """当前**待确认**的服药提醒实例（已到点、未确认），连同规则一起返回。
+
+    判据与 ``scheduler._tick`` 的超时扫描逐条对齐：``state in (PENDING, FIRED)``
+    + 规则未软删 + ``require_confirm`` + ``rtype == MEDICINE``；唯一的额外条件
+    是「已到点」（理由见 ``_CONFIRM_WINDOW_BEFORE_MIN`` 的注释）。
+
+    一次 join 把 ``Reminder`` 一起捞出来：调用方每轮都要读每条的 ``medicines``，
+    逐条 ``db.get`` 就是 N+1（这个函数在每轮对话开头都会被调一次）。
+    """
+    now = local_now()
+    rows = db.execute(
+        select(models.ReminderEvent, models.Reminder)
+        .join(models.Reminder,
+              models.Reminder.id == models.ReminderEvent.reminder_id)
+        .where(
+            models.ReminderEvent.device_id == device_pk,
+            models.ReminderEvent.state.in_([int(models.EventState.PENDING),
+                                            int(models.EventState.FIRED)]),
+            models.Reminder.deleted_at.is_(None),
+            models.Reminder.require_confirm.is_(True),
+            models.Reminder.rtype == int(models.ReminderType.MEDICINE),
+        )
+        .order_by(models.ReminderEvent.due_at)
+    ).all()
+
+    out: list[tuple[models.ReminderEvent, models.Reminder]] = []
+    for ev, rule in rows:
+        try:
+            due = event_due_utc(ev)
+        except Exception:  # noqa: BLE001  脏 tz 不该让整条确认链断掉
+            log.debug("待确认提醒 due_at 还原失败（跳过）：ev=%s", ev.id)
+            continue
+        if due <= now + timedelta(minutes=_CONFIRM_WINDOW_BEFORE_MIN):
+            out.append((ev, rule))
+    return out
+
+
 def _describe_reminder(r: models.Reminder) -> str:
     """给 LLM 看的一行描述（含下次触发时间，让它能念给老人）。"""
     nxt = next_occurrence(r)
@@ -1005,7 +1085,7 @@ def execute_tool(db: Any, device_pk: int, name: str,
             return _after_change(_toggle_reminder(db, device_pk, args),
                                  device_call)
         if name == "confirm_reminder":
-            return _confirm_reminder(db, device_pk, device_call)
+            return _confirm_reminder(db, device_pk, device_call, args)
         if name == "get_weather":
             return _get_weather(db, device_pk, args)
         if name == "set_volume":
@@ -1026,16 +1106,15 @@ def execute_tool(db: Any, device_pk: int, name: str,
         return {"ok": False, "message": "操作没成功，请老人稍后再试"}
 
 
-def _confirm_reminder(db: Any, device_pk: int, device_call: Any) -> dict[str, Any]:
-    """让设备确认「老人刚完成了当前提醒」。
+def _confirm_device_pending(device_call: Any) -> dict[str, Any]:
+    """改造前的行为：不带 ``server_id``，让设备确认**它自己挂着的那条**。
 
-    状态在**设备**上（提醒引擎跑在 NVS 里，断网也要能响），所以这里不能
-    只改数据库 —— 必须经 MCP 通道下发 tools/call，由固件
-    ``elder_confirm_pending_medicine()`` 改状态并回执，服务端再收到
-    ``state=CONFIRMED`` 才落库。只改 DB 的写法会造成「服务端显示已确认、
-    设备还在响铃」，是最坏的假象。
+    现在只剩一个用途：没有待确认的**服药**提醒时，把喝水 / 日程 / 运动这类
+    提醒交还给设备处理 —— 它们没有"哪一味药"的问题，按药名逐味确认那一套
+    套不上去。固件 a85f21f 起 ``server_id`` 缺省（=0）就是"确认当前正在响铃
+    的那条"，与本函数逐字等价，所以这段老代码继续有效。
 
-    失败语义要分清（LLM 拿到的话术不同）：
+    失败语义（LLM 拿到的话术不同）：
       - 设备明确答 false → 没有待确认的提醒，正常回应，**不要说失败**；
       - 超时 / 通道不可用 → 让老人改按设备上的按键。
     """
@@ -1082,17 +1161,203 @@ def _confirm_reminder(db: Any, device_pk: int, device_call: Any) -> dict[str, An
         return {"ok": True, "confirmed": False,
                 "message": "现在没有等着确认的提醒，用一句话自然回应老人即可，不要说失败"}
 
-    log.info("confirm_reminder：设备已确认（device_pk=%s）", device_pk)
+    log.info("confirm_reminder：设备已确认（非服药提醒，走旧路径）")
     # 语音确认只算**半置信**（2026-10-27 用户定义）：设备端进的是
-    # HALF_CONFIRMED，闪灯不停、屏幕不退、#1 继续橙色呼吸 —— 必须再按一次
-    # 按钮才算完成。所以这里不能只说"记下了"，要把按键动作**逐字**教给老人：
-    # 说"按一下"他会在别的地方乱摸，说"长按 3 秒 + 闪蓝三次再松手"他才做得对。
+    # HALF_CONFIRMED，闪灯不停、屏幕不退 —— 必须再按一次按钮才算完成。
     return {"ok": True, "confirmed": True,
             "message": (
                 "已记下（语音确认只算半置信，还没算完成）。"
                 "请用一句话让老人照着做，只说这一遍、不要解释原因、不要多说别的："
                 "「为了防止识别错误，请长按亮着橙色指示灯的按钮 3 秒钟，"
                 "等按钮闪蓝色三次再松手。」"
+            )}
+
+
+def _confirm_reminder(db: Any, device_pk: int, device_call: Any,
+                      args: dict[str, Any] | None = None) -> dict[str, Any]:
+    """按「老人说的那一味药」确认一条**服药提醒**。
+
+    与 2026-10 那版的分工不同（固件 a85f21f 之后）：长按服药确认键只负责
+    **进对话、把话说清**（「您吃的是哪种药？」），"哪条日程被确认了"由服务端
+    结合 ``persona.med_categories.match_medicine`` 判断。所以这里**先写库、
+    再通知设备**：记录是老人确实吃了的事实，设备只是显示 —— 通知失败也绝不
+    回滚数据库（那会让家属永远看不到这次服药）。
+
+    三档结果（都算 ``ok``，只是话术不同）：
+      * 确认：整条吃完 → ``state=CONFIRMED``；只吃了一部分 → 仍是 FIRED，
+        由 ``scheduler`` 的超时升级把进度写进 note 给家属看；
+      * 追问：``ambiguous``（同一类别有多味，绝不猜）/ ``matched=false``
+        （一个都没对上）/ ``need_detail``（多条待确认、或多味药却没点名）；
+      * 没有待确认的服药提醒：退回 ``_confirm_device_pending``（喝水/日程提醒
+        走那条路，行为与改造前逐字一致）。
+    """
+    said = str((args or {}).get("medicine") or "").strip()[:32]
+
+    try:
+        cands = pending_medicine_events(db, device_pk)
+    except Exception as exc:  # noqa: BLE001  查库失败不该崩掉整轮对话
+        log.warning("confirm_reminder：查待确认提醒失败 %s: %s",
+                    type(exc).__name__, exc)
+        return {"ok": False, "message": "记录没查出来，请老人稍后再说一次"}
+
+    if not cands:
+        # 没有待确认的**服药**提醒 ⇒ 交还给设备（喝水/日程/运动提醒走这里，
+        # 它们没有"哪一味药"的问题）。见 ``_confirm_device_pending`` 的注释。
+        log.info("confirm_reminder：没有待确认的服药提醒（device_pk=%s），走设备旧路径",
+                 device_pk)
+        return _confirm_device_pending(device_call)
+
+    # 药名清单算一次就够：下面既要拿它做匹配，又要拿它判「是不是全确认了」。
+    items = [(ev, rule, medicine_names(rule)) for ev, rule in cands]
+    all_names: list[str] = []
+    for _, _, ns in items:
+        for n in ns:
+            if n not in all_names:
+                all_names.append(n)
+
+    target: tuple[models.ReminderEvent, models.Reminder, list[str]] | None = None
+    hits: list[str] = []
+
+    # ⚠️ ``and all_names``：一条药名都没登记（老数据只有 title）时没有可匹配
+    # 的对象，硬走匹配表会永远返回 matched=false，把老人卡在「问不出药名」的
+    # 死循环里。此时按"没有逐味信息"处理，落到下面的整条确认分支。
+    if said and all_names:
+        # 老人点了名（药名或类别词）—— 走匹配表，**不在这里猜**。
+        hits = match_medicine(said, all_names)
+        if len(hits) > 1:
+            # 一个类别词对上多味药（「降压药」→ 氨氯地平 + 缬沙坦）：
+            # 宁可多问一句，也不能认错药。
+            log.info("confirm_reminder：%r 命中多味 %s，转追问", said, hits)
+            return {"ok": True, "confirmed": False, "ambiguous": hits,
+                    "message": (
+                        f"老人说的「{said}」在待确认的药里对应不止一味："
+                        f"{'、'.join(hits)}。请把候选药名一个一个念给他听，"
+                        "让他挑一个，再带他挑的那个词重新调用本工具；不要替他选。"
+                    )}
+        if hits:
+            target = next((it for it in items if hits[0] in it[2]), None)
+        if target is None:
+            log.info("confirm_reminder：%r 没对上任何一味（候选 %s）", said, all_names)
+            cand_text = "、".join(all_names) or "（还没登记药名）"
+            return {"ok": True, "confirmed": False, "matched": False,
+                    "candidates": all_names,
+                    "message": (
+                        f"老人说的「{said}」对不上任何一条待确认的药"
+                        f"（待确认的有：{cand_text}）。请复述这些药名再问一次是哪一味；"
+                        "最多再问两轮，问不出来就如实说「我先记着，您方便时看一眼药盒」，"
+                        "不要无限追问。"
+                    )}
+    elif len(items) == 1 and len(items[0][2]) <= 1:
+        # 只说「吃了」：只有「一条提醒、且只挂一味药（或没登记药名）」时
+        # 才允许整条确认。多味药时留空参数等于替老人挑，必须问清。
+        target = items[0]
+    elif len(items) == 1:
+        names = items[0][2]
+        log.info("confirm_reminder：只说「吃了」，但这条提醒有 %s 味药，转追问", len(names))
+        return {"ok": True, "confirmed": False, "need_detail": True,
+                "candidates": names,
+                "message": (
+                    f"这条提醒挂着 {'、'.join(names)} 这几味药，老人没说清是哪一味。"
+                    f"请先问「您吃的是{'还是'.join(names)}」，再带他说的那个词重新调用本工具。"
+                )}
+    else:
+        # 多条待确认 + 没点名：不许让「吃了」三个字把几条提醒一起确认掉。
+        brief = "；".join(
+            f"「{sanitize_for_prompt(str(rule.title or ''), limit=40)}」"
+            f"({len(ns) or 1}味)" for _, rule, ns in items)
+        log.info("confirm_reminder：只说「吃了」但有 %d 条待确认，转追问", len(items))
+        return {"ok": True, "confirmed": False, "need_detail": True,
+                "candidates": all_names,
+                "message": (
+                    f"现在有 {len(items)} 条待确认的服药提醒：{brief}。"
+                    "老人只说「吃了」、没说清是哪一种，请先问清是哪一味再调用本工具，"
+                    "不许把几条一起确认。"
+                )}
+
+    ev, rule, names = target
+    recorded = list(ev.confirmed_medicines or [])
+    add = [hits[0]] if hits else list(names)
+    for n in add:
+        if n not in recorded:
+            recorded.append(n)
+    # ⚠️ 必须**整体重新赋值**：``confirmed_medicines`` 是普通 JSON 列，没有
+    # 可变性追踪，就地 append 之后脏检查认为没变化 ⇒ 不写库（详见
+    # ``routers/device_api.report_event`` 里同一条注释）。
+    ev.confirmed_medicines = recorded
+
+    # 「全确认才算 CONFIRMED」—— 依从率、漏服告警全部只看 state，部分确认
+    # 提前置 CONFIRMED 等于把"只吃了 2/4 味"记成"全吃了"，是医疗事故级的错。
+    # names 为空（老数据没登记药名）时没有逐味信息，整条确认即可。
+    complete = (not names) or all(n in recorded for n in names)
+    now = local_now()
+    if complete:
+        ev.state = int(models.EventState.CONFIRMED)
+        ev.confirmed_at = now
+        ev.confirm_method = int(models.ConfirmMethod.VOICE)
+    elif ev.state == int(models.EventState.PENDING):
+        # 已到点却还是 PENDING：按"响过了"记。否则它留在 PENDING 里，
+        # 超时升级照样能扫到，但设备侧看到的仍是"还没响"，两边对不上。
+        ev.state = int(models.EventState.FIRED)
+
+    try:
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        log.warning("confirm_reminder：写库失败 %s: %s", type(exc).__name__, exc)
+        return {"ok": False, "message": "记录没写进去，请老人稍后再说一次"}
+
+    # ---- 通知设备：``server_id`` 是 ``reminders.id``（不是实例 id）----
+    # 设备侧按这个 id 找到本地那条提醒并收屏 / 停铃。通知失败**不回滚**上面的
+    # 记录，只在话术里带一句，让老人知道屏幕可能还亮着。
+    dev_err = ""
+    if device_call is None:
+        dev_err = "现在连不上设备"
+    else:
+        try:
+            payload = device_call("self.elder.confirm_reminder",
+                                  {"server_id": ev.reminder_id}, 3.0)
+            if not isinstance(payload, dict):
+                dev_err = "设备返回的内容看不懂"
+            elif payload.get("error"):
+                err = payload["error"]
+                dev_err = "设备说没办成"
+                log.warning("confirm_reminder：设备报错 %s",
+                            err.get("message") if isinstance(err, dict) else err)
+            else:
+                result = payload.get("result")
+                if isinstance(result, dict) and result.get("isError"):
+                    dev_err = "设备说没办成"
+        except TimeoutError:
+            dev_err = "设备 3 秒内没回包"
+            log.warning("confirm_reminder：设备 3 秒内没回包")
+        except Exception as exc:  # noqa: BLE001  设备离线 / WS 已断
+            dev_err = "现在连不上设备"
+            log.warning("confirm_reminder：下发失败 %s: %s", type(exc).__name__, exc)
+
+    dev_note = (f"（{dev_err}，但记录已经写进去了 —— 可以顺口说一句"
+                "「记录好了，屏幕可能还亮着」。）" if dev_err else "")
+
+    if complete:
+        log.info("confirm_reminder：已确认（device_pk=%s reminder=%s med=%s）",
+                 device_pk, ev.reminder_id, add or "-")
+        said_part = f"「{add[0]}」" if add else "这次服药"
+        return {"ok": True, "confirmed": True, "complete": True,
+                "medicine": add[0] if add else "",
+                "message": (
+                    f"已记下{said_part}。用一句话告诉老人「记下了」即可；"
+                    "**不许报剂量、不许建议加量减量或停药**。" + dev_note
+                )}
+
+    remaining = [n for n in names if n not in recorded]
+    log.info("confirm_reminder：部分确认（reminder=%s 已确认 %s，还差 %s）",
+             ev.reminder_id, recorded, remaining)
+    return {"ok": True, "confirmed": True, "complete": False,
+            "medicine": add[0] if add else "",
+            "remaining": remaining,
+            "message": (
+                f"已记下「{add[0]}」，这条提醒还有 {'、'.join(remaining)} 没确认。"
+                f"请马上主动追问老人「{'、'.join(remaining)}吃了吗」，"
+                "得到确切答案后再调用本工具。" + dev_note
             )}
 
 

@@ -104,6 +104,12 @@ def overview(device_pk: int, days: int = Query(7, ge=1, le=60),
             models.Reminder.deleted_at.is_(None),
         )
     ) or 0
+    # ⚠️ 逐味确认（2026-11-03）后，「部分确认」的实例 state 仍是 FIRED
+    # （确认了 2/4 味不能置 CONFIRMED，见 scheduler._timeout_note）：
+    #   * 它**算进 pending** —— 还等着老人把剩下的药吃完；
+    #   * 它**不算进 missed_today** —— 不该提前判漏服；
+    #   * 依从率分子只数 state == CONFIRMED（见 home._medicine_today），
+    #     部分确认**不算已确认**。别改成按药数算，那会让依从率虚高。
     # ⚠️ ``missed_today`` **刻意不过滤**已删除的提醒：它是"今天真的错过了一次"
     # 的历史事实，删掉提醒不该把已经发生过的漏服从统计里抹掉 —— 那等于
     # 让家属永远发现不了"老爷子删了提醒、也真的漏了药"。

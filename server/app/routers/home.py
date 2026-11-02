@@ -215,6 +215,10 @@ def _medicine_today(db: Session, device_ids: list[int],
             slot["confirmed_at"] = ev.confirmed_at
             slot["confirmed_medicines"] = list(ev.confirmed_medicines or [])
 
+        # 口径（2026-11-03 逐味确认）：分子**只数完整确认**的实例
+        # （state == CONFIRMED）。一条提醒挂多味药时，确认了 2/4 味仍是 FIRED，
+        # **不算已确认** —— 别"顺手改成按药数算"：那会让依从率虚高，家属以为
+        # 老人按时吃全了。中间态通过 ``confirmed_medicines`` 单独展示。
         confirmed = sum(1 for s in slots.values()
                         if s["state"] == int(models.EventState.CONFIRMED))
         # 主动跳过（SKIPPED）不算待服药：家属明确点了「这次不吃了」
