@@ -19,6 +19,14 @@ import json
 import struct
 from datetime import datetime
 
+# 表情 PNG -> cbin 的转换器（同目录）。CMake 用 `python <abs>/scripts/
+# build_default_assets.py` 调用，脚本目录本来就在 sys.path[0]；这里再显式插
+# 一次，是为了让「按文件路径 import 本模块」的工具（那样 scripts/ 不在
+# sys.path）也能拿到它 —— 少了这行会报 ModuleNotFoundError，症状与本改动
+# 无关，很难一眼看出是路径问题。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from emoji_cbin import png_to_cbin  # noqa: E402  （必须排在 sys.path 之后）
+
 
 # =============================================================================
 # Pack model functions (from pack_model.py)
@@ -216,29 +224,53 @@ def process_text_font(text_font_file, assets_dir):
 
 
 def process_emoji_collection(emoji_collection_dir, assets_dir):
-    """Process emoji_collection parameter"""
+    """把表情 PNG 转成 cbin 写进 assets 目录，返回 index.json 的条目列表。
+
+    2026-11-02：这里原本是把 PNG **原样拷进** assets，设备端靠
+    ``LvglRawImage`` + LVGL 的 lodepng 每次重绘都解一遍。而本机
+    ``CONFIG_LV_CACHE_DEF_SIZE`` 是 0（图片缓存关着），64x64 PNG 每次
+    解成 RGBA8888 要 16KB 峰值 —— 静态表情勉强能忍，待机跑马灯逐帧
+    重绘会直接把 LVGL 任务拖死。所以改成打包期一次性转成 cbin
+    （裸 RGB565A8），设备端零解码。格式见 emoji_cbin.py 头注释。
+
+    文件名从 ``<name>.png`` 变成 ``<name>.bin``，index.json 里的 ``file``
+    跟着改，设备端按名字取，不需要额外协议。
+    """
     if not emoji_collection_dir:
         return []
-    
+
     emoji_list = []
-    
-    # Copy each image from input directory to build/assets directory
+
+    # sorted()：os.walk 的顺序由文件系统决定，不排序的话 index.json 每次
+    # 构建的条目顺序都可能变，assets.bin 跟着变 ⇒ 同一个 commit 编出来的
+    # 固件二进制不一致，没法用校验和判断「固件到底换没换」。
     for root, dirs, files in os.walk(emoji_collection_dir):
-        for file in files:
-            if file.lower().endswith(('.png', '.gif')):
-                # Copy file
-                src_file = os.path.join(root, file)
-                dst_file = os.path.join(assets_dir, file)
-                if copy_file(src_file, dst_file):
-                    # Get filename without extension
-                    filename_without_ext = os.path.splitext(file)[0]
-                    
-                    # Add to emoji list
-                    emoji_list.append({
-                        "name": filename_without_ext,
-                        "file": file
-                    })
-    
+        for file in sorted(files):
+            ext = os.path.splitext(file)[1].lower()
+            if ext != '.png':
+                # 目录里混着 .DS_Store / README 之类是常事，静默忽略；
+                # 但**图片**格式不支持必须炸掉：.gif 是帧序列、不是一张
+                # RGB565A8，悄悄丢掉会让固件少一半表情而构建全绿。
+                if ext in ('.gif', '.jpg', '.jpeg', '.webp', '.bmp'):
+                    raise ValueError(
+                        f"表情 {file}: 不支持的图片格式 {ext}（只支持 PNG）")
+                continue
+
+            src_file = os.path.join(root, file)
+            # Get filename without extension
+            filename_without_ext = os.path.splitext(file)[0]
+            dst_file = os.path.join(assets_dir, filename_without_ext + ".bin")
+            blob = png_to_cbin(src_file)
+            with open(dst_file, 'wb') as f:
+                f.write(blob)
+            print(f"Converted: {src_file} -> {dst_file} ({len(blob)} B)")
+
+            # Add to emoji list
+            emoji_list.append({
+                "name": filename_without_ext,
+                "file": filename_without_ext + ".bin"
+            })
+
     return emoji_list
 
 
