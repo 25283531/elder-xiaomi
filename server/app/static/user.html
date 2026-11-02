@@ -400,7 +400,9 @@
               <tr v-for="r in reminders" :key="r.id">
                 <td>
                   {{r.title}}
-                  <div class="muted" style="font-size:12px" v-if="r.dose">剂量：{{r.dose}}</div>
+                  <!-- 逐味显示：一条提醒可以带多味药（如「降压药 1片 · 二甲双胍 0.5g」）。
+                       老数据由服务端派生（dose → 一味药），所以这里不需要再判 dose。 -->
+                  <div class="muted" style="font-size:12px" v-if="medText(r)">{{medText(r)}}</div>
                   <div class="muted" style="font-size:12px">下次：{{fmt(r.next_fire_at)}}</div>
                 </td>
                 <td>{{typeName(r.rtype)}}</td>
@@ -505,7 +507,40 @@
                 <option :value="2">喝水</option><option :value="3">运动</option><option :value="4">自定义</option>
               </select></div>
             <div><label>播报文案（留空则读标题）</label><input v-model="rForm.speak_text" style="width:100%" /></div>
-            <div><label>剂量 / 备注</label><input v-model="rForm.dose" style="width:100%" placeholder="1 片，饭后" /></div>
+            <!-- 老字段 dose：**保留**，不要删。存量提醒只有这一列（一条提醒一个
+                 剂量），删了输入框这些数据就再也编辑不了；旧版 APK 也只认它。
+                 新数据请用下面的「药物与剂量」列表。 -->
+            <div><label>备注 / 老剂量</label>
+              <input v-model="rForm.dose" style="width:100%" placeholder="1 片，饭后" />
+              <div class="muted" style="font-size:12px;margin-top:2px">
+                老数据用这一栏；新数据请用下面的药物列表
+              </div>
+            </div>
+          </div>
+
+          <!-- 一条提醒可以带多味药（2026-11-02）。为什么是「行编辑器」而不是
+               一个逗号分隔的文本框：药名和剂量是两个概念，混在一个串里既没法
+               校验长度，也没法逐条增删；老人吃的药是家属逐条确认的，界面必须
+               让"加一味 / 去掉一味"是一步操作。上限 4 味与服务端
+               schemas.MAX_MEDICINES 一致（超了接口直接 422）。 -->
+          <div style="margin-top:10px">
+            <label>药物与剂量（最多 4 种）</label>
+            <div v-for="(m, i) in (rForm.medicines || [])" :key="i"
+                 class="row" style="margin-bottom:6px">
+              <input v-model="m.name" maxlength="32" placeholder="药名，如 降压药"
+                     style="flex:1;min-width:140px" />
+              <input v-model="m.dose" maxlength="64" placeholder="剂量，如 1片 / 0.5g"
+                     style="flex:1;min-width:140px" />
+              <button @click="removeMedicine(i)">删除</button>
+            </div>
+            <div class="row">
+              <button :disabled="(rForm.medicines || []).length >= 4"
+                      @click="addMedicine">+ 添加一种药</button>
+              <span class="muted" style="font-size:12px"
+                    v-if="(rForm.medicines || []).length >= 4">
+                已达上限 4 种；再多请拆成两条提醒（如「早上的药」「晚上的药」）
+              </span>
+            </div>
           </div>
 
           <div class="grid g2" style="margin-top:10px">
@@ -1747,8 +1782,30 @@ createApp({
       return { title:'', speak_text:'', rtype:0, schedule_kind:1,
         times_of_day:['08:00'], weekdays:[], month_days:[], interval_days:1,
         once_date:null, start_date:null, end_date:null, dose:'',
+        // medicines 必须显式给 []：saveReminder 是**整包提交**（POST 会把 body
+        // 直接展开成 ORM 行）。少了这个键，新建时 medicines 会落到服务端默认值
+        // —— 现在默认值也是空数组，但"靠服务端默认"在 PATCH 改成
+        // exclude_unset 之后会变成"这个键压根没发"，行为就取决于接口实现。
+        medicines:[],
         require_confirm:true, repeat_interval_min:10, repeat_times:3,
         escalate_after_min:30, confirm_methods:['voice','button'], enabled:true };
+    },
+    // 药物行编辑器：加/删一味药。上限 4 与服务端 schemas.MAX_MEDICINES 一致。
+    addMedicine(){
+      if (!Array.isArray(this.rForm.medicines)) this.rForm.medicines = [];
+      if (this.rForm.medicines.length >= 4) return;
+      this.rForm.medicines.push({name:'', dose:''});
+    },
+    removeMedicine(i){
+      if (!Array.isArray(this.rForm.medicines)) return;
+      this.rForm.medicines.splice(i, 1);
+    },
+    // 列表里的「逐味显示」：有剂量就带上，没有就只显示药名。
+    medText(r){
+      const list = (r && r.medicines) || [];
+      if (!list.length) return '';
+      return list.map(m => (m.dose ? (m.name || '') + ' ' + m.dose : (m.name || '')))
+                 .filter(Boolean).join(' · ');
     },
     editReminder(r){
       this.rForm = r ? JSON.parse(JSON.stringify(r)) : this.blankReminder();
@@ -1762,6 +1819,12 @@ createApp({
       this.rForm.weekdays = this.weekText.split(/[,，\s]+/).filter(Boolean).map(Number);
       this.rForm.month_days = this.monthText.split(/[,，\s]+/).filter(Boolean).map(Number);
       const body = JSON.parse(JSON.stringify(this.rForm));
+      // 药名空着的行直接丢掉：用户点了「+ 添加一种药」没填就保存时，
+      // 留着会变成一条 name='' 的脏数据（服务端 name 没有 min_length，
+      // 列表上就是一行空白）。**只按药名判**：只有剂量没有药名的行没有意义。
+      body.medicines = (body.medicines || [])
+        .map(m => ({name:(m.name||'').trim(), dose:(m.dose||'').trim()}))
+        .filter(m => m.name);
       delete body.id; delete body.device_id; delete body.creator_id;
       delete body.created_at; delete body.updated_at; delete body.next_fire_at;
       try{

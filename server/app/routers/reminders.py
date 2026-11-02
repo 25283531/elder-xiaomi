@@ -311,7 +311,15 @@ def update_reminder(reminder_pk: int, payload: ReminderIn, request: Request,
     # 快照必须在**改动之前**取：改完之后再 snapshot 拿到的是新值，
     # before/after 会变成两份一样的 JSON（流水看起来"什么都没改"）。
     before = reminder_audit.snapshot(r)
-    data = payload.model_dump()
+    # ⚠️ ``exclude_unset=True`` 是**防静默清空**，不是"更严谨一点"：
+    # 这个接口是 PATCH，但下面逐字段 ``setattr`` 是全量覆盖语义。客户端没发的
+    # 字段会拿到 ``ReminderIn`` 的默认值（空列表 / 空串）并被原样写回库。
+    # 具体后果：装了旧版 APK 的手机不发送 ``medicines``，家属只是在手机上改了
+    # 个标题，那条提醒的多味药就被清成空 —— **不报错、界面也不提示**，
+    # 老人到点只听到「该吃药了」却不知道吃什么。
+    # 现有调用方（网页 / APP）都是整包提交，所以对它们行为完全不变；
+    # 变的是"没提交的字段保持原样"，这正是 PATCH 该有的语义。
+    data = payload.model_dump(exclude_unset=True)
     # 未显式给 tz 时**保留原值**，不重新判定：一条规则建好之后的时区不该
     # 因为"家属这次在另一个国家改了个标题"而漂移 —— 那会把老人已经习惯的
     # 服药时间整体平移。要改时区必须显式传。

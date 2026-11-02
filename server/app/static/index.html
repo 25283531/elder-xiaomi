@@ -364,7 +364,9 @@
             <tr v-for="r in shownReminders" :key="r.id">
               <td>
                 {{r.title}}
-                <div class="muted" style="font-size:12px" v-if="r.dose">剂量：{{r.dose}}</div>
+                <!-- 逐味显示（一条提醒可带多味药）。这里**只读**：管理后台没有
+                     编辑入口，新增/修改一律由家属在 APP 或用户网页端操作。 -->
+                <div class="muted" style="font-size:12px" v-if="medText(r)">{{medText(r)}}</div>
                 <div class="muted" style="font-size:12px">下次：{{fmt(r.next_fire_at)}}</div>
                 <div class="muted" style="font-size:12px">设备：{{deviceName(r.device_id)}}</div>
               </td>
@@ -3085,6 +3087,15 @@ createApp({
        Asia/Shanghai 恒等于 UTC+8，手算即等价。
        ⚠️ 接口返回的串**带偏移**（后端 schemas.ORMBase 会按每一行自己的
        tz 补上），所以跨时区的提醒实例也能正确换算到北京时间。 */
+    /* 一条提醒可能带多味药（服务端 reminders.medicines，老数据已派生）。
+       做成方法而不是模板里内联 map：模板里的箭头函数参数会被前端卫生检查
+       当成"孤儿引用"（L2），而且这一行展示口径要与 user.html 的 medText 一致。 */
+    medText(r){
+      const list = (r && r.medicines) || [];
+      if (!list.length) return '';
+      return list.map(m => (m.dose ? (m.name || '') + ' ' + m.dose : (m.name || '')))
+                 .filter(Boolean).join(' · ');
+    },
     fmt(v){
       if (!v) return '—';
       let s = String(v).trim();

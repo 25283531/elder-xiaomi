@@ -27,6 +27,8 @@
     I. 越权        别人的 device_pk 查 audits 被拒
     J. can_restore 已删除时 true、活着时 false
     L. 先暂停再删除 → 恢复后必须**还是暂停态**（enabled 要还原，不能一律 True）
+    M. 一条提醒多味药 + 剂量：JSON 列往返、老数据派生、PATCH 不清空、心跳下发、
+       4 味上限
 
 另有三条专门守**设备侧副作用**的断言：
 
@@ -94,6 +96,8 @@ SEED_PW_ENV = "ELDER_SEED_ADMIN_PASSWORD"
 
 DEV_MAC = "auditdev000001"
 DEV_MAC_2 = "auditdev000002"
+#: M 段（多味药）专用：独立设备，避免多出来的提醒把 K1 的流水顺序断言弄红。
+DEV_MAC_3 = "auditdev000003"
 
 results: list[tuple[str, bool, str]] = []
 
@@ -182,6 +186,21 @@ def pending_events(reminder_pk: int) -> int:
     return db_count(
         "SELECT COUNT(*) FROM reminder_events WHERE reminder_id = ? AND state = 0",
         (reminder_pk,))
+
+
+def db_exec(sql: str, params: tuple = ()) -> None:
+    """直接写一行（独立连接）。
+
+    用途：M3 要造一条**老数据**（``medicines`` 为空、只有老字段 ``dose``）。
+    走接口造不出来 —— 接口现在一定会把 ``medicines`` 写进去，而"老数据长什么样"
+    正是这一条要验的东西，只能绕过被测方直接落库。
+    """
+    con = sqlite3.connect(str(DB_FILE), timeout=10)
+    try:
+        con.execute(sql, params)
+        con.commit()
+    finally:
+        con.close()
 
 
 # ================================================================ 主流程
@@ -513,6 +532,161 @@ def main() -> int:
                          if r.get("id") == rem_pk)
         check("G5 恢复后设备心跳又能拿到这条规则", code == 200 and n_sync == 1,
               f"code={code} 命中={n_sync}")
+
+        # ==================================================== M. 多味药
+        # 单独一台设备：K1 断言"本设备最新一条流水是 restore、最末是 create"，
+        # 在这台设备上多建几条提醒会把它弄红 —— 而那条断言本身是有价值的。
+        print("── M. 一条提醒多味药 + 各自剂量 ──")
+        _, dev3 = req("POST", "/api/devices", {"device_id": DEV_MAC_3}, u1)
+        dev_pk3 = int((dev3 or {}).get("id", 0) or 0)
+        check("M0 第三台设备就绪（多药断言用独立设备，别打乱 K1 的顺序）",
+              dev_pk3 > 0, f"pk={dev_pk3}")
+
+        MEDS = [{"name": "降压药", "dose": "1片"}, {"name": "二甲双胍", "dose": "0.5g"}]
+        code, mr = req("POST", f"/api/reminders?device_pk={dev_pk3}", {
+            "title": "早上吃药",
+            "rtype": 0,
+            "schedule_kind": 1,
+            "times_of_day": ["08:00"],
+            "medicines": MEDS,
+            "require_confirm": True,
+            "enabled": True,
+        }, u1)
+        mr_pk = int((mr or {}).get("id", 0) or 0)
+        check("M1 建一条带 2 味药的提醒 201，回包 2 项且**顺序一致**",
+              code == 201 and mr_pk > 0
+              and [m.get("name") for m in (mr or {}).get("medicines") or []]
+              == ["降压药", "二甲双胍"]
+              and [(m or {}).get("dose") for m in (mr or {}).get("medicines") or []]
+              == ["1片", "0.5g"],
+              f"code={code} medicines={(mr or {}).get('medicines')}")
+
+        code, got = req("GET", f"/api/reminders/{mr_pk}", token=u1)
+        check("M2 GET 回来仍是 2 项、顺序不变（JSON 列没有被打散/排序）",
+              code == 200
+              and [m.get("name") for m in (got or {}).get("medicines") or []]
+              == ["降压药", "二甲双胍"],
+              f"code={code} medicines={(got or {}).get('medicines')}")
+
+        # ---- 老数据兼容：直接往库里插一条只有老字段的提醒 ----
+        # 不写回填脚本（没有 Alembic、没有回滚），靠 schemas.ReminderOut 派生。
+        # 这条断言就是"派生"这件事唯一的机器证据。
+        db_exec(
+            "INSERT INTO reminders (device_id, creator_id, title, speak_text, rtype,"
+            " schedule_kind, times_of_day, weekdays, month_days, interval_days,"
+            " dose, medicines, require_confirm, repeat_interval_min, repeat_times,"
+            " escalate_after_min, confirm_methods, enabled, tz, created_at,"
+            " updated_at, deleted_via)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (dev_pk3, None, "吃钙片", "", 0, 1, '["09:00"]', "[]", "[]", 1,
+             "1片", "[]", 1, 10, 3, 30, '["voice"]', 1, "",
+             "2026-01-01 08:00:00", "2026-01-01 08:00:00", ""))
+        legacy_pk = int(db_scalar(
+            "SELECT id FROM reminders WHERE device_id = ? AND title = '吃钙片'",
+            (dev_pk3,)) or 0)
+        code, legacy = req("GET", f"/api/reminders/{legacy_pk}", token=u1)
+        check("★ M3 老数据（medicines 为空、dose='1片'）→ GET 派生出 1 项"
+              "「吃钙片 1片」（不靠回填脚本）",
+              code == 200 and legacy_pk > 0
+              and (legacy or {}).get("medicines") == [{"name": "吃钙片", "dose": "1片"}],
+              f"code={code} medicines={(legacy or {}).get('medicines')}")
+
+        # ---- PATCH 只传 title：medicines 必须**原样保留** ----
+        # 这条守的是 update_reminder 的 model_dump(exclude_unset=True)。
+        # 老语义是全量覆盖：没发的字段拿默认值（空数组）写回库，于是"旧版 APK
+        # 改了个标题，多味药就被静默清空"—— 不报错、界面也不提示。
+        code, pt = req("PATCH", f"/api/reminders/{mr_pk}", {"title": "早上吃药（改）"}, u1)
+        check("★ M4 只 PATCH title → medicines 不被清空（exclude_unset 回归）",
+              code == 200
+              and [m.get("name") for m in (pt or {}).get("medicines") or []]
+              == ["降压药", "二甲双胍"]
+              and (pt or {}).get("title") == "早上吃药（改）",
+              f"code={code} medicines={(pt or {}).get('medicines')}")
+
+        # ---- 改 medicines：库要落新值，审计 after_json 要看得见 ----
+        # 后者守的是 reminder_audit._SNAPSHOT_FIELDS 登记了 medicines ——
+        # 漏登记的话流水会显示"什么都没改"（before/after 两份一样）。
+        # 注意 title 必须一起带：ReminderIn 里 title 是**必填**（PATCH 用的也是
+        # 同一个入参模型），只发 medicines 会 422，那验不到快照。
+        code, mt = req("PATCH", f"/api/reminders/{mr_pk}", {
+            "title": "早上吃药（改）",
+            "medicines": [{"name": "降压药", "dose": "2片"}],
+        }, u1)
+        raw_med = db_row("SELECT medicines FROM reminders WHERE id = ?", (mr_pk,))
+        # ⚠️ 必须 json.loads 之后再比：快照里的中文是 \\uXXXX 转义的，
+        # 直接 ``"二甲双胍" not in after_json`` 恒为真（假绿）。
+        snap = db_row("SELECT before_json, after_json FROM reminder_audits "
+                      "WHERE reminder_id = ? AND action = 'update' "
+                      "ORDER BY id DESC LIMIT 1", (mr_pk,)) or ("", "")
+        snap_before = json.loads(snap[0] or "{}")
+        snap_after = json.loads(snap[1] or "{}")
+        check("★ M5 PATCH medicines → 库落新值，且审计 before/after 都带 medicines"
+              "（快照漏登记就只显示「什么都没改」）",
+              code == 200
+              and [m.get("name") for m in (mt or {}).get("medicines") or []] == ["降压药"]
+              and "二甲双胍" not in json.dumps(raw_med[0] if raw_med else "", ensure_ascii=False)
+              and snap_before.get("medicines") == MEDS
+              and snap_after.get("medicines") == [{"name": "降压药", "dose": "2片"}],
+              f"code={code} db={raw_med} before={snap_before.get('medicines')} "
+              f"after={snap_after.get('medicines')}")
+
+        # ---- 设备心跳：JSON 列天然跟着下发（这正是不做子表的理由）----
+        _, ota3 = req("GET", "/api/voice/ota", None, None, {"Device-Id": DEV_MAC_3})
+        dev3_token = ((ota3 or {}).get("websocket") or {}).get("token", "")
+        code, sync3 = req("POST", "/api/device/sync", None, dev3_token)
+        hit3 = next((r for r in (sync3 or {}).get("reminders") or []
+                     if r.get("id") == mr_pk), None)
+        check("★ M6 设备心跳下发的规则里带 medicines（不用额外查询，也不会 N+1）",
+              code == 200 and bool(dev3_token)
+              and [m.get("name") for m in (hit3 or {}).get("medicines") or []]
+              == ["降压药"],
+              f"code={code} medicines={(hit3 or {}).get('medicines')}")
+
+        # ---- 上限 4 味 ----
+        code, over = req("POST", f"/api/reminders?device_pk={dev_pk3}", {
+            "title": "五种药",
+            "rtype": 0,
+            "schedule_kind": 1,
+            "times_of_day": ["08:00"],
+            "medicines": [{"name": f"药{i}", "dose": "1片"} for i in range(5)],
+        }, u1)
+        check("★ M7 超过 4 味药 → 422（上限必须在服务端，前端拦得住 API 拦不住）",
+              code == 422, str(code))
+        code, longname = req("POST", f"/api/reminders?device_pk={dev_pk3}", {
+            "title": "长药名",
+            "rtype": 0,
+            "schedule_kind": 1,
+            "times_of_day": ["08:00"],
+            "medicines": [{"name": "药" * 33, "dose": "1片"}],
+        }, u1)
+        check("M8 药名超 32 字 → 422（列宽 32，不拦就会被截断或撑爆布局）",
+              code == 422, str(code))
+
+        # ---- 存量超长 dose：读**不能** 500 ----
+        # 本次给 ReminderIn.dose 补了 max_length=128（堵"以后还能写进去"），
+        # 但 SQLite 不校验 VARCHAR 长度、改之前 API 也没拦 ⇒ 生产库里可能已经
+        # 躺着更长的串。ReminderOut 因此**刻意覆盖**成不带 max_length 的字段：
+        # 否则一条存量坏行会让 GET /api/reminders 与设备心跳一起 500
+        # （一条坏行 = 整台设备一条提醒都同步不到）。
+        db_exec(
+            "INSERT INTO reminders (device_id, creator_id, title, speak_text, rtype,"
+            " schedule_kind, times_of_day, weekdays, month_days, interval_days,"
+            " dose, medicines, require_confirm, repeat_interval_min, repeat_times,"
+            " escalate_after_min, confirm_methods, enabled, tz, created_at,"
+            " updated_at, deleted_via)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (dev_pk3, None, "超长剂量", "", 0, 1, '["10:00"]', "[]", "[]", 1,
+             "片" * 200, "[]", 1, 10, 3, 30, '["voice"]', 1, "",
+             "2026-01-01 08:00:00", "2026-01-01 08:00:00", ""))
+        long_pk = int(db_scalar(
+            "SELECT id FROM reminders WHERE device_id = ? AND title = '超长剂量'",
+            (dev_pk3,)) or 0)
+        code, longr = req("GET", f"/api/reminders/{long_pk}", token=u1)
+        check("★ M9 存量超长 dose 仍能读出（不 500），派生值截到 64",
+              code == 200 and long_pk > 0
+              and len(((longr or {}).get("medicines") or [{}])[0].get("dose") or "") == 64,
+              f"code={code} dose_len="
+              f"{len(((longr or {}).get('medicines') or [{}])[0].get('dose') or '')}")
 
         # ==================================================== 收尾统计
         code, audits = req("GET", f"/api/reminders/audits?device_pk={dev_pk}", token=u1)
