@@ -87,6 +87,19 @@ static struct {
     int64_t           last_reshow_us;
     uint8_t           last_confirm_method;
     TaskHandle_t      task;
+    /* 多药提醒的「纯 RAM」元数据（见 elder_reminder.h 的 ELDER_MED_NAME_MAX）。
+     *
+     * 为什么和 state[] / fired_today[] 一样只放 RAM：
+     *   · 它们都是「本轮配置」的派生信息，不是需要跨重启保留的事实；
+     *   · 更重要的是**绝不能**进 g.table —— 那张表是 NVS blob，
+     *     多一个字节就会让 V1/V2 前缀断言失效、老用户整表被清空。
+     * 16×128 = 2KB 静态 RAM，相对 512KB SRAM 可以忽略。
+     *
+     * ⚠️ 跨天重置时**不要**清它（药数是配置属性，不是当日状态）；
+     *    但 replace_all 装新表时必须清（旧下标对应的药名对新表毫无意义，
+     *    留着就会「拿错药名去确认」，比未知更危险）。 */
+    uint8_t           med_count[ELDER_REMINDER_MAX];
+    elder_med_name_t  med_name[ELDER_REMINDER_MAX];
 } g;
 
 static int64_t now_us(void);
@@ -618,24 +631,20 @@ static void tick(void)
      *      与 elder_bridge.cc 的 FirstUndoneReminder() 同一取法 —— 否则会
      *      出现"屏上写着 A、按键确认的是 B"。
      *
-     * ⚠️ 文案必须与 elder_bridge.cc 的 OnReminder(PENDING) 保持一致
-     *    （「该吃…了」/「…时间到了」+「长按按钮 3 秒确认」）。改一处就要改两处，
-     *    否则重显出来的句子和第一次响铃时不一样，老人会以为是另一条提醒。 */
+     * ⚠️ 文案由 elder_reminder_screen_text() **统一生成**（2026-11-03 改）。
+     *    原先这里与 elder_bridge.cc 的 OnReminder(PENDING) 各写一份完全相同的
+     *    snprintf，注释写着「改一处就要改两处」—— 这一轮要加「（还有 N 条）」
+     *    与时段话术，两份手写必然漂移，而漂移的表现是「屏幕上的句子在两条
+     *    路径之间来回跳」，老人会以为是两条不同的提醒。
+     *    ⇒ 现在只有一处实现，bridge 也调它，不存在"两处"了。 */
     if (has_pending_confirm() && !elder_ui_reminder_showing()) {
         if (g.last_reshow_us == 0 ||
             (now_us() - g.last_reshow_us) >= 5LL * 1000 * 1000) {
             int idx = elder_reminder_first_ringing();
             if (idx >= 0 && idx < ELDER_REMINDER_MAX) {
-                char text[96];
                 char screen_text[160];
                 const elder_rmd_item_t *it = &g.table.items[idx];
-                if (it->type == ELDER_RMD_TYPE_MEDICINE) {
-                    snprintf(text, sizeof(text), "该吃%s了", it->label);
-                } else {
-                    snprintf(text, sizeof(text), "%s时间到了", it->label);
-                }
-                snprintf(screen_text, sizeof(screen_text),
-                         "%s\n\n长按按钮 3 秒确认", text);
+                elder_reminder_screen_text(it, screen_text, sizeof(screen_text));
                 elder_ui_show_reminder(screen_text);
                 g.last_reshow_us = now_us();
                 ESP_LOGW(TAG, "引擎还有待确认项但屏幕没在显示 ⇒ 重新推全屏提醒: %s",
@@ -981,6 +990,16 @@ esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items,
     /* ---- 4. 安装 + 运行态继承（按 server_id / 内容匹配旧表）---- */
     memset(g.table.items, 0, sizeof(g.table.items));
     memset(g.table.when, 0, sizeof(g.table.when));
+    /* 药数/药名跟着整表重建一起清空。
+     *
+     * 不能"继承"：旧下标 i 对应的可能是另一条提醒（新表重排过），
+     * 留着旧药名会让长按追问说成「您刚才吃过<别的药>了吗」——
+     * 老人顺着答"是"，服务端就把错的那条日程标成完成，这是事故。
+     * 清成 0 的语义是「未知」，行为退回「直接确认」，方向安全。
+     * 由调用方（sync.c）在 replace_all 成功后用
+     * elder_reminder_set_med_info() 写回本轮解析到的真实值。 */
+    memset(g.med_count, 0, sizeof(g.med_count));
+    memset(g.med_name, 0, sizeof(g.med_name));
     uint8_t n = 0;
     for (uint8_t i = 0; i < srv_n; i++) {
         g.table.items[n] = items[i];
@@ -1379,6 +1398,108 @@ int elder_reminder_first_ringing(void)
         }
     }
     return best;
+}
+
+/* ---- 多药提醒：纯 RAM 元数据 + 全屏文案（唯一真源） ---- */
+
+void elder_reminder_set_med_info(const uint8_t *counts,
+                                 const elder_med_name_t *first_names,
+                                 uint8_t n)
+{
+    if (n > ELDER_REMINDER_MAX) n = ELDER_REMINDER_MAX;
+
+    /* 先整体清零再写：调用方可能只装了 n 条，n 之后的下标必须是「未知」，
+     * 否则缩表后残留的旧药名会被长按分支读走。 */
+    memset(g.med_count, 0, sizeof(g.med_count));
+    memset(g.med_name, 0, sizeof(g.med_name));
+
+    if (counts == NULL) return;
+    for (uint8_t i = 0; i < n; i++) {
+        /* 两道守卫，都是防「药单写到别人头上」：
+         *   · i 必须落在当前表内（replace_all 可能因容量把后端条目截短）；
+         *   · 只写**服务端下发**的条目（server_id != 0）。容量溢出时
+         *     replace_all 会把"设备本地自建"的条目排在后面并保留下来，
+         *     它们的下标正好接在被截短的后端条目之后 —— 不判 server_id
+         *     就会把后端某条提醒的药名写到本地提醒上，长按追问说成
+         *     「您刚才吃过<别人的药>了吗」，这是事故。 */
+        if (i >= g.table.count) break;
+        if (g.table.items[i].server_id == 0) continue;
+        g.med_count[i] = counts[i];
+        if (first_names != NULL) {
+            /* 用 memcpy 而不是 strncpy：目标区已经整体清零，只需保证
+             * 末尾 NUL（strncpy 不补 NUL 的那条老坑在这里不存在）。 */
+            memcpy(g.med_name[i], first_names[i], ELDER_MED_NAME_MAX);
+            g.med_name[i][ELDER_MED_NAME_MAX] = '\0';
+        }
+    }
+}
+
+uint8_t elder_reminder_med_count(uint8_t idx)
+{
+    /* 越界 / 超出当前表长一律按「未知」返回 0：
+     * 缩表后 idx 可能还落在数组范围内，但那条提醒已经不存在了。 */
+    if (idx >= ELDER_REMINDER_MAX || idx >= g.table.count) return 0;
+    return g.med_count[idx];
+}
+
+const char *elder_reminder_first_med_name(uint8_t idx)
+{
+    if (idx >= ELDER_REMINDER_MAX || idx >= g.table.count) return "";
+    return g.med_name[idx];
+}
+
+/* 同一分钟内「还在等确认」的提醒条数（含自己）。
+ *
+ * 判据用 fired_due_at/60 而不是墙上时钟：必须与 elder_bridge.cc 的播报
+ * 去重键完全一致 —— 一个用实例到期分钟、一个用 time(NULL) 的话，跨分钟
+ * 边界会出现「声音只响一次、屏幕却写着还有 3 条」或反过来。
+ *
+ * 为什么把 HALF_CONFIRMED 也算进来：它语义上仍是「待确认」（老人语音说过、
+ * 还没按按钮），屏幕/按键都要继续管它，见 elder_reminder.h 的枚举注释。 */
+static uint8_t pending_same_minute(int64_t due_at)
+{
+    if (due_at <= 0) return 0;
+    int64_t minute = due_at / 60;
+    uint8_t n = 0;
+    for (int i = 0; i < g.table.count && i < ELDER_REMINDER_MAX; i++) {
+        const elder_rmd_item_t *it = &g.table.items[i];
+        if (!it->enabled || it->fired_due_at <= 0) continue;
+        if (it->fired_due_at / 60 != minute) continue;
+        uint8_t st = g.state[i];
+        if (st == ELDER_RMD_PENDING || st == ELDER_RMD_CONFIRM_WIN ||
+            st == ELDER_RMD_ESCALATED || st == ELDER_RMD_HALF_CONFIRMED) {
+            n++;
+        }
+    }
+    return n;
+}
+
+void elder_reminder_screen_text(const elder_rmd_item_t *item, char *out, size_t len)
+{
+    if (out == NULL || len == 0) return;
+    out[0] = '\0';
+    if (item == NULL) return;
+
+    /* 首行沿用 2026-10-29 用户实报后定下的措辞（「该吃X了」/「X时间到了」），
+     * 不给老人换一种说法 —— 他认的是这句话。 */
+    char head[96];
+    if (item->type == ELDER_RMD_TYPE_MEDICINE) {
+        snprintf(head, sizeof(head), "该吃%s了", item->label);
+    } else {
+        snprintf(head, sizeof(head), "%s时间到了", item->label);
+    }
+
+    /* 「（还有 N 条）」：同一分钟里除自己之外还有几条等着确认。
+     * 需求原话是「让老人知道不止一条」。N 只算**已触发**的，所以第一条
+     * 触发时不会预支后面的条数（tick 在同一轮里会紧接着触发剩下的，
+     * 屏幕会连着刷新到最终值，老人看到的是最后一次）。 */
+    uint8_t total = pending_same_minute(item->fired_due_at);
+    if (total > 1) {
+        snprintf(out, len, "%s\n（还有 %u 条）\n\n长按按钮 3 秒确认",
+                 head, (unsigned)(total - 1));
+    } else {
+        snprintf(out, len, "%s\n\n长按按钮 3 秒确认", head);
+    }
 }
 
 int32_t elder_reminder_next_in_sec(void)

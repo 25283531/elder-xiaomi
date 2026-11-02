@@ -83,11 +83,13 @@ GAP_MS = 200
 #:    标记与 `firmware/components/elder/src/elder_bridge.cc` 里的实际调用点
 #:    必须一致，改一边就要改另一边。
 #:
-#: 2026-11-03 team-lead 定的接线范围：
-#:   MEDICINE / TODO  → OnReminder(PENDING)，带 TTS 回落
-#:   ESCALATED        → OnReminder(ESCALATED)，带 tone 回落
+#: 2026-11-03 的接线范围（当天两次需求变更后的**实际**状态）：
+#:   MEDICINE / TODO  → OnReminder(PENDING) 的**离线回落**。
+#:                      在线已改走 TTS：时段话术「您今天上午…」带变量，
+#:                      预录片段零参数化能力，做不到（见 elder_bridge.cc）。
+#:   CONFIRM_HINT     → OnReminder(ESCALATED) 且 type==服药，带 tone 回落
+#:   ESCALATED        → OnReminder(ESCALATED) 且非服药，带 tone 回落
 #:   DONE             → **暂不接**（排队问题，见下面 DONE 那条的注释）
-#:   CONFIRM_HINT     → **没有可用调用点**（见下）
 #:   SKIPPED / NO_REMINDER → **没有对应语音场景**
 CLIPS: tuple[dict, ...] = (
     # 2026-11-03 加长：原话术只有「您有一条服药提醒」，而屏幕上写的是
@@ -98,16 +100,24 @@ CLIPS: tuple[dict, ...] = (
      "text": "您有一条服药提醒，请长按机身顶部凸起的橙色大按键确认"},
     {"id": "TODO", "file": "elder_todo.ogg", "chime": True, "wired": True,
      "text": "您有一条待办事项，请长按机身顶部凸起的橙色大按键确认"},
-    # CONFIRM_HINT：**暂无调用点**。
-    # 它本来的用途是"二次催促"——老人第一次没确认，再催一遍。但本工程没有
-    # 这条路径：reminder.c 的「每 10 分钟闪 10 秒、持续 2 小时」是 rgb.c 自己
-    # 的计时器，只闪灯、**不重新进 OnReminder(PENDING)**；唯一能让提醒回到
-    # PENDING 的二次入口是 ELDER_RMD_CONFIRM_WIN 超时（reminder.c:556），
-    # 而 CONFIRM_WIN 的唯一写入点 elder_reminder_arm_confirm() 只在
-    # firmware/main/app_main.c（**独立的主机自测工程，不随 xiaozhi 固件编译**）
-    # 里被调用，正式固件里根本没有调用者 ⇒ CONFIRM_WIN 不可达 ⇒ 没有二次催促。
+    # CONFIRM_HINT：2026-11-03 起**有调用点** —— OnReminder(ESCALATED) 的
+    # 服药分支（elder_bridge.cc 的 ELDER_RMD_ESCALATED）。
+    #
+    # 需求原话：「『请长按机身顶部凸起的橙色大按键确认』这句提醒音只在服药
+    # 日程生效但是未确认的提醒升级状态主动播放。」PENDING 不播它（老人刚听到
+    # 提醒，再催一遍只是聒噪），非服药也不播（话里明说"服药确认"）。
+    #
+    # 为什么只播它、不和 ESCALATED 连播：两条 2.52 + 4.56 ≈ 7.1 秒，而老人
+    # 已经等了 15 分钟；这句话正是此刻唯一有用的信息（按键位置 + 动作），
+    # escalated 的「该吃药了，请长按按钮」与它语义重叠，先播只会把关键指令
+    # 推后 2.5 秒。判断依据同步写在 elder_bridge.cc 的分支注释里。
+    #
+    # 历史备注（保留，说明它当初为什么空着）：本片段原打算做"二次催促"，
+    # 但本工程没有那条路径 —— reminder.c 的「每 10 分钟闪 10 秒、持续 2 小时」
+    # 是 rgb.c 自己的计时器，只闪灯、不重新进 OnReminder(PENDING)；
+    # CONFIRM_WIN 在正式固件里不可达。现在接在升级态，语义更准。
     {"id": "CONFIRM_HINT", "file": "elder_confirm_hint.ogg", "chime": False,
-     "wired": False,
+     "wired": True,
      "text": "请长按机身顶部凸起的橙色大按键进行服药确认"},
     # DONE：**暂不接**（2026-11-03 team-lead 定的条件式决策）。
     #

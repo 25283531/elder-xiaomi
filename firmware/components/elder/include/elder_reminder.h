@@ -26,6 +26,31 @@ extern "C" {
 #define ELDER_REMINDER_MAX      16
 #define ELDER_REMINDER_LABEL    31
 
+/* ---- 多药提醒的「纯 RAM」元数据 ----
+ *
+ * 需求（2026-11-03）：一条服药提醒挂多味药时，长按确认键不能直接当成
+ * 「全吃完了」，要先问「您吃的是哪种药？」，由服务端大模型判断哪一条日程
+ * 完成了。但设备侧原先**根本不知道一条提醒有几味药、药名是什么**：
+ * sync.c 的 parse_reminders() 只读 title，服务端下发的 medicines 数组
+ * 在传输层就被丢掉了。
+ *
+ * 为什么只放 RAM、绝不放进 elder_rmd_item_t：
+ *   items[] 是 NVS blob 的一部分。往里加一个字节，V1/V2 的逐字节前缀断言
+ *   立刻编译失败；就算绕过断言，老 blob 的尺寸与 CRC 也对不上，load() 会把
+ *   老用户的整张提醒表判成「无数据」并清空 —— 服药提醒全丢，医疗事故级。
+ *   而药数/药名是**配置属性**：每轮心跳（默认 300s）都会重新下发，丢了大不了
+ *   等 5 分钟；断电重启后退回「药数未知」，行为是「直接确认」—— 方向安全
+ *   （宁可少问一句，也不能拿昨天的药名去确认今天的药）。
+ *
+ * 为什么是 128 字节/条而不是 32：
+ *   服务端 schemas.py 的 MedicineItem.name 是 **32 个字符**（max_length=32），
+ *   中文 UTF-8 一个字 3 字节，最坏 96 字节。按 32 字节存会把
+ *   「盐酸二甲双胍缓释片」这类名字截成半个汉字 —— TTS 念出来是乱码，
+ *   老人据此吃错药。16×128 = 2KB RAM，换这个确定性是值得的。
+ */
+#define ELDER_MED_NAME_MAX      127
+typedef char elder_med_name_t[ELDER_MED_NAME_MAX + 1];
+
 typedef enum {
     ELDER_RMD_IDLE = 0,      /* 未到时间 */
     ELDER_RMD_PENDING,       /* 已触发，等待确认 */
@@ -357,6 +382,55 @@ bool elder_reminder_has_pending_confirm(void);
  * 这是 elder_bridge.cc 的 FirstUndoneReminder() 选目标时的第一优先级。
  */
 int elder_reminder_first_ringing(void);
+
+/**
+ * @brief 写入「每条提醒挂几味药、第一味药叫什么」—— **纯 RAM，绝不落盘**。
+ *
+ * @param counts       与 items[] 同下标；counts[i] = 该条提醒 medicines 数组长度
+ * @param first_names  与 items[] 同下标；medicines[0].name（可为 NULL）
+ * @param n            条目数，超过 ELDER_REMINDER_MAX 的部分忽略
+ *
+ * 生命周期（三条，漏一条就会「药数莫名其妙归零」或「拿错药名去确认」）：
+ *   ① 每次 elder_reminder_replace_all() 之后**必须重写**：心跳默认 300 秒
+ *      整表重装一次，不重写的话 5 分钟后药数归零，长按退回「直接确认」；
+ *      replace_all 内部会先把这批数据清零（见 reminder.c），所以漏调不会
+ *      继承到错药名，只会退化成「未知」。
+ *   ② 跨天重置（reminder.c 的 tick）**不清**：药数是配置属性，不是当日状态。
+ *   ③ 开机为 0：断电重启后药数未知，退回「直接确认」是正确行为。
+ */
+void elder_reminder_set_med_info(const uint8_t *counts,
+                                 const elder_med_name_t *first_names,
+                                 uint8_t n);
+
+/**
+ * @brief 该条提醒挂几味药。未知（含越界 / 超出当前表长）返回 0。
+ *
+ * 0 的语义是「不知道」，不是「没有药」—— 调用方必须把 0 当成
+ * 「按老路径直接确认」，而不是「这条提醒没有药、不能确认」。
+ */
+uint8_t elder_reminder_med_count(uint8_t idx);
+
+/** 第一味药名；未知返回空串（不是 NULL，调用方可直接 snprintf） */
+const char *elder_reminder_first_med_name(uint8_t idx);
+
+/**
+ * @brief 生成全屏提醒文案 —— **唯一真源**。
+ *
+ * 为什么要有这个函数（2026-11-03）：原先 elder_bridge.cc 的 OnReminder(PENDING)
+ * 与 reminder.c 的反向对账各写了一份一模一样的 snprintf，注释里写着「改一处
+ * 就要改两处」。这一轮又要在文案里加「（还有 N 条）」，两处手写必然漂移，
+ * 而漂移的表现是「屏幕上的句子在两条路径之间来回跳」，老人会以为是两条提醒。
+ * ⇒ 合成一个函数，两边都调它，从结构上消灭这个坑。
+ *
+ * 文案形状（含同一分钟多条时的条数提示）：
+ *   「该吃降压药了\n（还有 2 条）\n\n长按按钮 3 秒确认」
+ *   「喝水时间到了\n\n长按按钮 3 秒确认」
+ *
+ * @param item 目标提醒（取 label/type/fired_due_at）
+ * @param out  输出缓冲（建议 >=160 字节）
+ * @param len  缓冲长度
+ */
+void elder_reminder_screen_text(const elder_rmd_item_t *item, char *out, size_t len);
 
 /**
  * @brief 获取下一条待触发提醒距现在的秒数（-1 表示无）
