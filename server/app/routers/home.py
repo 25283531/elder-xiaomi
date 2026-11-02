@@ -146,6 +146,9 @@ def _medicine_today(db: Session, device_ids: list[int],
                     # 多设备合并时逐条查就是标准的 N+1（首页是轮询接口）。
                     "medicines": r.medicines,
                     "dose": r.dose or "",
+                    # 还没到点/没有实例 ⇒ 一味都没确认过。**给 [] 不给 None**：
+                    # 与 derive_medicines 同口径，前端 v-for 拿到 null 会白屏。
+                    "confirmed_medicines": [],
                 }
 
         # 2) 用实例表覆盖真实状态。为什么按 (提醒, HH:MM) 对齐而不是按完整时间：
@@ -200,6 +203,9 @@ def _medicine_today(db: Session, device_ids: list[int],
                     # 拿到 null 会直接抛错白屏。
                     "medicines": rule.medicines if rule is not None else None,
                     "dose": (rule.dose if rule is not None else "") or "",
+                    # 规则被删了，但实例上的逐味进度仍然是**老人确实确认过**
+                    # 的事实，照旧带着（与上面"仍然保留这条实例"同一个理由）。
+                    "confirmed_medicines": list(ev.confirmed_medicines or []),
                 }
                 continue
             slot["due_at"] = ev.due_at
@@ -207,6 +213,7 @@ def _medicine_today(db: Session, device_ids: list[int],
             slot["state"] = int(ev.state)
             slot["confirm_method"] = int(ev.confirm_method or 0)
             slot["confirmed_at"] = ev.confirmed_at
+            slot["confirmed_medicines"] = list(ev.confirmed_medicines or [])
 
         confirmed = sum(1 for s in slots.values()
                         if s["state"] == int(models.EventState.CONFIRMED))
@@ -232,6 +239,9 @@ def _medicine_today(db: Session, device_ids: list[int],
                 confirmed_at=s["confirmed_at"],
                 device_id=s["device_id"],
                 device_name=s["device_name"],
+                # 逐味确认进度（2026-11-03）：与 medicines 一起给到首页，
+                # 家属才能看出「四味药只确认了两味」。
+                confirmed_medicines=s["confirmed_medicines"],
             )
             for s in slots.values()
         ]

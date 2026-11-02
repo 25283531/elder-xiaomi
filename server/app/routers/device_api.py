@@ -592,6 +592,12 @@ def report_event(payload: EventReportIn, db: Session = Depends(get_db),
     #     也看不出老人是"自己说的"还是"被催着按的"；
     #   * 反过来（先按键、后语音）保持 BUTTON：按键已是全置信，不该被降级。
     _method = payload.confirm_method
+    # ⚠️ 逐味确认（2026-11-03）后同一个 ``(reminder_id, due_at)`` 实例会**多次**
+    # 上报（每确认一味一条），下面这条「先 VOICE 后 BUTTON 合并成
+    # VOICE_AND_BUTTON」的规则因此需要按「同一味药」判才算对：现在按
+    # (实例, 确认方式) 判，四味药各自"先语音后按键"会被合并成一次，
+    # 家属看不出是逐味确认了四次。**这一版先不改**（状态机改造是另一个改动），
+    # 但改动它的人必须先看 ``ReminderEvent.confirmed_medicines`` 的注释。
     if (
         payload.state == int(EventState.CONFIRMED)
         and _method == int(ConfirmMethod.BUTTON)
@@ -601,6 +607,24 @@ def report_event(payload: EventReportIn, db: Session = Depends(get_db),
         if not ev.note:
             ev.note = "语音确认后半置信，按键复核"
     ev.confirm_method = _method
+    # 逐味确认：把这次点名的药记进 ``confirmed_medicines``（去重、保持顺序）。
+    # **只做这一件事** —— 不在这里推导 state（"全确认才算 CONFIRMED"属于状态机
+    # 改造，别在这里顺手改，否则老固件的整条确认会立刻变成"永远不确认"）。
+    #
+    # 空 medicine = 整条确认 / 没说具体哪一味 ⇒ 列表保持原样，语义是
+    # 「没有逐味信息」，与老固件的行为逐字一致。
+    #
+    # ⚠️ 必须**整体重新赋值**，不能 ``ev.confirmed_medicines.append(name)``：
+    # SQLAlchemy 的 ``JSON`` 列默认**没有可变性追踪**（不是 MutableList），
+    # 就地 append 之后实例的 ``__dict__`` 里还是同一个 list 对象，
+    # 脏检查比较的是"对象身份/值相等" ⇒ 认为没有变化 ⇒ **不写库**。
+    # 症状最恶劣：接口返回 200、响应里甚至能看到刚加的药名（因为内存里确实改了），
+    # 刷新页面/下次心跳就没了 —— 表现为"确认记录随机丢失"，且本地复现不了。
+    _med = (payload.medicine or "").strip()[:32]
+    if _med:
+        _known = list(ev.confirmed_medicines or [])
+        if _med not in _known:
+            ev.confirmed_medicines = _known + [_med]
     if payload.fired_at:
         ev.fired_at = payload.fired_at
         ev.fired_count = (ev.fired_count or 0) + 1
