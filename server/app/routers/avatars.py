@@ -1,12 +1,16 @@
-"""形象管理：EAF 序列帧资源 + 片段映射 + 情绪灯效 + 资源包。
+"""形象管理：EAF 序列帧资源 + 情绪灯效 + 资源包。
 
 ⚠️ 形象已**退化为纯形象**（架构 §4.2）：人格与角色级音色搬到了 AIProvider，
 这里不再暴露 system_prompt。设备侧「换外观」与「换人格」从此互不影响。
 
 ⚠️ 2026-10-31 职责重划（用户定调）：
-    形象主管 = 灯效 / EAF 资源 / clips（动画片段映射）/ 资源包
+    形象主管 = 灯效 / EAF 资源 / 资源包
     人格预设主管 = 声音（音色）/ 定义（system_prompt + traits）
 两处**不许出现同一个可编辑项** —— 否则用户改了不生效的那一处，会以为改错了。
+
+⚠️ 2026-11-02：``clips``（动画片段映射）已整体删除。它只服务已删除的 emote
+引擎，固件从来没有消费者 —— 写进去没人读，读出来没人用。库里那一列保留
+（没有 Alembic，删不掉），但 API 不再收发它。
 
 ``tts_voice`` 列**保留但不读不写**：本项目没有 Alembic，schema_patch 只能
 ADD COLUMN、删不掉列，所以列还留在库里。但它已经**不再参与任何下发**
@@ -20,10 +24,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..avatar_style import (  # noqa: F401  (DEFAULT_CLIPS 等被 main.py 复用)
-    BRIGHTNESS_MAX, BRIGHTNESS_MIN, CLIP_STATES, DEFAULT_CLIPS, DEFAULT_LIGHTS,
+from ..avatar_style import (  # noqa: F401  (常量被 main.py / schemas.py 复用)
+    BRIGHTNESS_MAX, BRIGHTNESS_MIN, DEFAULT_LIGHTS,
     INTERVAL_MAX, INTERVAL_MIN, LIGHT_COLORS, LIGHT_EFFECTS, LIGHT_STATES,
-    RANDOM_EFFECTS, RANDOM_RGB, normalize_clips, normalize_lights,
+    RANDOM_EFFECTS, RANDOM_RGB, normalize_lights,
 )
 from ..db import get_db
 from ..deps import get_current_user, require_avatar
@@ -41,11 +45,8 @@ def create_avatar(payload: AvatarIn, db: Session = Depends(get_db),
     只有管理员通过直接改库（或未来的管理端接口）才能造 preset 形象。
     """
     av = models.Avatar(**payload.model_dump())
-    if not av.clips:
-        av.clips = dict(DEFAULT_CLIPS)
     if not av.emotion_lights:
         av.emotion_lights = dict(DEFAULT_LIGHTS)
-    av.clips = normalize_clips(av.clips)
     av.emotion_lights = normalize_lights(av.emotion_lights)
     av.record_type = models.RECORD_TYPE_ROLE
     av.owner_id = user.id
@@ -103,7 +104,6 @@ def light_presets(user: models.User = Depends(get_current_user)):
         # normalize_lights() 会二次校验（API 直连、APP 旧版本都绕过界面）。
         "random": {"rgb": RANDOM_RGB, "effects": list(RANDOM_EFFECTS)},
         "defaults": {k: dict(v) for k, v in DEFAULT_LIGHTS.items()},
-        "clip_states": [{"key": k, "label": lab} for k, lab in CLIP_STATES],
         "brightness": {"min": BRIGHTNESS_MIN, "max": BRIGHTNESS_MAX},
         "interval_ms": {"min": INTERVAL_MIN, "max": INTERVAL_MAX},
     }
@@ -120,8 +120,8 @@ def update_avatar(avatar_pk: int, payload: AvatarIn, db: Session = Depends(get_d
                   user: models.User = Depends(get_current_user)):
     """改形象（P0-3 修复：加归属 / is_admin 守卫）。
 
-    修复前任何登录用户都能改平台预设形象 —— 改掉 clips 或灯效映射，
-    等于让全平台所有设备的屏幕表现被人为改变。
+    修复前任何登录用户都能改平台预设形象 —— 改掉灯效映射，
+    等于让全平台所有设备的灯光表现被人为改变。
     """
     av = require_avatar(db, avatar_pk, user, write=True)
     # exclude_unset：只改请求里**真的带了**的字段。
@@ -129,11 +129,9 @@ def update_avatar(avatar_pk: int, payload: AvatarIn, db: Session = Depends(get_d
     # 而形象表单里 `enabled` 这类开关并不总在弹窗里出现 —— 那样每保存一次外观，
     # 就会把"是否启用"悄悄重置成 true。
     data = payload.model_dump(exclude_unset=True)
-    # clips / emotion_lights 走归一而不是原样落库：这两个字段在界面上是
-    # "每状态一行"的固定表单，前端漏传一个状态就会让该状态在库里消失，
-    # 而设备按 key 查表取不到 → 该状态下灯不亮、表情不动，且没有任何报错。
-    if "clips" in data:
-        data["clips"] = normalize_clips(data["clips"])
+    # emotion_lights 走归一而不是原样落库：它在界面上是"每状态一行"的固定表单，
+    # 前端漏传一个状态就会让该状态在库里消失，而设备按 key 查表取不到 →
+    # 该状态下灯不亮，且没有任何报错。
     if "emotion_lights" in data:
         data["emotion_lights"] = normalize_lights(data["emotion_lights"])
     for k, v in data.items():

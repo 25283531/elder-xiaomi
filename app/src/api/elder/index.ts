@@ -140,7 +140,8 @@ export interface Avatar {
   eaf_pack_url: string
   screen_width: number
   screen_height: number
-  clips: Record<string, string>
+  // ⚠️ 2026-11-02 起服务端 AvatarIn/Out **不再有 clips**（动画片段映射随
+  // emote 引擎一起废弃，固件从来没有消费者）。这里同步删掉，别再加回来。
   // ⚠️ 2026-10-31 起形象**不再带 system_prompt**（后端 AvatarIn 已移除该字段），
   // 音色也归到人格预设，这里保留 tts_voice 只是因为它仍是"角色没设音色"时的兜底值，
   // 界面上**不要**再展示成"形象的音色"。

@@ -476,19 +476,6 @@
               这里只保留一个兜底值：角色没设音色时才用它。
             </div>
           </div>
-          <div style="margin-top:10px">
-            <label>动画片段映射（设备处于某状态时播资源包里的哪段动画）</label>
-            <div class="hint" style="font-size:12px;line-height:1.6;margin:4px 0 8px">
-              左边是设备状态，右边填<b>EAF 资源包里的片段名</b>。留空则用默认同名片段。<br>
-              ⚠️ 当前固件<b>尚未消费</b>本映射（表情走内置 emote.json），保存后不会改变设备表情。
-            </div>
-            <div class="grid g2">
-              <div v-for="cs in clipStates" :key="cs.key">
-                <label style="font-size:12px">{{cs.label}}</label>
-                <input v-model="aForm.clips[cs.key]" style="width:100%" :placeholder="cs.key" />
-              </div>
-            </div>
-          </div>
           <div style="margin-top:14px">
             <label>情绪灯效（每个状态一行）</label>
             <div class="hint" style="font-size:12px;line-height:1.6;margin:4px 0 8px">
@@ -1577,7 +1564,7 @@ createApp({
       // 不在前端硬编码状态/动效/色板清单：加一种灯效只改后端，三端自动都有。
       // lightColors = 安全色板（不含"随机"），lightRandom* = "颜色随机"的
       // 哨兵值与**支持随机的动效**（后端说了算，前端不自己判断）。
-      lightStates: [], lightEffects: [], lightColors: [], clipStates: [],
+      lightStates: [], lightEffects: [], lightColors: [],
       lightRandomRgb: '#000000', lightRandomEffects: [],
       // 颜色弹窗状态：open + 目标是哪个状态 + 当前值 + 视口坐标。
       lightPick: {open:false, key:'', rgb:'', top:0, left:0, randomAllowed:false},
@@ -2088,7 +2075,7 @@ createApp({
       return d ? d.name : ('设备 #' + pk);
     },
     async loadAvatars(){ const r = await this.api('/api/avatars'); if(r) this.avatars = r; },
-    // 灯效编辑器的元数据（状态清单 / 预置 / 动效 / 取值范围 / clips 状态键）。
+    // 灯效编辑器的元数据（状态清单 / 动效 / 色板 / 取值范围）。
     // 与 loadAvatars 一起拉：形象弹窗一打开就要渲染 7 行灯效，晚到就会出现
     // 一段空白表格，运营会以为"这台部署没有灯效配置"。
     // ⚠️ 失败不静默：没有这份清单，弹窗里的下拉与滑杆全是空的，
@@ -2103,12 +2090,11 @@ createApp({
         const rnd = r.random || {};
         this.lightRandomRgb = rnd.rgb || '#000000';
         this.lightRandomEffects = rnd.effects || [];
-        this.clipStates = r.clip_states || [];
         this.lightMeta = r;
         // 元数据可能比弹窗晚到（loadAll 是并行拉的）。那一刻 lightStates 已经
         // 有值、aForm.emotion_lights 还是 {} —— 模板会在 undefined 上取 .effect
         // 直接抛渲染错误，整个弹窗变空白。补一次归一即可，成本为零。
-        if (this.aBox && this.aForm){ this.fillClips(); this.fillLights(); }
+        if (this.aBox && this.aForm){ this.fillLights(); }
       }catch(e){ this.err = '灯效元数据加载失败：' + e.message; }
     },
     async loadProviders(){ const r = await this.api('/api/providers'); if(r) this.providers = r; },
@@ -2279,7 +2265,7 @@ createApp({
     // -------- 形象 --------
     blankAvatar(){
       return { name:'', description:'', eaf_pack_name:'', eaf_pack_url:'', eaf_pack_sha256:'',
-        screen_width:320, screen_height:240, clips:{},
+        screen_width:320, screen_height:240,
         emotion_lights:{}, enabled:true };
     },
     editAvatar(a){
@@ -2291,26 +2277,8 @@ createApp({
       delete this.aForm.tts_voice_custom;
       // 必须先补全再开弹窗：模板里直接读 aForm.emotion_lights[st.key].effect，
       // 状态或字段缺一个，Vue 首次渲染就会在 undefined 上取属性而报错。
-      this.fillClips();
       this.fillLights();
       this.aBox = true;
-    },
-    // 保证 clips 9 个键都在：模板里直接 v-model="aForm.clips[cs.key]"，
-    // 键不存在时 v-model 会写到一个新键上但界面首次渲染是空的。
-    fillClips(){
-      // 元数据没拉到（/light-presets 失败）时**原样保留**，绝不写回空对象：
-      // 提交空对象会被后端归一成默认片段名，等于把运营配好的映射静默清掉。
-      if (!this.clipStates.length){ this.aForm.clips = this.aForm.clips || {}; return; }
-      const def = {idle:'idle', listening:'listening', thinking:'thinking',
-                   mouth_open:'mouth_open', mouth_half:'mouth_half', smile:'smile',
-                   blink:'blink', sleepy:'sleepy', alert:'alert'};
-      const src = this.aForm.clips || {};
-      const out = {};
-      this.clipStates.forEach(cs => {
-        out[cs.key] = (typeof src[cs.key] === 'string' && src[cs.key].trim())
-          ? src[cs.key] : (def[cs.key] || cs.key);
-      });
-      this.aForm.clips = out;
     },
     // 保证 emotion_lights 7 个状态 × 4 个字段都在（后端也会归一，
     // 但界面首次渲染必须是完整的，否则滑杆显示空值）。
@@ -2429,8 +2397,8 @@ createApp({
     },
     voiceOf(v){ return this.ttsVoices.find(x=>x.id===v) || null; },
     async saveAvatar(){
-      // clips / emotion_lights 在表单里已经是对象（editAvatar 的 fillClips /
-      // fillLights 补全过），直接提交；后端仍会按 9 键 / 7 状态归一一次。
+      // emotion_lights 在表单里已经是对象（editAvatar 的 fillLights 补全过），
+      // 直接提交；后端仍会按 7 状态归一一次。
       // 形象不含音色：editAvatar 已把它从表单摘掉，这里不再做任何音色收敛。
       const body = JSON.parse(JSON.stringify(this.aForm));
       delete body.id; delete body.created_at;
