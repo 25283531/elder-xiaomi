@@ -50,6 +50,13 @@ _OFF_MARKER = "brace-check: off"
 
 _DEFAULT_ROOTS = ("firmware/components/elder", "firmware/xiaozhi/components/elder")
 _ALL_ROOTS = ("firmware/components/elder", "firmware/xiaozhi/main")
+#: 2026-11-03 追加：main/display 是**直接改上游**的定制文件（lcd_display.cc/.h
+#: 由 merge_to_xiaozhi.py 打补丁，不是生成副本）。它们只出现在 _ALL_ROOTS 里，
+#: 而 _ALL_ROOTS 只在 --negative 时用 —— 等于日常门禁不查这两块最容易改坏的
+#: 文件。2026-11-03 就真的改坏过一次：同一段插了两遍，多出的 `};` 把
+#: class LcdDisplay 提前闭合，报错落在 elder_bridge.cc 上（no member named
+#: 'ShowReminder'），离真正的位置隔了一个文件。现在默认就扫。
+_DISPLAY_ROOTS = ("firmware/xiaozhi/main/display",)
 _SUFFIXES = {".c", ".cc", ".cpp", ".h", ".hpp"}
 
 
@@ -147,7 +154,8 @@ def main(argv: list[str]) -> int:
     args = [a for a in argv[1:] if a != "--all"]
     only_negative = "--all" in argv[1:]
     files = ([Path(a) for a in args] or
-             iter_targets(list(_ALL_ROOTS if only_negative else _DEFAULT_ROOTS)))
+             iter_targets(list(_ALL_ROOTS if only_negative
+                               else _DEFAULT_ROOTS + _DISPLAY_ROOTS)))
     problems: list[str] = []
     for f in files:
         found = check_file(f)

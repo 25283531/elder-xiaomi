@@ -1,6 +1,5 @@
 #include "lcd_display.h"
 #include "gif/lvgl_gif.h"
-#include "anim_emoji_player.h"
 #include "settings.h"
 #include "lvgl_theme.h"
 #include "assets/lang_config.h"
@@ -17,7 +16,7 @@
 
 #include "board.h"
 
-/* 防烧屏屏保必须知道「设备是不是待机」：熊猫是待机指示灯，不是普通屏保。
+/* 防烧屏屏保必须知道「设备是不是待机」：待机跑马灯是待机指示灯，不是普通屏保。
  * 两个头都在 main 组件内（与 main/display/ 同级目录），直接 include 即可，
  * elder_bridge.cc 用的也是这两个。这里只读广播出来的 DeviceState，
  * 不碰 Application 本身，所以不构成"显示层反向依赖业务层"。 */
@@ -320,7 +319,12 @@ LcdDisplay::~LcdDisplay() {
         gif_controller_->Stop();
         gif_controller_.reset();
     }
-    
+
+    /* 待机跑马灯的 lv_anim 必须在删对象**之前**停：它的 exec 回调里拿的是
+     * idle_marquee_image_ 这个指针，对象被 lv_obj_del 之后那条动画还在动画
+     * 链表里，下一帧就会对已释放内存调 lv_obj_set_x（LoadProhibited）。 */
+    StopIdleMarquee();
+
     if (preview_timer_ != nullptr) {
         esp_timer_stop(preview_timer_);
         esp_timer_delete(preview_timer_);
@@ -886,6 +890,10 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_TRANSP, 0);
     lv_obj_set_style_pad_all(emoji_box_, 0, 0);
     lv_obj_set_style_border_width(emoji_box_, 0, 0);
+    /* 待机跑马灯会把这个盒子的子对象挪到边界之外（滚出左边缘），盒子的
+     * 可滚动标志必须关掉：否则 LVGL 会把越界部分算成"可滚动内容"，
+     * 触摸拖动时整块图片区会跟着手指偏移，看起来像界面错位。 */
+    lv_obj_clear_flag(emoji_box_, LV_OBJ_FLAG_SCROLLABLE);
     // 偏移量与 preview_image_ 必须逐字一致（两者是同一块区域，只是内容不同）
     lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, -lvgl_theme->spacing(4));
 
@@ -1127,11 +1135,16 @@ void LcdDisplay::SetEmotion(const char* emotion) {
         gif_controller_.reset();
     }
 
-    /* 动图帧定时器必须在换图**之前**停掉：否则它会在这个函数把
-     * emoji_image_ 换成静态表情之后，继续把旧动画的下一帧怼回去，
-     * 表现为「表情闪一下就变了」或者干脆花屏。 */
-    AnimEmojiPlayer::Get().Stop();
-    
+    /* 待机跑马灯必须在换图**之前**停掉：它每帧都在改自己那个 image 的 x，
+     * 而"有语境表情"和"待机指示灯"是互斥的两种语义 —— 同时出现在屏上，
+     * 老人分不清设备是在待机还是在干活。滚动的 lv_anim 也要一起删，
+     * 否则它继续每 16ms 改一个已经隐藏的对象的坐标，白烧 CPU。
+     * 放在 emoji_image_ 判空之前：跑马灯和 emoji_image_ 是两块独立对象。 */
+    {
+        DisplayLockGuard lock(this);
+        StopIdleMarquee();
+    }
+
     if (emoji_image_ == nullptr) {
         return;
     }
@@ -1197,9 +1210,8 @@ void LcdDisplay::StartAntiBurnInTimer() {
     if (anti_burn_timer_ != nullptr || emoji_image_ == nullptr) {
         return;
     }
-    /* 动图和防烧屏是同一件事的两面，一起在这里初始化。
-     * Init() 幂等，且帧数据缺失时只是 Available()=false，不影响静态轮播。 */
-    AnimEmojiPlayer::Get().Init();
+    /* 待机跑马灯不需要预热：表情图在 assets 里，StartIdleMarquee() 每次
+     * 现查现用（见那里的注释：缓存会因主题/挂载时序过期）。这里只起计时。 */
     last_ui_change_tick_ = lv_tick_get();
 
     /* 订阅设备状态：屏保只在待机态跑（见 AntiBurnInStep 开头的 2026-11-01
@@ -1236,28 +1248,29 @@ void LcdDisplay::AntiBurnInStep() {
     /* ★ 第一道闸：非待机态一律不动屏。★
      *
      * 2026-11-01 真机事故：老人唤醒后不说话（或一轮对话播报完设备自动回到
-     * 聆听态），屏幕中央换成了待机动态熊猫，而字幕还是「聆听中」、状态灯
-     * 还是蓝色常亮 —— 三处互相打架。老人看到熊猫以为设备回待机了，喊唤醒词
-     * 反而打断当前这轮，越急越乱。
+     * 聆听态），屏幕中央换成了待机动态图案，而字幕还是「聆听中」、状态灯
+     * 还是蓝色常亮 —— 三处互相打架。老人看到待机图案以为设备回待机了，
+     * 喊唤醒词反而打断当前这轮，越急越乱。
      *
      * 根因就是这个函数**只看界面静止了多久，不看设备在干什么**：本机
      * CONFIG_USE_DEVICE_AEC=y ⇒ 走 kListeningModeRealtime 连续对话，一轮
      * 说完自动回 kDeviceStateListening，而这一态唤醒词是关的；老人一沉默
      * 就停在那儿，直到服务端 120 秒无有效内容才下发待机。这 120 秒里界面
-     * 静止满 60 秒，于是防烧屏把待机熊猫播了上去。
+     * 静止满 60 秒，于是防烧屏把待机指示灯播了上去。
      *
-     * 为什么必须在这里判、不能只在 PlayIdleAnimation() 里播：熊猫的产品
-     * 语义是「待机指示灯」（2026-10-22 用户原话：「进入待机状态强制切换到
-     * 待机动态熊猫图案，以便区分硬件是否在监听声音，让用户知道是否需要
-     * 唤醒词进行唤醒」）。非待机态播它 = 对老人撒谎，属于功能错误而不是
-     * 视觉瑕疵，所以判据必须挡在所有播图路径的最前面（含下面的静态兜底
-     * 轮播：聆听中把表情图换成随机一张，同样会让人以为状态变了）。
+     * 为什么必须在这里判、不能只在 PlayIdleAnimation() 里播：待机指示灯的
+     * 产品语义是「设备在待机、可以喊我」（2026-10-22 用户原话：「进入待机
+     * 状态强制切换到待机动态图案，以便区分硬件是否在监听声音，让用户知道
+     * 是否需要唤醒词进行唤醒」；2026-11-03 起这个图案由待机跑马灯承担）。
+     * 非待机态播它 = 对老人撒谎，属于功能错误而不是视觉瑕疵，所以判据必须
+     * 挡在所有播图路径的最前面（含下面的静态兜底轮播：聆听中把表情图换成
+     * 随机一张，同样会让人以为状态变了）。
      *
      * 为什么不能只靠 PlayIdleAnimation()、把这条兜底删掉：待机态下老人
-     * 中途说一句话，SetEmotion() 会 Stop() 掉动图并换成语境图标；如果这句
-     * 话没有让状态离开待机（识别为空/被丢弃），屏上就再没有熊猫了 ——
-     * 而「有没有熊猫」是老人判断"要不要喊唤醒词"的唯一依据。所以待机态
-     * 仍然需要防烧屏这条兜底把熊猫接回来；非待机态则必须一步都不许动。
+     * 中途说一句话，SetEmotion() 会停掉跑马灯并换成语境图标；如果这句话
+     * 没有让状态离开待机（识别为空/被丢弃），屏上就再没有待机指示灯了 ——
+     * 而「有没有它在滚」是老人判断"要不要喊唤醒词"的唯一依据。所以待机态
+     * 仍然需要防烧屏这条兜底把它接回来；非待机态则必须一步都不许动。
      *
      * 代价：聆听/播报态长时间静止确实有烧屏风险。但这两个态本来就有
      * 字幕、状态栏、灯效在变，且它们是"正在工作"的短时态；把待机指示灯
@@ -1272,28 +1285,27 @@ void LcdDisplay::AntiBurnInStep() {
         return;
     }
 
-    /* 2026-10-20 用户拍板：空闲屏保 = **一只会动的动物，一直播着**。
+    /* 空闲屏保 = **一直滚着的待机跑马灯**。
      *
-     * 之前是「每 60 秒从 6 个表情动画里随机换一个」，问题有两个：
-     *   1. 只在空闲时触发，实际能看到的机会很少，做 6 个浪费了 5 个
-     *   2. 每轮换一张 = 每 60 秒一次大跳变，反而不像「屏保」
-     * 现在：空闲就开播熊猫并**无限循环**，像素一直在变（这才真防烧屏）；
-     * 有人说话时 SetEmotion() 会先 Stop()，立刻回到语境对应的静态图标。
-     * 所以这里只需要「没在播就开播」，播着就什么都不做。 */
-    auto& anim = AnimEmojiPlayer::Get();
-    if (anim.Playing()) {
-        return;
-    }
-    if (anim.Available() && emoji_image_ != nullptr) {
-        const uint32_t idle_sec = lv_tick_elaps(last_ui_change_tick_) / 1000;
+     * 语义（2026-10-20 用户拍板，2026-11-03 从"熊猫动图"换成"跑马灯"）：
+     * 待机就一直播、无限循环，像素一直在变（这才真防烧屏）；有人说话时
+     * SetEmotion() 会先停掉它，立刻回到语境对应的静态图标。
+     * 所以这里只需要「没在跑就开跑」，跑着就什么都不做。
+     *
+     * ⚠️ idle_marquee_running_ 的读必须**持锁**：它由 SetEmotion /
+     * PlayIdleAnimation（应用任务、协议任务）写，本函数跑在 LVGL 定时器
+     * 任务里。不加锁就是跨任务读一个普通 bool —— 与 device_idle_ 不同，
+     * 这里不打算为它引入 volatile（那只是让读不被缓存，不解决可见性），
+     * 直接进锁最省事：20 秒一次，代价可以忽略。 */
+    {
         DisplayLockGuard lock(this);
-        if (anim.PlayDefault(emoji_image_)) {
-            if (emoji_label_ != nullptr) {
-                lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
-            }
-            lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
-            ESP_LOGI(TAG, "空闲屏保：静止 %u 秒，开始循环播放 \"%s\"",
-                     (unsigned)idle_sec, anim.DefaultName());
+        if (idle_marquee_running_) {
+            return;
+        }
+        if (StartIdleMarquee()) {
+            ESP_LOGI(TAG, "空闲屏保：静止 %u 秒，待机跑马灯开播（%u 张表情）",
+                     (unsigned)(lv_tick_elaps(last_ui_change_tick_) / 1000),
+                     (unsigned)idle_marquee_ready_.size());
             return;
         }
     }
@@ -1316,79 +1328,306 @@ void LcdDisplay::AntiBurnInStep() {
             continue;
         }
         if (collection->GetEmojiImage(candidate.c_str()) == nullptr) {
-            continue;   /* assets 里没这张（只有 PNG 集合里有的才可用） */
+            continue;   /* assets 里没这张（名字不在 cbin 清单里） */
         }
         anti_burn_last_emoji_ = candidate;
-        /* 走到这里说明动图不可用（帧数据缺失/描述符池分配失败），
-         * 退回静态轮换，至少还能防烧屏。这条分支正常情况下走不到。 */
-        ESP_LOGW(TAG, "防烧屏兜底：动图不可用，静态表情轮换为 \"%s\"",
+        /* 走到这里说明跑马灯起不来（一个表情都取不到图），退回静态轮换，
+         * 至少还能防烧屏。这条分支正常情况下走不到。 */
+        ESP_LOGW(TAG, "防烧屏兜底：跑马灯起不来，静态表情轮换为 \"%s\"",
                  candidate.c_str());
         SetEmotion(candidate.c_str());   /* 内部会重置 last_ui_change_tick_ */
         return;
     }
 }
 
-// >>> BEGIN elder-idle-panda (2026-10-22 需求 7：待机立即播熊猫) >>>
-/* 进入待机：立即开播动态熊猫，**不**等防烧屏的 60 秒。
+// >>> BEGIN elder-idle-marquee (2026-11-03：待机跑马灯顶替熊猫) >>>
+/* 待机跑马灯 —— 本次改动的全部实现都在这一段。
  *
- * 需求原话（2026-10-22）：「进入待机状态强制切换到待机动态熊猫图案，
+ * 需求（2026-11-03 用户原话）：「待机熊猫和跑马灯放在同一个 commit 里删，
+ * 跑马灯顶上这个位置。」即：删掉编译进 .rodata 的熊猫帧动画（269,568 字节），
+ * 由跑马灯占用它原来那块图片区（emoji_box_，320x240 屏上是 134x110），
+ * 继续承担「设备活着、可以喊我」这个唯一视觉信号（2026-10-22 用户对熊猫的
+ * 语义定义，见 PlayIdleAnimation 的注释）。
+ *
+ * 形态：图片区里**一个** lv_image，lv_anim 驱动 lv_obj_set_x 从右边缘外
+ * 匀速左移；整张移出左边缘后 lv_image_set_src 换下一张、x 复位到右边缘外。
+ * 不建 N 个 image 拼长条：屏幕只够同时看到一张，多建的每个对象都要参与
+ * 重绘扫描，内存和重绘量都是 N 倍。
+ *
+ * 为什么用 assets 里的 cbin 表情、不另做 PNG/GIF：本机
+ * CONFIG_LV_CACHE_DEF_SIZE=0（图片缓存关闭），PNG 每帧都要 lodepng 重解，
+ * 逐帧滚动会把 LVGL 任务拖死 —— 这正是 2026-11-02 把表情从 PNG 换成
+ * cbin（裸 RGB565A8，零解码）的原因，跑马灯直接复用这条既有取图路径
+ * （LvglTheme::emoji_collection()->GetEmojiImage）。 */
+
+namespace {
+
+/* 待机态滚哪些表情。
+ *
+ * 只放中性/友好的一批，**不用全部 21 个**：angry / shocked / crying / sad
+ * 这类负面表情在待机态循环出现，会让老人以为设备在生气、或者家里出了事。
+ * 待机指示灯是「状态指示」不是「装饰」，它的每一个画面都会被当成设备在
+ * 表达情绪 —— 筛选标准就是「老人看了不会往坏处想」。
+ *
+ * 2026-11-03 把 thinking 换成 loving：待机态滚出「思考中」是自相矛盾的
+ * 假信号 —— 设备什么都没在处理，老人却看见它在想，会以为自己的话还没被
+ * 应答、再喊一遍把这次请求打断（与 2026-11-01 那次「非待机态播待机灯」
+ * 是同一类错：指示灯说了它没在做的事）。loving 是正面的陪伴感，与
+ * 「小安在待机、可以喊我」一致。
+ *
+ * 名字必须与 main/assets/emoji/fluent3d_128/ 下的文件名**逐字一致**
+ * （assets.cc 按这个名字查 cbin，写错就是取不到图，会被下面的校验跳掉）。
+ * 顺序按「平静 → 有点俏皮」排，滚起来观感是渐进的，不会忽喜忽悲。 */
+constexpr const char* kIdleMarqueeEmoji[] = {
+    "neutral", "relaxed", "happy", "loving", "winking", "cool", "sleepy",
+};
+
+/* 滚动速度 35 px/s。
+ *
+ * 上限由「看得清」定：图片区宽 134px，图 110px，一张划过约 7 秒；再快
+ * （>50px/s）老人只看到一团颜色在动，认不出是什么表情。
+ * 下限由「别以为卡住」定：慢于 ~25px/s 时相邻两帧位移不到 1px，
+ * 观感接近静止，起不到「设备活着」的信号作用。
+ * 取中间值 35 ⇒ 单张过屏 (134+110)/35 ≈ 7.0 秒，7 张一轮约 49 秒，
+ * 与防烧屏的 60 秒量级一致（一轮下来整块图片区的像素全换过）。 */
+constexpr int32_t kIdleMarqueeSpeedPxPerSec = 35;
+
+}  // namespace
+
+void LcdDisplay::IdleMarqueeExecCb(void* var, int32_t x) {
+    auto* self = static_cast<LcdDisplay*>(var);
+    if (self == nullptr || self->idle_marquee_image_ == nullptr) {
+        return;
+    }
+    /* 一轮滚完 ⇒ 换下一张。判据是「x 变大了」：动画只往左走，x 变大只可能
+     * 发生在 repeat 复位回起点那一刻（lv_anim 在 repeat 时把 act_time 归零，
+     * path 重新算出 start_value）。
+     *
+     * 不用 lv_anim 的 completed_cb：它只在 repeat_count 归零时回调
+     * （lv_anim.c 的 anim_completed_handler），而这里是无限循环，永远等不到。
+     * 也不用 start_cb：repeat 不走 start_cb，只在首次启动时调。 */
+    if (x > self->idle_marquee_last_x_) {
+        self->AdvanceIdleMarqueeImage();
+    }
+    self->idle_marquee_last_x_ = x;
+    lv_obj_set_x(self->idle_marquee_image_, x);
+}
+
+void LcdDisplay::AdvanceIdleMarqueeImage() {
+    if (idle_marquee_ready_.empty() || idle_marquee_image_ == nullptr) {
+        return;
+    }
+    auto* theme = static_cast<LvglTheme*>(current_theme_);
+    auto collection = theme != nullptr ? theme->emoji_collection() : nullptr;
+    if (collection == nullptr) {
+        return;
+    }
+    /* 理论上每个名字在 StartIdleMarquee() 时都校验过；但主题/资源包可能
+     * 中途换过，所以这里仍然逐个试。取不到就跳过继续下一张 —— 不显示空白，
+     * 也不让 src 停在一个可能已经失效的 dsc 上（旧图会保留到换成功为止）。 */
+    for (size_t tries = 0; tries < idle_marquee_ready_.size(); ++tries) {
+        const char* name = idle_marquee_ready_[idle_marquee_next_];
+        idle_marquee_next_ = (idle_marquee_next_ + 1) % idle_marquee_ready_.size();
+        const LvglImage* image = collection->GetEmojiImage(name);
+        if (image == nullptr) {
+            ESP_LOGW(TAG, "待机跑马灯：表情 \"%s\" 取不到图，跳过", name);
+            continue;
+        }
+        lv_image_set_src(idle_marquee_image_, image->image_dsc());
+        return;
+    }
+}
+
+bool LcdDisplay::StartIdleMarquee() {
+    if (idle_marquee_running_) {
+        return true;
+    }
+    if (emoji_box_ == nullptr) {
+        ESP_LOGW(TAG, "待机跑马灯：图片区还没建好，不启动");
+        return false;
+    }
+    auto* theme = static_cast<LvglTheme*>(current_theme_);
+    auto collection = theme != nullptr ? theme->emoji_collection() : nullptr;
+    if (collection == nullptr) {
+        ESP_LOGW(TAG, "待机跑马灯：没有表情集合（assets 分区没挂上？），不启动");
+        return false;
+    }
+
+    /* 每次启动都重新校验可用性，不缓存结论：assets 分区挂载晚于 SetupUI，
+     * 主题也可能换过，缓存会拿到过期结果。7 次 map 查找，代价可忽略。 */
+    idle_marquee_ready_.clear();
+    for (const char* name : kIdleMarqueeEmoji) {
+        if (collection->GetEmojiImage(name) == nullptr) {
+            /* 缺图必须点名报出来。静默跳过会让「跑马灯只滚 3 张」这种问题
+             * 永远查不出来 —— 屏上看着"在动"，只是少了几张，没人会怀疑。 */
+            ESP_LOGW(TAG, "待机跑马灯：表情 \"%s\" 取不到图，跳过", name);
+            continue;
+        }
+        idle_marquee_ready_.push_back(name);
+    }
+    if (idle_marquee_ready_.empty()) {
+        ESP_LOGE(TAG, "待机跑马灯：一个表情都取不到，不启动（屏上保持静态表情）");
+        return false;
+    }
+
+    /* 尺寸：表情源是 128x128 方图，图片区 134x110 ⇒ 按**盒子高度**取正方形，
+     * CONTAIN 等比缩到 110x110，正好铺满高度、宽度也留出左右各 12px 的
+     * 进出空间（滚出/滚入时不会突然整块跳出来）。 */
+    lv_obj_update_layout(emoji_box_);
+    const int32_t box_w = lv_obj_get_width(emoji_box_);
+    const int32_t box_h = lv_obj_get_height(emoji_box_);
+    if (box_w <= 0 || box_h <= 0) {
+        ESP_LOGW(TAG, "待机跑马灯：图片区尺寸异常（%dx%d），不启动",
+                 (int)box_w, (int)box_h);
+        return false;
+    }
+
+    if (idle_marquee_image_ == nullptr) {
+        idle_marquee_image_ = lv_image_create(emoji_box_);
+        lv_obj_set_style_pad_all(idle_marquee_image_, 0, 0);
+        lv_obj_set_style_border_width(idle_marquee_image_, 0, 0);
+        lv_image_set_inner_align(idle_marquee_image_, LV_IMAGE_ALIGN_CONTAIN);
+        /* 只建一次，之后靠显隐复用：LVGL 对象创建在 PSRAM 碎片化时可能失败，
+         * 而这块是待机态反复要用的东西。 */
+        lv_obj_add_flag(idle_marquee_image_, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_set_size(idle_marquee_image_, box_h, box_h);
+
+    idle_marquee_next_ = 0;
+    const LvglImage* first = collection->GetEmojiImage(idle_marquee_ready_[0]);
+    if (first == nullptr) {
+        /* 上面刚校验过，走到这里说明这一瞬间主题换了 —— 交给下一轮兜底 */
+        ESP_LOGW(TAG, "待机跑马灯：首帧取图失败，不启动");
+        return false;
+    }
+    lv_image_set_src(idle_marquee_image_, first->image_dsc());
+    idle_marquee_next_ = 1 % idle_marquee_ready_.size();
+
+    if (emoji_image_ != nullptr) {
+        lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (emoji_label_ != nullptr) {
+        lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_remove_flag(idle_marquee_image_, LV_OBJ_FLAG_HIDDEN);
+
+    /* x 从图片区右边缘外开始（对象左边缘 = box_w ⇒ 整张在图区之外），
+     * 匀速左移到 -img_w（对象右边缘 = 0 ⇒ 整张移出左边缘）。一条 lv_anim
+     * 用 repeat 无限循环，每轮回起点时 x 由动画自己复位。
+     *
+     * var 传 this 而不是 image：exec 回调里要拿 LcdDisplay 的成员（ready 列表、
+     * 下一张下标），而 lv_anim 的 exec_cb 只给一个 void*。顺带获得一个好处：
+     * lv_anim_start 会 remove_concurrent_anims（同 var + 同 exec_cb），
+     * 所以本函数被重入也不会同时跑两条动画。 */
+    const int32_t img_w = box_h;
+    const uint32_t duration_ms =
+        (uint32_t)((box_w + img_w) * 1000 / kIdleMarqueeSpeedPxPerSec);
+
+    /* early_apply 默认开 ⇒ lv_anim_start 会立刻用 start_value 调一次回调。
+     * 所以 last_x_ 必须在 start **之前**置成起点，否则首次回调会被当成
+     * 「x 变大」而白白换掉一张图。 */
+    idle_marquee_last_x_ = box_w;
+
+    lv_anim_t anim;
+    lv_anim_init(&anim);
+    lv_anim_set_var(&anim, this);
+    lv_anim_set_exec_cb(&anim, IdleMarqueeExecCb);
+    lv_anim_set_values(&anim, box_w, -img_w);
+    lv_anim_set_duration(&anim, duration_ms);
+    lv_anim_set_path_cb(&anim, lv_anim_path_linear);
+    lv_anim_set_repeat_count(&anim, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_repeat_delay(&anim, 0);
+    if (lv_anim_start(&anim) == nullptr) {
+        ESP_LOGW(TAG, "待机跑马灯：动画创建失败，退回静态表情");
+        lv_obj_add_flag(idle_marquee_image_, LV_OBJ_FLAG_HIDDEN);
+        return false;
+    }
+
+    idle_marquee_running_ = true;
+    return true;
+}
+
+void LcdDisplay::StopIdleMarquee() {
+    /* lv_anim_delete 按 (var, exec_cb) 匹配 —— 与 StartIdleMarquee 里注册的
+     * 那一对逐字一致，否则删不掉，滚动会在图片隐藏后继续跑（白烧 CPU，
+     * 且下次启动会出现两条动画抢同一个 x）。 */
+    lv_anim_delete(this, IdleMarqueeExecCb);
+    idle_marquee_running_ = false;
+    if (idle_marquee_image_ != nullptr) {
+        lv_obj_add_flag(idle_marquee_image_, LV_OBJ_FLAG_HIDDEN);
+        /* 断开 src 引用：主题换过之后旧 collection 里的 dsc 会被 delete，
+         * 留着野指针比"图暂时不显示"危险得多。 */
+        lv_image_set_src(idle_marquee_image_, nullptr);
+    }
+    /* 把常规表情图放回来：SetEmotion 紧接着会自己设新 src 并显式去掉隐藏
+     * 标志，但 SetTheme / ShowReminder 这两条路没有 —— 不补这一步，换主题
+     * 之后图片区会一直空着，直到下一次 SetEmotion（老人看到的是"屏幕坏了"）。 */
+    if (emoji_image_ != nullptr && lv_image_get_src(emoji_image_) != nullptr) {
+        lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+    }
+    idle_marquee_last_x_ = 0;
+    idle_marquee_next_ = 0;
+}
+
+/* 进入待机：立即开播待机跑马灯，**不**等防烧屏的 60 秒。
+ *
+ * 需求来源（2026-10-22 用户原话）：「进入待机状态强制切换到待机动态图案，
  * 以便区分硬件是否在监听声音，让用户知道是否需要唤醒词进行唤醒。」
+ * 2026-11-03 用户改为：待机熊猫删掉，这个位置放跑马灯。
  *
  * 为什么不能靠 AntiBurnInStep()：那条路径开头有
  *   if (lv_tick_elaps(last_ui_change_tick_) < ANTI_BURN_IDLE_MS) return;
  * 界面刚变过（SetEmotion("neutral") 正是界面变化）之后的 60 秒内一律
- * 跳过，而"进待机"恰好每次都紧跟一次 SetEmotion —— 熊猫永远播不上。
+ * 跳过，而"进待机"恰好每次都紧跟一次 SetEmotion —— 跑马灯永远起不来。
  *
  * 纪律与 SetEmotion 相同：一进函数就重置防烧屏计时。界面确实变过了
- * （静态表情 -> 熊猫动画），不重置的话轮播的「60 秒无操作」判据会从
- * 错误的起点算起。放在最前面：下面有多个分支会提前返回，漏掉哪个
- * 都会让计时错乱。
+ * （静态表情 -> 跑马灯），不重置的话轮播的「60 秒无操作」判据会从
+ * 错误的起点算起。
  *
- * 动图不可用（帧数据缺失/描述符池分配失败）时只打 WARN 退回静态
- * 表情，**不调 SetEmotion**：那会再把动画 Stop 一次（此刻本来就没在
- * 播，纯属浪费），且静态表情此刻已在屏上，没有切换的必要。 */
+ * 跑马灯起不来（表情资源取不到）时只打 WARN 退回静态表情，**不调
+ * SetEmotion**：静态表情此刻已在屏上，没有切换的必要，而 SetEmotion 会
+ * 再重置一次计时、打一轮多余的日志。
+ *
+ * 只在待机态被调用：两个调用点（elder_bridge.cc 的 OnDeviceStateChanged
+ * 的 cur == kDeviceStateIdle 分支、elder_enter_standby 里 SetDeviceState(Idle)
+ * 之后）都成立，所以函数体内不再重复判 device_idle_ —— 那个标志由事件循环
+ * 异步写入，进待机的瞬间可能还是 false，拿它当闸会把"立即播"直接掐死。 */
 void LcdDisplay::PlayIdleAnimation() {
     /* 界面变化 ⇒ 重置防烧屏空闲计时（见 StartAntiBurnInTimer）。 */
     last_ui_change_tick_ = lv_tick_get();
 
-    /* 先把可能正在播的 GIF 表情停掉，再换熊猫。
+    /* 先把可能正在播的 GIF 表情停掉，再上跑马灯。
      *
-     * AnimEmojiPlayer 的帧定时器与 gif_controller_ 的帧回调都往
-     * emoji_image_ 上怼，两个同时跑就是 SetEmotion 注释里写的
-     * 「表情闪一下就变了」甚至花屏。SetEmotion 每次都会清
-     * gif_controller_，进待机的主路径（状态变化事件）必经 SetEmotion，
-     * 通常这里已经是空的；但 elder_bridge 在「设备已经是 idle 又说了一
-     * 次待机」时也会直接调本函数，那条路径没有 SetEmotion 兜底，
-     * 所以必须自己清。AntiBurnInStep 不需要这步 —— 它只在界面 60 秒
-     * 无变化后跑，那期间任何 SetEmotion 都已经清过 GIF 了。
-     *
-     * AnimEmojiPlayer 不用在这里停：PlayDefault → Play() 第一行就是
-     * Stop()（anim_emoji_player.cc:128），自带。 */
+     * gif_controller_ 的帧回调和跑马灯都在改写图片区，两个同时跑就是
+     * SetEmotion 注释里写的「表情闪一下就变了」甚至花屏。SetEmotion 每次
+     * 都会清 gif_controller_，进待机的主路径（状态变化事件）必经 SetEmotion，
+     * 通常这里已经是空的；但 elder_bridge 在「设备已经是 idle 又说了一次
+     * 待机」时也会直接调本函数，那条路径没有 SetEmotion 兜底，所以必须自己清。 */
+    DisplayLockGuard lock(this);
     if (gif_controller_) {
-        DisplayLockGuard lock(this);
         gif_controller_->Stop();
         gif_controller_.reset();
     }
 
-    auto& anim = AnimEmojiPlayer::Get();
-    if (anim.Available() && emoji_image_ != nullptr) {
-        DisplayLockGuard lock(this);
-        if (anim.PlayDefault(emoji_image_)) {
-            if (emoji_label_ != nullptr) {
-                lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
-            }
-            lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
-            ESP_LOGI(TAG, "待机屏保：立即播放熊猫 \"%s\"", anim.DefaultName());
-            return;
-        }
+    if (StartIdleMarquee()) {
+        ESP_LOGI(TAG, "待机屏保：立即开播待机跑马灯（%u 张表情，%d px/s）",
+                 (unsigned)idle_marquee_ready_.size(),
+                 (int)kIdleMarqueeSpeedPxPerSec);
+        return;
     }
-    ESP_LOGW(TAG, "待机屏保：动图不可用，退回静态表情（防烧屏轮播仍会尝试）");
+    ESP_LOGW(TAG, "待机屏保：跑马灯起不来，保持静态表情（防烧屏轮播仍会尝试）");
 }
-// <<< END elder-idle-panda <<<
+// <<< END elder-idle-marquee <<<
 
 void LcdDisplay::SetTheme(Theme* theme) {
     DisplayLockGuard lock(this);
-    
+
+    /* 换主题会换掉 emoji_collection（assets 资源包里的 LvglCBinImage 会被
+     * delete）。跑马灯手里攥着旧 dsc 的 src，不停掉就是野指针 —— 先停，
+     * StopIdleMarquee() 里会把 src 一并断开。停掉之后如果设备仍在待机，
+     * AntiBurnInStep 的兜底会在下一个 20 秒周期把它重新拉起来。 */
+    StopIdleMarquee();
+
     auto lvgl_theme = static_cast<LvglTheme*>(theme);
     
     // Get the active screen
@@ -1606,6 +1845,11 @@ void LcdDisplay::SetHideSubtitle(bool hide) {
  */
 void LcdDisplay::ShowReminder(const char* text) {
     DisplayLockGuard lock(this);
+    /* 全屏提醒是最高优先级的界面内容（吃药/喝水这类医疗级提示）。
+     * 跑马灯虽然被 overlay 整块盖住看不见，但动画照样每 16ms 改一次坐标、
+     * 让 LVGL 每帧重绘一块被遮住的区域 —— 白耗电，且提醒挂 4 小时。
+     * 停掉它；提醒撤掉后如果仍是待机态，AntiBurnInStep 会把它接回来。 */
+    StopIdleMarquee();
     auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
     auto screen = lv_screen_active();
     if (screen == nullptr || lvgl_theme == nullptr) {

@@ -130,6 +130,46 @@ def read_kv(path: Path) -> dict[str, str]:
     return out
 
 
+def _strip_comments(s: str) -> str:
+    """把 C/C++ 注释换成等长空白（保留换行与偏移）。
+
+    为什么必须先剥注释：本仓的门禁大多是「某处不许出现 X」，而**解释为什么
+    不许出现的那段注释里就写着 X**（例如「已删除 anim_emoji_player」）。
+    不剥注释等于让防回归注释自己踩红 —— 这是本仓库反复踩过的坑。
+    字符串字面量要整体跳过，否则 `"//"` 会被当成行注释起点。
+    """
+    out: list[str] = []
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "/" and i + 1 < n and s[i + 1] == "*":
+            j = s.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append(re.sub(r"[^\n]", " ", s[i:j]))
+            i = j
+        elif c == "/" and i + 1 < n and s[i + 1] == "/":
+            j = s.find("\n", i)
+            j = n if j < 0 else j
+            out.append(" " * (j - i))
+            i = j
+        elif c in "\"'":
+            q, j = c, i + 1
+            while j < n:
+                if s[j] == "\\":
+                    j += 2
+                    continue
+                if s[j] == q:
+                    j += 1
+                    break
+                j += 1
+            out.append(s[i:j])
+            i = j
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 def overlay_keys(defaults_path: Path) -> set[str]:
     """取 sdkconfig.defaults 里**我们自己的 overlay 段**里的键。
 
@@ -521,68 +561,103 @@ def main() -> int:
         else "dual_wake_word.cc 与 elder_cmd.h 均不存在（回归上游已落实）",
     )
 
-    # ------------------------------------------------------ 表情动图
-    # 帧数据（anim_frames.bin）是**生成物但入库**，索引头（anim_emoji_index.h）
-    # 和它必须同步。改了 tools/anim_emoji_pack.py 的 --frames / --size 之后
-    # 只重跑了一半，就会得到「bin 比索引头小」⇒ 运行时 dsc 指到越界地址，
-    # 表现是随机花屏（读 PSRAM/flash 映射区的脏数据），极难归因。
-    anim_dir = ROOT / "firmware" / "xiaozhi" / "main" / "display" / "lvgl_display" / "anim"
-    anim_bin = anim_dir / "anim_frames.bin"
-    anim_hdr = anim_dir / "anim_emoji_index.h"
-    if anim_bin.exists() and anim_hdr.exists():
-        hdr_text = anim_hdr.read_text(encoding="utf-8", errors="ignore")
-        m = re.search(r"kAnimEmojiBlobSize\s*=\s*(\d+)", hdr_text)
-        declared = int(m.group(1)) if m else -1
-        actual = anim_bin.stat().st_size
-        check(
-            "C8 动图帧数据与索引头同步",
-            declared == actual,
-            f"索引头声明 kAnimEmojiBlobSize={declared}，实际 bin={actual} 字节。"
-            f"改过 tools/anim_emoji_pack.py 的参数就重跑一遍生成"
-            if declared != actual else f"bin {actual} 字节与索引头一致",
-            fatal=True,
-        )
-        # 帧偏移必须首尾相接且落在 bin 内，否则中间有空洞/重叠
-        ok_layout = True
-        detail = ""
-        entries = re.findall(
-            r'\{"([^"]+)",\s*(\d+)u,\s*(\d+)u,\s*(\d+)u,\s*(\d+)u,\s*(\d+)u\}', hdr_text)
-        expect_off = 0
-        total_frames = 0
-        for name, off, nfr, fbytes, _ms_off, _side in entries:
-            off, nfr, fbytes = int(off), int(nfr), int(fbytes)
-            total_frames += nfr
-            if off != expect_off:
-                ok_layout = False
-                detail = f"{name} 的 offset={off}，按前一条推算应为 {expect_off}"
-                break
-            if off + nfr * fbytes > actual:
-                ok_layout = False
-                detail = (f"{name} 末尾 {off + nfr * fbytes} 超出 bin 长度 {actual}")
-                break
-            expect_off = off + nfr * fbytes
-        if ok_layout and entries and expect_off != actual:
-            ok_layout = False
-            detail = f"所有动画合计 {expect_off} 字节，与 bin {actual} 字节不等（尾部有残留）"
-        check(
-            "C8b 动图索引的偏移首尾相接且不越界",
-            ok_layout and len(entries) > 0,
-            detail or f"{len(entries)} 个动画的偏移连续，合计 {expect_off} 字节",
-            fatal=True,
-        )
-        # 每帧一个时长，少一条运行时就会退化到 40ms 兜底 ⇒ 整段动画快慢错乱。
-        # 这条在只有一张动画时最容易漏：改帧数只重跑一半、时长表还是旧的。
-        m = re.search(r"kAnimEmojiFrameMsCount\s*=\s*sizeof\(kAnimEmojiFrameMs\)"
-                      r"\s*/\s*sizeof\(kAnimEmojiFrameMs\[0\]\)", hdr_text)
-        ms_vals = re.findall(r"(\d+)u,", hdr_text.split("kAnimEmojiFrameMs[]")[-1]
-                             .split("};")[0]) if "kAnimEmojiFrameMs[]" in hdr_text else []
-        check(
-            "C8c 动图时长表条数等于总帧数",
-            m is not None and len(ms_vals) == total_frames and total_frames > 0,
-            f"时长表 {len(ms_vals)} 条，帧数合计 {total_frames} —— 不等就说明索引头"
-            f"是半新半旧，重跑 tools/anim_emoji_pack.py 生成",
-            fatal=True,
-        )
+    # ---------------------------------------------- 待机熊猫必须保持已删除
+    # 2026-11-03 用户要求：「待机熊猫和跑马灯放在同一个 commit 里删，跑马灯顶上
+    # 这个位置。」熊猫 = 编译进 app .rodata 的 Noto 帧序列（anim_frames.bin
+    # 269,568 字节 + anim_emoji_player.cc + anim_emoji_index.h），待机指示改由
+    # lcd_display.cc 的待机跑马灯承担（复用 assets 里的 cbin 表情）。
+    #
+    # 本项原来是**正向**判据（C8/C8b/C8c：bin 大小与索引头一致、偏移首尾相接、
+    # 时长表条数等于帧数）。文件删掉之后那些判据无判据可查，会静默消失 ——
+    # 而「静默消失的门禁」等于没有门禁，还会把总条数悄悄改小。所以整块翻成
+    # **反向**判据：断言熊猫不许被加回来。三条分别守三个独立的回头路：
+    #   C8  文件位：数据/索引头文件本身不许重新入库（占 app 分区）
+    #   C8b 代码位：不许有代码引用 AnimEmojiPlayer / anim_frames / PlayDefault
+    #   C8c 构建位：CMakeLists 不许再 target_add_binary_data 那个 bin、不许再编
+    #       anim_emoji_player.cc（否则源码回来了也照样编进固件）
+    #
+    # ⚠️ 判据必须**先剥注释**再匹配。理由本仓踩过：防回归的注释里天生就要写
+    #    「已删除 anim_emoji_player」，整文件子串匹配会让注释自己踩红。
+    # ⚠️ 只扫 firmware/ 下的源码：tools/prebuild_check.py 自己就带着这些字面量
+    #    （就是下面这几个字符串），扫进去必然假红。
+    _panda_dir = ROOT / "firmware" / "xiaozhi" / "main" / "display" / "lvgl_display"
+    _panda_files = [
+        _panda_dir / "anim" / "anim_frames.bin",
+        _panda_dir / "anim" / "anim_emoji_index.h",
+        _panda_dir / "anim_emoji_player.h",
+        _panda_dir / "anim_emoji_player.cc",
+    ]
+    _panda_present = [p.relative_to(ROOT).as_posix() for p in _panda_files if p.exists()]
+    check(
+        "C8 待机熊猫帧数据/播放器文件已删除（不许加回来）",
+        not _panda_present,
+        ("仍存在：" + "、".join(_panda_present) +
+         " ⇒ 待机指示已改由 lcd_display.cc 的待机跑马灯承担，这些文件只剩"
+         "「占 app 分区」和「两套待机图案打架」两个后果。处置：git rm 掉，"
+         "不要只从编译里移出") if _panda_present
+        else "anim_frames.bin / anim_emoji_index.h / anim_emoji_player.{h,cc} 均不存在"
+             "（app 分区省下 269,568 字节）",
+        fatal=True,
+    )
+
+    # 代码位：剥注释后扫 firmware/ 下的 C/C++ 源码
+    _panda_tokens = ("AnimEmojiPlayer", "anim_frames", "anim_emoji_index",
+                     "PlayDefault")
+    _panda_hits: list[str] = []
+    _fw_root = ROOT / "firmware"
+    if _fw_root.is_dir():
+        for _p in _fw_root.rglob("*"):
+            if not _p.is_file() or _p.suffix not in (".c", ".cc", ".cpp", ".h", ".hpp"):
+                continue
+            # 构建产物里会有 IDF 生成的 *.bin.S / 拷贝，不是源码，跳过
+            if "build" in _p.parts or "managed_components" in _p.parts:
+                continue
+            _code = _strip_comments(_p.read_text(encoding="utf-8", errors="replace"))
+            for _tok in _panda_tokens:
+                if _tok in _code:
+                    _panda_hits.append(f"{_p.relative_to(ROOT).as_posix()} → {_tok}")
+                    break
+    check(
+        "C8b 代码里不再引用熊猫动画（AnimEmojiPlayer/anim_frames/PlayDefault）",
+        not _panda_hits,
+        ("仍有代码引用：" + "；".join(_panda_hits[:6]) +
+         "。符号 _binary_anim_frames_bin_start 已随 target_add_binary_data 一起"
+         "消失，这些引用会链接期报 undefined reference；若只是残留调用，"
+         "运行期则是「待机图案被两套逻辑抢」。处置：删掉引用，改用 "
+         "LcdDisplay::StartIdleMarquee()") if _panda_hits
+        else "firmware/ 下（剥注释后）无任何 AnimEmojiPlayer / anim_frames / "
+             "anim_emoji_index / PlayDefault 引用",
+        fatal=True,
+    )
+
+    # 构建位：CMakeLists 不许再把 bin 嵌进来、也不许再编播放器
+    _panda_cmake = ROOT / "firmware" / "xiaozhi" / "main" / "CMakeLists.txt"
+    _panda_cmake_bad: list[str] = []
+    if _panda_cmake.is_file():
+        # CMake 的注释是 `#`（不是 C 的 // 和 /* */），所以这里单独按行剥：
+        # 上面那段「曾经有一条 target_add_binary_data(... anim_frames.bin)」
+        # 的历史注释不能自己踩红。与 C7 读 idf_component.yml 的做法一致。
+        _cmake_code = "\n".join(
+            line.split("#", 1)[0]
+            for line in _panda_cmake.read_text(encoding="utf-8",
+                                               errors="replace").splitlines())
+        if "target_add_binary_data" in _cmake_code and "anim_frames" in _cmake_code:
+            _panda_cmake_bad.append(
+                "仍 target_add_binary_data(... anim_frames.bin ...) —— 会把 "
+                "269,568 字节重新压进 app 分区")
+        if "anim_emoji_player.cc" in _cmake_code:
+            _panda_cmake_bad.append("仍把 anim_emoji_player.cc 列入 SOURCES")
+    else:
+        _panda_cmake_bad.append("main/CMakeLists.txt 不存在")
+    check(
+        "C8c 构建脚本不再嵌入/编译熊猫动画",
+        not _panda_cmake_bad,
+        ("⚠️ " + "；".join(_panda_cmake_bad) +
+         "。处置：删掉那条 target_add_binary_data 与 SOURCES 里的 "
+         "anim_emoji_player.cc") if _panda_cmake_bad
+        else "CMakeLists 已无 anim_frames 嵌入、也无 anim_emoji_player.cc 源文件",
+        fatal=True,
+    )
 
     # --------------------------------- C10 elder 段是否被"手改生成文件"骗过
     # 2026-10-23 真事故（DS1302 接入时暴露，代价是一次假绿 CI）：
@@ -878,45 +953,6 @@ def main() -> int:
     _c15_rmd = ROOT / "firmware" / "components" / "elder" / "src" / "reminder.c"
     _c15_sync = ROOT / "firmware" / "components" / "elder" / "src" / "sync.c"
 
-    def _strip_comments(s: str) -> str:
-        """把注释换成等长空白（保留换行与偏移）。
-
-        为什么必须先剥注释：本项的断言是"某处不许出现 time(NULL)"，而
-        **解释为什么不许出现的那段注释里就写着 time(NULL)** —— 不剥注释
-        等于让防回归注释自己踩红（这是本仓库反复踩过的坑）。
-        字符串字面量要整体跳过，否则 `"//"` 会被当成行注释起点。
-        """
-        out: list[str] = []
-        i, n = 0, len(s)
-        while i < n:
-            c = s[i]
-            if c == "/" and i + 1 < n and s[i + 1] == "*":
-                j = s.find("*/", i + 2)
-                j = n if j < 0 else j + 2
-                out.append(re.sub(r"[^\n]", " ", s[i:j]))
-                i = j
-            elif c == "/" and i + 1 < n and s[i + 1] == "/":
-                j = s.find("\n", i)
-                j = n if j < 0 else j
-                out.append(" " * (j - i))
-                i = j
-            elif c in "\"'":
-                q, j = c, i + 1
-                while j < n:
-                    if s[j] == "\\":
-                        j += 2
-                        continue
-                    if s[j] == q:
-                        j += 1
-                        break
-                    j += 1
-                out.append(s[i:j])
-                i = j
-            else:
-                out.append(c)
-                i += 1
-        return "".join(out)
-
     def _func_body(code: str, name: str) -> str | None:
         """按花括号配平切出函数体（含外层大括号）。取不到返回 None。
 
@@ -1014,7 +1050,7 @@ def main() -> int:
               fatal=True)
 
     # ------------------------------------------------ C16 屏保必须只在待机态
-    # 2026-11-01 真机：老人沉默停在聆听态，屏幕换成了待机动态熊猫，字幕还是
+    # 2026-11-01 真机：老人沉默停在聆听态，屏幕换成了待机动态图案，字幕还是
     # 「聆听中」、灯还是蓝色 —— 三处互相打架。根因是 AntiBurnInStep() 只看
     # 「界面静止了多久」，不看设备在干什么，把**待机指示灯**播到了工作态上。
     #
@@ -1044,15 +1080,17 @@ def main() -> int:
             _c16_bad.append("取不到 LcdDisplay::AntiBurnInStep() 的函数体")
         else:
             _m_guard = re.search(r"if\s*\(\s*!\s*device_idle_\s*\)", _c16_body)
-            _m_play = re.search(r"\bPlayDefault\s*\(", _c16_body)
+            # 锚点从 PlayDefault() 换成 StartIdleMarquee()：2026-11-03 待机熊猫
+            # 删除、改由待机跑马灯承担待机指示，播图入口跟着改名。
+            _m_play = re.search(r"\bStartIdleMarquee\s*\(", _c16_body)
             if _m_guard is None:
                 _c16_bad.append(
                     "AntiBurnInStep() 里没有 `if (!device_idle_) return;` 判据"
-                    "—— 非待机态也会把待机熊猫播上去")
+                    "—— 非待机态也会把待机指示灯（跑马灯）播上去")
             elif _m_play is not None and _m_guard.start() > _m_play.start():
                 _c16_bad.append(
-                    "device_idle_ 判据写在 PlayDefault() 之后 —— 图已经换掉了，"
-                    "判据形同虚设")
+                    "device_idle_ 判据写在 StartIdleMarquee() 之后 —— 图已经"
+                    "换掉了，判据形同虚设")
             # 静态兜底轮播（SetEmotion 换随机表情）同样会让人以为状态变了，
             # 所以判据必须在函数**最前面**：以 lv_tick_elaps 判据为锚，
             # 要求 device_idle_ 出现在它之前。
@@ -1064,7 +1102,7 @@ def main() -> int:
                     "device_idle_ 判据写在 60 秒静止判据之后 —— 要求放在函数"
                     "最前面，才能同时挡住静态兜底轮播")
 
-        # 反向失效：判据永远为 false 时熊猫再也播不出来（老人失去"要不要
+        # 反向失效：判据永远为 false 时待机指示灯再也起不来（老人失去"要不要
         # 喊唤醒词"的唯一依据）。所以要确认注册回调里真的给它赋了值。
         _c16_start = _func_body(_c16_code, "LcdDisplay::StartAntiBurnInTimer")
         if _c16_start is None:
@@ -1073,16 +1111,16 @@ def main() -> int:
             if "RegisterStateChangeCallback" not in _c16_start:
                 _c16_bad.append(
                     "StartAntiBurnInTimer() 没注册状态回调 —— device_idle_ "
-                    "永远是初始 false，待机熊猫再也不会出现")
+                    "永远是初始 false，待机跑马灯再也不会出现")
             elif not re.search(r"device_idle_\s*=\s*\(\s*cur\s*==", _c16_start):
                 _c16_bad.append(
                     "状态回调里没有 `device_idle_ = (cur == kDeviceStateIdle)` "
                     "—— 标志位没人写，判据恒 false")
 
-        check("C16 防烧屏屏保只在待机态跑（非待机态不许播待机熊猫）",
+        check("C16 防烧屏屏保只在待机态跑（非待机态不许播待机跑马灯）",
               not _c16_bad,
               ("⚠️ " + "；".join(_c16_bad[:5]) +
-               "。待机熊猫是「硬件是否在监听声音」的唯一指示灯，播到聆听/"
+               "。待机跑马灯是「硬件是否在监听声音」的唯一指示灯，播到聆听/"
                "播报态上等于告诉老人可以喊唤醒词 —— 实际喊了会打断当前这轮，"
                "越急越乱。") if _c16_bad else
               "AntiBurnInStep() 首行判 device_idle_，非待机态直接返回；"

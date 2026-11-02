@@ -12,10 +12,12 @@ set(SOURCES "audio/audio_codec.cc"
             # （SpiLcdDisplay），CONFIG_USE_EMOTE_MESSAGE_STYLE 恒为 n，
             # 而它没有整体条件编译保护（654 行都会生成目标码）。
             # 真要恢复必须先改显示层依赖，不能只把这行加回来。
+            #
+            # 表情只走 assets 分区里的 cbin（RGB565A8，设备端零解码）。
+            # 曾经还有一份「Noto 熊猫帧序列」编译进 .rodata（anim_emoji_player.cc
+            # + anim_frames.bin，269,568 字节），2026-11-03 随待机跑马灯上线一并删除：
+            # 待机指示改由 lcd_display.cc 的跑马灯承担，复用同一批 cbin 表情。
             "display/lvgl_display/emoji_collection.cc"
-            # 表情动图（Noto Animated Emoji → RGB565A8 帧序列）。
-            # 帧数据是 anim/anim_frames.bin，下面用 target_add_binary_data 嵌入。
-            "display/lvgl_display/anim_emoji_player.cc"
             "display/lvgl_display/lvgl_theme.cc"
             "display/lvgl_display/lvgl_font.cc"
             "display/lvgl_display/lvgl_image.cc"
@@ -738,17 +740,12 @@ idf_component_register(SRCS ${SOURCES}
                     WHOLE_ARCHIVE
                     )
 
-# 表情动图的帧数据（Noto Animated Emoji，64x64 RGB565A8，熊猫 59 帧 / 2.4 秒）
-# 生成方式：C:/Python314/python.exe tools/anim_emoji_pack.py \
-#             --out firmware/xiaozhi/main/display/lvgl_display/anim
-# ⚠️ 走 .bin + 嵌入而不是生成 .c 源码：同一份数据写成 "0x12," 文本会膨胀约 6 倍，
-#    仓库里躺 3MB 源码、每次编译都要重新解析。.bin 只有 708KB。
-# ⚠️ 只有**一张**动画（空闲屏保）。曾经做过 6 个轮流放，但轮播只在空闲时触发，
-#    实际看不到几个，预算集中到一张才够把帧数做满、动作才平滑。
-# 符号名由 IDF 按**文件名**生成（见 tools/cmake/utilities.cmake 里
-# get_filename_component(... NAME)）：_binary_anim_frames_bin_start / _end。
-target_add_binary_data(${COMPONENT_LIB}
-                    "display/lvgl_display/anim/anim_frames.bin" BINARY)
+# 表情资源全部走 assets 分区（assets.cc 按名字查 cbin），不再往 app 里嵌帧数据。
+# 这里曾经有一条 target_add_binary_data(... "anim/anim_frames.bin" BINARY)，
+# 把 269,568 字节的熊猫帧序列塞进 app .rodata。2026-11-03 待机跑马灯顶替熊猫后
+# 整块删除 —— 腾出来的 269,568 字节是 app 分区实打实的余量。
+# 符号名（_binary_anim_frames_bin_start/_end）随之一并消失，谁再引用谁就链接期报错，
+# 不会静默退回旧动画。prebuild_check.py 的 C8/C8b/C8c 反向守住「不许加回来」。
 
 # Use target_compile_definitions to define BOARD_TYPE, BOARD_NAME
 # If BOARD_NAME is empty, use BOARD_TYPE
