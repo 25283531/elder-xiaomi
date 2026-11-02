@@ -9,6 +9,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    ValidationError,
     field_serializer,
     field_validator,
     model_validator,
@@ -966,6 +967,83 @@ class PresetAuditOut(ORMBase):
     created_at: datetime
 
 
+# ============================================================ 多味药（共用）
+class MedicineItem(BaseModel):
+    """一条提醒里的一味药。
+
+    为什么单独一个类而不是裸 ``dict``：``ReminderIn`` 会被 ``model_dump()``
+    整包展开成 ``models.Reminder(**data)``，裸 dict 完全没有长度约束 ——
+    前端一个超长串就能把 128 字宽的展示位撑爆，而且 4 味药的上限也无处可写。
+    """
+
+    name: str = Field(max_length=32)
+    dose: str = Field(default="", max_length=64)
+
+
+#: 一条提醒最多挂几味药。写在这里而不是只写在前端：前端可以绕过（直接打 API），
+#: 而"最多 4 味"是产品约束（老人一次吃超过 4 种药，该拆成多条提醒分时段）。
+MAX_MEDICINES = 4
+
+
+def derive_medicines(
+    title: str,
+    medicines: list[MedicineItem] | list[dict[str, Any]] | None,
+    dose: str,
+) -> list[MedicineItem]:
+    """把「多味药」与「老的单一 dose」归成**一份** ``list[MedicineItem]``。
+
+    为什么抽成模块级函数（2026-11-03）
+    ---------------------------------
+    出参有**三条互不相干**的路径，而且都不经过同一个函数：
+
+      1. 提醒列表 / 设备心跳：``ReminderOut.model_validate(r)``；
+      2. 首页聚合：``routers/home._medicine_today`` 自己拼 ``MedicineTodayItemOut``；
+      3. 语音链路：``voice/tools`` 自己拼 dict。
+
+    派生规则（空 medicines + 非空 dose ⇒ ``[{title, dose}]``）是**唯一真源**。
+    写在两个地方必然漂移，而漂移不会报错 —— 只会让某一端"看不到剂量"。
+    所以 :class:`ReminderOut` 的 validator 与首页接口都调这一个函数。
+
+    入参允许是**原始 JSON 列**（``list[dict]``）：首页那边拿到的是 ORM 行，
+    ``Reminder.medicines`` 是未经 Pydantic 校验的 JSON 值，而 ``ReminderOut``
+    那边已经是 ``list[MedicineItem]``。两种都要吃下。
+
+    为什么逐项 try/except 而不是直接 ``model_validate``
+    -------------------------------------------------
+    本函数跑在**读**路径上。存量行可能有超长药名（``MedicineItem.name`` 上限
+    32）或脏结构，直接抛 ``ValidationError`` 的后果不是"少显示剂量"，而是
+    首页整块服药统计降级为 0 / 这条提醒 GET 500。丢掉那一味、退回老 ``dose``
+    派生，比整页空白好。
+
+    ⚠️ 派生的 ``name`` 必须截断到 32：``title`` 上限 128，直接塞进
+    ``MedicineItem`` 会抛校验错（同上，读路径）。
+
+    ⚠️ 语音播报侧另有一份 ``voice.tools._medicines_of()``（原样每味都念、
+    不省与标题重名的药名），两处语义不同是**刻意的**，不是漏改：
+    那边是给 LLM 念的句子，这边是给界面排版的列表。改这里时去确认那边
+    是否也要改 —— 只改一处就以为改全了，正是这类"两份归一"最典型的翻车方式。
+    """
+    items: list[MedicineItem] = []
+    for m in medicines or []:
+        if isinstance(m, MedicineItem):
+            items.append(m)
+            continue
+        try:
+            items.append(MedicineItem.model_validate(m))
+        except (ValidationError, TypeError):
+            # 存量脏行（超长药名 / 缺 name / 根本不是对象）：丢掉这一味
+            continue
+    if items:
+        return items
+    dose = (dose or "").strip()
+    if not dose:
+        return []
+    name = (title or "").strip()[:32]
+    if not name:
+        return []
+    return [MedicineItem(name=name, dose=dose[:64])]
+
+
 # ============================================================ 首页聚合
 class HomeDeviceOut(ORMBase):
     """首页设备卡片：状态 + 设备时间 + 当前生效的角色 / 形象名。
@@ -1007,6 +1085,19 @@ class MedicineTodayItemOut(ORMBase):
     reminder_id: int
     #: 规则标题（药品名 / 日程名）。规则被删后仍保留实例，标题会是空串。
     title: str = ""
+    #: 这一格要吃的**具体哪几味药、各自多少剂量**（2026-11-03 加）。
+    #:
+    #: 为什么首页必须带它：``title`` 是规则名，可能是「早饭后」「吃药」这种
+    #: 笼统写法，家属看到「08:00 早饭后 待确认」仍然不知道要吃哪几味、吃多少。
+    #: 多味药的派生口径与 :class:`ReminderOut` 完全一致（同一函数
+    #: :func:`derive_medicines`），所以老数据（只有 ``dose``）在这里也已经
+    #: 被派生过一次 —— 前端拿到的 ``medicines`` **不需要**再做兼容派生。
+    #: 规则已被删除（``reminder_id`` 查不到）时是空数组，**不是 null**。
+    medicines: list[MedicineItem] = Field(default_factory=list)
+    #: 老字段（一条提醒一味药），原样透传。
+    #: 与 ``medicines`` 并存而不是替代：老版本 APP 只读它，删了会让
+    #: 「1 片」这类信息在老客户端上整块消失。
+    dose: str = ""
     due_at: datetime
     #: 这一实例的钟点基准（IANA 名），见类注释
     tz: str = ""
@@ -1057,23 +1148,9 @@ class HomeSummaryOut(ORMBase):
 
 
 # ============================================================ 提醒
-class MedicineItem(BaseModel):
-    """一条提醒里的一味药。
-
-    为什么单独一个类而不是裸 ``dict``：``ReminderIn`` 会被 ``model_dump()``
-    整包展开成 ``models.Reminder(**data)``，裸 dict 完全没有长度约束 ——
-    前端一个超长串就能把 128 字宽的展示位撑爆，而且 4 味药的上限也无处可写。
-    """
-
-    name: str = Field(max_length=32)
-    dose: str = Field(default="", max_length=64)
-
-
-#: 一条提醒最多挂几味药。写在这里而不是只写在前端：前端可以绕过（直接打 API），
-#: 而"最多 4 味"是产品约束（老人一次吃超过 4 种药，该拆成多条提醒分时段）。
-MAX_MEDICINES = 4
-
-
+# ``MedicineItem`` / ``MAX_MEDICINES`` / ``derive_medicines`` 定义在文件上方的
+# 「多味药（共用）」段：首页的 ``MedicineTodayItemOut`` 也要用它们，而 Pydantic
+# 需要类型在类定义时就已存在（前向引用要 model_rebuild，脆弱且没必要）。
 class ReminderIn(ORMBase):
     title: str = Field(max_length=128)
     speak_text: str = ""
@@ -1224,16 +1301,13 @@ class ReminderOut(ReminderIn):
         （``model_validate``）—— 后果不是"少显示剂量"，是这条提醒
         ``GET`` 500、设备心跳整包 500（一台设备一条坏行 = 全部提醒同步不到）。
         截断只影响这份**派生视图**，``title`` 本身仍完整返回，信息不丢。
+
+        ⚠️ 规则本身**不在这里**（2026-11-03 抽成 :func:`derive_medicines`）：
+        首页接口 ``routers/home._medicine_today`` 拼的是另一个出参类
+        ``MedicineTodayItemOut``，它同样需要这份派生。两处各写一遍必然漂移，
+        而漂移不报错 —— 只表现为"APP 首页看不到剂量"。
         """
-        if self.medicines:
-            return self
-        dose = (self.dose or "").strip()
-        if not dose:
-            return self
-        name = (self.title or "").strip()[:32]
-        if not name:
-            return self
-        self.medicines = [MedicineItem(name=name, dose=dose[:64])]
+        self.medicines = derive_medicines(self.title, self.medicines, self.dose)
         return self
 
 

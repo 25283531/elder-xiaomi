@@ -872,6 +872,13 @@ def _medicines_of(r: models.Reminder) -> list[dict[str, str]]:
     ⚠️ 口径必须与 ``schemas.ReminderOut._derive_medicines`` **逐字一致**
     （同样是"medicines 为空且 dose 非空 ⇒ [{title, dose}]"、同样截断 32/64），
     否则老人从语音里听到的药和网页上看到的药会不一样。
+
+    ⚠️ 服务端另有一份归一 ``schemas.derive_medicines()``（``ReminderOut`` 与
+    首页接口共用），两处语义不同是**刻意的**，不是漏改：
+      · 这边：**原样每味都念**，不做任何省略 —— 老人要靠耳朵听全；
+      · 那边：给界面排版用，只剩一味且药名 === title 时省掉重复药名。
+    改这里时去确认那边是否也要改 —— 只改一处就以为改全了，正是这类
+    "两份归一"最典型的翻车方式。
     """
     items = [{"name": str(m.get("name") or "")[:32],
               "dose": str(m.get("dose") or "")[:64]}
