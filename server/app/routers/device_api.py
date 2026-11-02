@@ -583,6 +583,11 @@ def report_event(payload: EventReportIn, db: Session = Depends(get_db),
     # （先语音、后按键），两次都记的话家属会看到两条「确认提醒」，
     # 而实际只吃了一次药。
     prev_state = ev.state
+    # ⚠️ 这里**故意**不做「CONFIRMED 但药名不全 → 降级 FIRED」的拦截。
+    # 老固件回执的 CONFIRMED 不带药名，拦下来会让整条确认永远落不了地 ——
+    # 依从率恒 0、漏服告警不停，代价比这个洞更大。逐味完整性由上游保证：
+    # ``voice.session._fallback_confirm_verdict`` 已经把服务端兜底确认收紧到
+    # 「恰好 1 条候选 + 该条只有 1 味药」，多候选/多味药时不再下发空参数确认。
     ev.state = payload.state
     # 语音确认 = 半置信，按键确认 = 全置信（2026-10-27 用户定义）。
     # 同一条提醒实例设备会报两次：先 method=VOICE（老人说「我吃过了」），
