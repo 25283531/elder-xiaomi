@@ -501,6 +501,36 @@ def _pending_reminder_label(device_pk: int) -> str:
         return ""
 
 
+def _fallback_confirm_verdict(device_pk: int) -> tuple[bool, str]:
+    """服务端兜底确认（模型漏调 confirm_reminder）能否下发；返回 (可否, 跳过原因)。
+
+    判据必须与 ``tools._confirm_reminder`` 的候选集**完全一致**：直接复用
+    ``pending_medicine_events`` / ``medicine_names``，不另写一份 SQL。两套判据
+    迟早漂移，漂移的症状是「兜底确认了一条工具根本不会确认的提醒」。
+
+    为什么收紧到「恰好 1 条候选 + 该条只有 1 味药」（2026-11-03）：兜底下发的是
+    **空参数**设备确认 —— 设备挑的是"当前正在响铃的那条"，服务端无从核对。
+    多条候选时它可能确认错的那条；单条但挂多味药时，设备回执的 CONFIRMED 不带
+    药名，``routers/device_api.report_event`` 会整条置 CONFIRMED ⇒ 只吃了 1 味被
+    记成 4 味全吃，依从率虚高、漏服告警失效。宁可让提醒挂着，等下一轮按
+    ``_PENDING_REMINDER_HINT`` 的追问纪律问清，也不能替老人瞎确认。
+    """
+    try:
+        with SessionLocal() as db:
+            rows = pending_medicine_events(db, device_pk)
+            if not rows:
+                return False, "没有待确认的服药提醒"
+            if len(rows) > 1:
+                return False, (f"有 {len(rows)} 条候选待确认，"
+                               "设备无法确定老人说的是哪条")
+            names = medicine_names(rows[0][1])
+            if len(names) > 1:
+                return False, (f"唯一候选挂着 {len(names)} 味药"
+                               f"（{'、'.join(names)}），必须问清是哪一味")
+            return True, ""
+    except Exception as exc:  # noqa: BLE001  查库失败就不兜底，绝不瞎确认
+        return False, f"查询待确认提醒失败 {type(exc).__name__}: {exc}"
+
 
 #: 命中弱判据时追加到 system 的复核提示。**只在命中那一轮注入** ——
 #: 每轮都塞的话，模型会变得爱管闲事，正常聊天也想让设备待机。
@@ -2001,6 +2031,34 @@ class VoiceSession:
                  n, len(window))
         return window
 
+    async def _maybe_confirm_fallback(self, tool_trace: list[dict[str, Any]]) -> None:
+        """模型漏调 ``confirm_reminder`` 时，服务端补一刀设备确认。
+
+        抽成方法是为了能单独跑自测（build-out 里的临时脚本）：这段是"替老人
+        写服药记录"的最后一环，只靠读代码保证正确是不够的。
+
+        只在「恰好 1 条候选 + 该条只有 1 味药」时补，判据见
+        ``_fallback_confirm_verdict``；不满足就只打一条 log，交给模型按
+        ``_PENDING_REMINDER_HINT`` 的追问纪律继续问。
+        """
+        if not (self._pending_reminder and self._confirm_candidate):
+            return
+        if any(t.get("name") == "confirm_reminder" for t in tool_trace):
+            return
+        allowed, why = _fallback_confirm_verdict(self.dev.id)
+        if not allowed:
+            log.info("[%s] 兜底确认跳过：%s（交给模型按追问纪律继续问）",
+                     self.session_id, why)
+            return
+        try:
+            ok = await self.call_device_tool(
+                "self.elder.confirm_reminder", timeout=3.0)
+            log.info("[%s] 模型未调用 confirm_reminder，服务端兜底补调：%s",
+                     self.session_id, ok)
+        except Exception:  # noqa: BLE001  设备没响应不该影响对话
+            log.warning("[%s] 兜底确认失败（设备无响应）", self.session_id,
+                        exc_info=True)
+
     async def _run_turn(self, pcm: list[bytes], started: float) -> str:
         # 每轮重置"待机复核"状态（见 __init__ 里这两个字段的说明）。
         self._dismiss_candidate = ""
@@ -2463,17 +2521,9 @@ class VoiceSession:
         #   * 模型自己调过就不重复（看 tool_trace）；
         #   * 放在 speaker.finish() 之后 —— 先让老人听到"好的"，
         #     再让屏幕收起来，顺序反了会出现"屏先空、话后到"。
-        if (self._pending_reminder and self._confirm_candidate
-                and not any(t.get("name") == "confirm_reminder"
-                            for t in tool_trace)):
-            try:
-                ok = await self.call_device_tool(
-                    "self.elder.confirm_reminder", timeout=3.0)
-                log.info("[%s] 模型未调用 confirm_reminder，服务端兜底补调：%s",
-                         self.session_id, ok)
-            except Exception:  # noqa: BLE001  设备没响应不该影响对话
-                log.warning("[%s] 兜底确认失败（设备无响应）", self.session_id,
-                            exc_info=True)
+        # 2026-11-03 收紧触发条件：只有「恰好 1 条候选 + 该条只有 1 味药」才补，
+        # 见 ``_fallback_confirm_verdict`` 的 docstring（多药时整条确认会虚高依从率）。
+        await self._maybe_confirm_fallback(tool_trace)
 
         # ---- 模型判定待机：**念完告别语之后**再切固件 ----
         # 顺序不能反（理由见 _enter_standby 的 docstring）：先切 idle 的话，
