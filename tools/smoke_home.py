@@ -311,6 +311,27 @@ def main() -> int:
               str(med1.get("confirmed_count")))
         check("未心跳时 online 为 false", s1["devices"][0].get("online") is False, "")
 
+        # ==================================================== 3.2b 明细带药品与剂量
+        # 2026-11-03 用户报「APP 首页卡片要显示 medicines」：卡片以前只有 title
+        # （规则名），而 title 常常是「早饭后」「吃药」这种笼统写法，家属看到
+        # 「08:00 早饭后 待确认」仍然不知道该吃哪几味、吃多少。
+        #
+        # 这里同时钉住两件事：
+        #   ① 每条明细都**必须有** medicines 键且是数组 —— 返回 null 会让
+        #      APP / 网页的 v-for 直接抛错（白屏），而不是"少显示一行"；
+        #   ② 老数据（只有 dose、medicines 为空）由服务端派生成
+        #      [{name: title, dose: dose}]，口径与 ReminderOut 同一函数。
+        items1 = med1.get("items") or []
+        check("★ 明细每条都带 medicines 且是数组（不是 null）",
+              bool(items1) and all(isinstance(it.get("medicines"), list) for it in items1),
+              str([type(it.get("medicines")).__name__ for it in items1]))
+        old_item = next((it for it in items1 if it.get("reminder_id") == rem_pk), None)
+        check("★ 老数据（只有 dose）派生出 [{name:title, dose:dose}]",
+              old_item is not None
+              and old_item.get("medicines") == [{"name": "降压药", "dose": "1 片"}]
+              and old_item.get("dose") == "1 片",
+              str(old_item and old_item.get("medicines")))
+
         # ==================================================== 3.3 确认一次
         # 走设备回执接口上报 08:00 已确认（实例表没预排时该接口会自动补建），
         # 这样无论脚本在当天的哪个时刻运行都能稳定地多出一条确认记录。
@@ -365,6 +386,40 @@ def main() -> int:
         check("重复确认不产生重复实例",
               s2d.get("medicine_today", {}).get("total_count") == 3,
               str(s2d.get("medicine_today")))
+
+        # ==================================================== 3.3c 多味药逐条下发
+        # 一条提醒挂 2 味药 + 各自剂量：首页明细必须**逐味**给出，而不是只给
+        # 规则标题。这条是用户诉求「首页卡片要显示 medicines」的直接验收点。
+        code, rem3 = req("POST", f"/api/reminders?device_pk={dev_pk}", {
+            "title": "晚饭后",
+            "rtype": 0,
+            "schedule_kind": 1,
+            "times_of_day": ["19:00"],
+            "medicines": [
+                {"name": "二甲双胍", "dose": "0.5g"},
+                {"name": "阿司匹林", "dose": "100mg"},
+            ],
+            "require_confirm": True,
+            "enabled": True,
+        }, u1)
+        rem3_pk = rem3.get("id", 0)
+        check("创建一条挂 2 味药的服药提醒",
+              code == 201 and len(rem3.get("medicines") or []) == 2, str(code))
+        code, s6 = req("GET", "/api/home/summary", token=u1)
+        items6 = s6.get("medicine_today", {}).get("items") or []
+        multi = next((it for it in items6 if it.get("reminder_id") == rem3_pk), None)
+        check("★ 首页明细逐味返回药名与剂量（不再只有规则标题）",
+              multi is not None and multi.get("medicines") == [
+                  {"name": "二甲双胍", "dose": "0.5g"},
+                  {"name": "阿司匹林", "dose": "100mg"},
+              ],
+              str(multi and multi.get("medicines")))
+        check("★ 多味药明细的 title 仍是规则名（两套信息并存，不是二选一）",
+              multi is not None and multi.get("title") == "晚饭后",
+              str(multi and multi.get("title")))
+        check("★ 多味药明细的老 dose 为空串（没有旧字段可透传）",
+              multi is not None and multi.get("dose") == "",
+              str(multi and multi.get("dose")))
 
         # ==================================================== 3.4 心跳后在线
         code, sync = req("POST", "/api/device/sync?fw_version=0.1.0", {}, dev_token)
@@ -598,6 +653,25 @@ def main() -> int:
         from app.db import SessionLocal, engine               # noqa: E402
         from app.device_state import ONLINE_WINDOW            # noqa: E402
         from app.models import Device, utcnow                 # noqa: E402
+
+        # ---- 「规则已删（reminder_id 查不到）」分支：函数级验证 ----
+        # ⚠️ 为什么放在这里、为什么只能函数级：HTTP 路径**到不了**这条分支 ——
+        # _medicine_today 的两条 SQL 都带 `Reminder.deleted_at IS NULL`
+        # （第二条连 join 都按它过滤），已删规则的实例压根不会进结果集。
+        # 它是给「历史实例指向已消失规则」留的兜底，契约是 **[] 不是 null**
+        # —— 前端 v-for 拿到 null 会直接抛错白屏。
+        # ⚠️ 这两个 import 必须写在 `os.environ["ELDER_DB"]` 之后：app.schemas
+        # 会经 app.schedule → app.models → app.db 把 engine 建出来，提前 import
+        # 就会把 engine 绑到默认库上，下面第 5 段的进程内改库全部打偏。
+        from app.schemas import MedicineTodayItemOut, derive_medicines  # noqa: E402
+
+        check("★ derive_medicines 对「规则已删」返回 []（不是 None）",
+              derive_medicines("", None, "") == [], "")
+        _orphan = MedicineTodayItemOut(reminder_id=987654, due_at=datetime.now(), state=0)
+        _orphan_json = _orphan.model_dump(mode="json")
+        check("★ 缺规则的明细序列化出 medicines=[]（不是 null）",
+              "medicines" in _orphan_json and _orphan_json["medicines"] == [],
+              str(_orphan_json.get("medicines")))
 
         with SessionLocal() as s:
             row = s.scalar(sa_select(Device).where(Device.id == dev_pk))

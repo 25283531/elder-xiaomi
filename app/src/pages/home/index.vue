@@ -114,6 +114,35 @@ function methodClass(m: number) {
 }
 
 /**
+ * 一条明细的「用药」行文字（与 pages/schedule/index.vue 的 medText 同款规则）。
+ *
+ * 三种情况：
+ *   · 有 medicines → 逐味拼：「降压药 1片 · 二甲双胍 0.5g」
+ *   · medicines 空/不存在（服务端老版本 / 老数据没派生）→ 回退老的 dose
+ *   · 两者都空 → 返回空串，模板 v-if 整行不渲染（不留空白占位）
+ *
+ * 另有一种**去重**：只有一味药、且药名就是 `title`（老数据派生的典型形态 ——
+ * 服务端把 `title` + `dose` 派生成 `[{name: title, dose}]`）时只显示剂量，
+ * 否则卡片上会出现「降压药 / 降压药 1 片」两行重复的药名。
+ *
+ * 为什么端侧还要回退：`title` 只是规则名（「早饭后」「吃药」这种写法很常见），
+ * 光有它家属仍然不知道该吃哪几味、吃多少 —— 这正是本次要补的信息。
+ * 服务端已经用 `schemas.derive_medicines` 做过一次派生，这里只是兜底
+ * 老版本服务端（返回体里没有 medicines 字段）的情况。
+ */
+function medText(it: MedicineTodayItem) {
+  const list = (it.medicines || []).filter(m => (m?.name || '').trim())
+  if (list.length) {
+    if (list.length === 1 && list[0].name.trim() === (it.title || '').trim())
+      return (list[0].dose || '').trim()
+    return list
+      .map(m => ((m.dose || '').trim() ? `${m.name.trim()} ${m.dose.trim()}` : m.name.trim()))
+      .join(' · ')
+  }
+  return (it.dose || '').trim()
+}
+
+/**
  * 只保留 HH:MM。
  *
  * 不能用 fmtTime：那会输出「2026-10-31 08:00」，同一张表里已经按天分组，
@@ -345,6 +374,10 @@ onShow(() => { refresh() })
             <view class="med-title">
               {{ it.title || '—' }}
             </view>
+            <!-- 具体哪几味药、各自多少剂量。medText 返回空串时整行不渲染。 -->
+            <view v-if="medText(it)" class="med-dose">
+              {{ medText(it) }}
+            </view>
             <view v-if="showDeviceCol" class="med-meta">
               {{ it.device_name || ('设备 ' + it.device_id) }}
             </view>
@@ -374,6 +407,9 @@ onShow(() => { refresh() })
             </view>
             <view class="med-title">
               {{ it.title || '—' }}
+            </view>
+            <view v-if="medText(it)" class="med-dose">
+              {{ medText(it) }}
             </view>
             <view v-if="showDeviceCol" class="med-meta">
               {{ it.device_name || ('设备 ' + it.device_id) }}
@@ -437,6 +473,19 @@ onShow(() => { refresh() })
 .med-head { display: flex; flex-direction: row; align-items: center; }
 .med-time { font-size: 30rpx; font-weight: 700; color: #1f2937; margin-right: 12rpx; }
 .med-title { font-size: 28rpx; color: #374151; margin-top: 8rpx; }
+/* 用药明细（「降压药 1片 · 二甲双胍 0.5g」）。
+   320~430px 的窄屏上 4 味药拼起来会很长：必须允许换行，且长串（英文药名 /
+   「0.5g×2」这类连写）要在任意位置断开，否则会把卡片撑宽、右侧内容被裁掉。
+   uni-app 三端（H5 / app-plus / 小程序）都认 word-break: break-all。 */
+.med-dose {
+  font-size: 26rpx;
+  color: #4b5563;
+  margin-top: 4rpx;
+  line-height: 1.5;
+  white-space: normal;
+  word-break: break-all;
+  overflow-wrap: break-word;
+}
 .med-meta { font-size: 24rpx; color: #8a8f99; margin-top: 6rpx; }
 
 /* 空态 */

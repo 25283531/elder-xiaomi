@@ -1122,7 +1122,12 @@
             <tr v-for="it in pendingItems" :key="'p' + it.reminder_id + '@' + it.due_at">
               <td style="white-space:nowrap">{{fmtHM(it.due_at)}}</td>
               <td v-if="showDeviceCol">{{it.device_name || ('设备 ' + it.device_id)}}</td>
-              <td>{{it.title || '—'}}</td>
+              <td>{{it.title || '—'}}
+                <!-- 具体哪几味药、各自多少剂量（medText 空则整行不渲染）。
+                     title 常常只是规则名（「早饭后」），只有它家属仍然不知道
+                     该吃哪几味、吃多少 —— 与 APP 首页保持同一套显示规则。 -->
+                <div class="muted" style="font-size:12px" v-if="medText(it)">{{medText(it)}}</div>
+              </td>
               <td><span class="tag" :class="stateClass(it.state)">{{it.state_text || stateName(it.state)}}</span></td>
               <td>
                 <!-- state===0 是「还没到点」。给药都不该给代确认按钮：
@@ -1150,7 +1155,9 @@
             <tr v-for="it in confirmedItems" :key="'d' + it.reminder_id + '@' + it.due_at">
               <td style="white-space:nowrap">{{fmtHM(it.due_at)}}</td>
               <td v-if="showDeviceCol">{{it.device_name || ('设备 ' + it.device_id)}}</td>
-              <td>{{it.title || '—'}}</td>
+              <td>{{it.title || '—'}}
+                <div class="muted" style="font-size:12px" v-if="medText(it)">{{medText(it)}}</div>
+              </td>
               <td><span class="tag" :class="methodClass(it.confirm_method)">{{it.confirm_method_text || methodName(it.confirm_method)}}</span></td>
               <td class="muted">{{fmt(it.confirmed_at)}}</td>
             </tr>
@@ -1786,12 +1793,33 @@ createApp({
       if (!Array.isArray(this.rForm.medicines)) return;
       this.rForm.medicines.splice(i, 1);
     },
-    // 列表里的「逐味显示」：有剂量就带上，没有就只显示药名。
+    // 一条记录的「逐味显示」：有剂量就带上，没有就只显示药名。
+    //
+    // 三种情况（与 APP 的 pages/home、pages/schedule 同款规则）：
+    //   · 有 medicines → 「降压药 1片 · 二甲双胍 0.5g」
+    //   · medicines 空但有老 dose（服务端老版本 / 老数据）→ 直接显示 dose
+    //   · 两者都空 → 空串，模板 v-if 整行不渲染
+    //
+    // 另有去重：只有一味药、且药名就是 title（老数据派生的典型形态 —— 服务端
+    // 把 title + dose 派生成 [{name: title, dose}]）时只显示剂量，否则标题下面
+    // 会再重复一遍同样的药名（「降压药 / 降压药 1 片」）。
+    //
+    // 提醒列表里 medicines 一定非空（服务端 ReminderOut 已按 dose 派生过），
+    // 所以回退分支不会让列表多出内容；它服务的是首页 items —— 那里
+    // title 常常只是「早饭后」这种规则名，光有它看不出吃哪几味、吃多少。
     medText(r){
-      const list = (r && r.medicines) || [];
-      if (!list.length) return '';
-      return list.map(m => (m.dose ? (m.name || '') + ' ' + m.dose : (m.name || '')))
-                 .filter(Boolean).join(' · ');
+      const list = ((r && r.medicines) || [])
+        .filter(m => ((m && m.name) || '').trim());
+      if (list.length){
+        if (list.length === 1 && (list[0].name || '').trim() === ((r && r.title) || '').trim())
+          return (list[0].dose || '').trim();
+        return list.map(m => {
+          const name = (m.name || '').trim();
+          const dose = (m.dose || '').trim();
+          return dose ? name + ' ' + dose : name;
+        }).filter(Boolean).join(' · ');
+      }
+      return ((r && r.dose) || '').trim();
     },
     editReminder(r){
       this.rForm = r ? JSON.parse(JSON.stringify(r)) : this.blankReminder();

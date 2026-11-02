@@ -94,7 +94,10 @@ function toggleWeek(i: number) {
   const v = i + 1
   if (list.has(v)) list.delete(v)
   else list.add(v)
-  form.value.weekdays = [...list].sort((a, b) => a - b)
+  // ⚠️ 必须用 Array.from 而不是 [...list]：tsconfig 的 target 低于 es2015，
+  // 展开 Set 会报 TS2802（需要 downlevelIteration）。**不要**为此去改
+  // tsconfig —— 那是全工程编译目标，为一个循环不值得。
+  form.value.weekdays = Array.from(list).sort((a, b) => a - b)
 }
 
 function toggleMethod(k: string) {

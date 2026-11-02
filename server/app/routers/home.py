@@ -44,6 +44,7 @@ from ..schemas import (
     HomeSummaryOut,
     MedicineTodayItemOut,
     MedicineTodayOut,
+    derive_medicines,
 )
 
 log = logging.getLogger("elder.home")
@@ -118,6 +119,11 @@ def _medicine_today(db: Session, device_ids: list[int],
                 models.Reminder.deleted_at.is_(None),
             )
         ).all()
+        # 为什么这里是 ``{r.id: r}`` 而不是按 ``(device_id, reminder_id)`` 做键：
+        # ``models.Reminder.id`` 是**单列主键**（``Integer, primary_key=True``，
+        # ``__tablename__ = "reminders"``），全表唯一，跨设备不会撞。下面组装
+        # items 时按 reminder_id 反查 medicines/dose 就靠这张表，**不再多打一次
+        # in_() 查询** —— 需要的行这次已经全在手上。
         by_id = {r.id: r for r in rules}
         for r in rules:
             zone = reminder_zone(r)
@@ -135,6 +141,11 @@ def _medicine_today(db: Session, device_ids: list[int],
                     "confirmed_at": None,
                     "device_id": r.device_id,
                     "device_name": names.get(r.device_id, ""),
+                    # 多味药 + 老 dose 原样带着，最后统一走 schemas.derive_medicines。
+                    # **不要在循环里 db.get(Reminder, id)**：这里 `r` 就是那一行，
+                    # 多设备合并时逐条查就是标准的 N+1（首页是轮询接口）。
+                    "medicines": r.medicines,
+                    "dose": r.dose or "",
                 }
 
         # 2) 用实例表覆盖真实状态。为什么按 (提醒, HH:MM) 对齐而不是按完整时间：
@@ -184,6 +195,11 @@ def _medicine_today(db: Session, device_ids: list[int],
                     "confirmed_at": ev.confirmed_at,
                     "device_id": ev.device_id,
                     "device_name": names.get(ev.device_id, ""),
+                    # 规则已被删（by_id 里没有）：medicines/dose 一律空，
+                    # derive_medicines 会给 []，**不是 null** —— 前端 v-for
+                    # 拿到 null 会直接抛错白屏。
+                    "medicines": rule.medicines if rule is not None else None,
+                    "dose": (rule.dose if rule is not None else "") or "",
                 }
                 continue
             slot["due_at"] = ev.due_at
@@ -203,6 +219,10 @@ def _medicine_today(db: Session, device_ids: list[int],
             MedicineTodayItemOut(
                 reminder_id=s["reminder_id"],
                 title=s["title"],
+                # 与 ReminderOut 共用同一份派生规则（schemas.derive_medicines）：
+                # 老数据只有 dose 时派生出 [{title, dose}]，两者都空给 []。
+                medicines=derive_medicines(s["title"], s["medicines"], s["dose"]),
+                dose=s["dose"],
                 due_at=s["due_at"],
                 tz=s["tz"],
                 state=s["state"],

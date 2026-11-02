@@ -709,6 +709,18 @@ export interface MedicineTodayItem {
   reminder_id: number
   /** 药品名 / 提醒标题 */
   title: string
+  /**
+   * 这一格要吃的**具体哪几味药、各自多少剂量**（服务端 2026-11 起返回）。
+   *
+   * 派生口径在服务端（`schemas.derive_medicines`）：老数据（只有 `dose`）
+   * 已经被派生成 `[{name: title, dose}]`，所以端侧**不做兼容派生**，
+   * 只在显示时做「空就回退老 dose」的兜底。
+   *
+   * ⚠️ 老版本服务端不返回该字段 ⇒ 取值处一律 `|| []`，不要直接 `.length`。
+   */
+  medicines?: MedicineItem[]
+  /** 老字段（一条提醒一味药）。与 medicines 并存，老服务端只有它。 */
+  dose?: string
   /** ISO 时间，**带时区偏移**（服务端 ORMBase 按 tz 补的） */
   due_at: string
   tz: string
