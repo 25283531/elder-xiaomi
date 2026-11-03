@@ -56,6 +56,56 @@ _log_handler.setFormatter(BeijingFormatter(LOG_FORMAT))
 logging.basicConfig(level=logging.INFO, handlers=[_log_handler])
 log = logging.getLogger("elder")
 
+# ---------------------------------------------------------------- 扫描器噪声
+# 2026-11-03 深夜用户实报「生产容器出现大量 404 错误日志」。
+#
+# 现场：45 分钟 209 条 404，其中 **207 条来自同一个 IP**（45.138.12.179），
+# 路径全是凭据/配置探测 —— ``/.git/config``、``/.aws/credentials``、
+# ``/application_default_credentials.json``、``/wp-config.php``、``/xml``、
+# ``/soap`` … 全部正确返回 404，**不是本站的缺陷**。
+#
+# 但它们把真正的 404（自己前端/设备打错路径）淹掉了：出问题时没人能一眼看出
+# 哪条是自己的。所以按"**不在本站路由前缀下的 404 一律视为外部探测**"过滤，
+# 并每 50 条打一行汇总 —— 噪声消失，同时保留"有人一直在扫"这件事的证据。
+#
+# 判据必须是"路径前缀"而不是"关键词黑名单"：黑名单永远漏（扫描器天天换
+# 路径），而本站只服务下面这几个前缀，之外的 404 定义上就不可能是我们的。
+_OWN_EXACT_PATHS = frozenset({"/", "/index.html", "/favicon.ico"})
+_OWN_PATH_PREFIXES = ("/api/", "/static/", "/admin", "/docs", "/redoc",
+                      "/openapi.json", "/favicon.ico", "/index.html")
+
+
+class ScannerNoiseFilter(logging.Filter):
+    """把"外部扫描器打出来的 404"从 uvicorn 访问日志里摘掉。"""
+
+    def __init__(self) -> None:
+        super().__init__("scanner-noise")
+        self.dropped = 0
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        try:
+            args = record.args
+            # uvicorn.access 的参数固定是
+            # (client_addr, method, full_path, http_version, status_code)。
+            if not isinstance(args, tuple) or len(args) < 5:
+                return True
+            path, status = args[2], args[4]
+            if status != 404 or not isinstance(path, str):
+                return True
+            clean = path.split("?", 1)[0]
+            if clean in _OWN_EXACT_PATHS or clean.startswith(_OWN_PATH_PREFIXES):
+                return True
+            self.dropped += 1
+            if self.dropped % 50 == 1:
+                log.info("已忽略 %d 条扫描器 404（最近一条：%s）",
+                         self.dropped, clean[:80])
+            return False
+        except Exception:  # noqa: BLE001  过滤器绝不能把日志打崩
+            return True
+
+
+logging.getLogger("uvicorn.access").addFilter(ScannerNoiseFilter())
+
 STATIC_DIR = Path(__file__).parent / "static"
 
 # 三条安全日志的**稳定标记**：运维要 grep、冒烟要断言，改文案时这三个串不许动
