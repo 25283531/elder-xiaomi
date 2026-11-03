@@ -142,6 +142,21 @@ jobs:
       - name: 空识别退避 / 结束语直判冒烟（连续 3 次空识别进待机，冷却期内不出声）
         run: python tools/run_smoke.py logs/smoke_smoke_empty_asr.log python tools/smoke_empty_asr.py
 
+      # 2026-11-03 晚用户实报四条：①10 秒后再说，前两个字没识别到；②偶发性完全
+      # 不识别；③长按服药确认键既无提示音也无后续（说"我吃过药了"才进流程）；
+      # ④服药卡片只有标题、没有药名和剂量。
+      #
+      # 这四条里有三条是**静默失败**：不抛异常、不写日志、服务端每轮都有始有终 ——
+      # ①只表现为少两个字，②只表现为"这次没反应"，③只表现为一片安静。真机上
+      # 各试一次要跑一整轮对话，而且失败了也拿不到任何证据。只能把**判据本身**
+      # 钉住：头 pad 必须大于尾 pad、思考期丢帧必须计数、片段判据必须允许
+      # Listening 态、药名剂量必须拼进屏幕文案。
+      #
+      # 纯函数 + 源码切片（含用真实 `_trim_silence_edges` 跑的变异验证），
+      # 不起服务、不占端口，耗时约 1 秒。
+      - name: 语音输入 / 待机 / 服药卡片冒烟（词头 pad、思考期丢帧、长按片段判据、药名剂量）
+        run: python tools/run_smoke.py logs/smoke_smoke_voice_input_medcard.log python tools/smoke_voice_input_medcard.py
+
       # docs/DEPLOY.md §8.3 曾把 `NEW_COLUMNS` 的规模写死成「26 列 / 5 张表」，
       # 而 2026-10-30 加完提醒软删除三列后实际是「37 列 / 8 张表」。
       # §8.3 是升级前核对的唯一依据 —— 按它核对会得出「还缺 11 列」，

@@ -3046,8 +3046,18 @@ def t_asr_silence_trim() -> None:
     # ---- ① 头 10 帧静音 + 20 帧语音 + 15 帧静音 → 只留语音 ± pad ----
     pcm = [_mk(False)] * 10 + [_mk(True)] * 20 + [_mk(False)] * 15
     out = _session(10, 29, len(pcm))._trim_silence_edges(list(pcm))
-    check("12j · 头尾静音被裁掉，只留语音帧 ± 2 帧 pad",
-          len(out) == 24, f"in={len(pcm)} out={len(out)} want=24")
+    # pad 一律从常量取，不写死数字：2026-11-03 把头 pad 从 2 帧加到 6 帧
+    # （用户实报「前面两个字没识别到」），写死的 24 立刻变成假红 —— 而那条
+    # 断言真正要守的是"按 pad 保留"，不是"pad 恰好等于 2"。
+    HP = S._TRIM_HEAD_PAD_FRAMES
+    TP = S._TRIM_TAIL_PAD_FRAMES
+    check("12j · 头尾静音被裁掉，只留语音帧 ± pad",
+          len(out) == 20 + HP + TP,
+          f"in={len(pcm)} out={len(out)} want={20 + HP + TP}")
+    # 头 pad 必须比尾 pad 长：词头丢的是**内容**（轻声的"我""这"），词尾多留
+    # 只是白等 ASR。两头都留 2 帧正是"前两个字被切掉"的根因。
+    check("12j · 头 pad > 尾 pad（只有词头会丢内容）", HP > TP,
+          f"head={HP} tail={TP}")
 
     # ---- ② 裁掉总量不足 300ms（5 帧）就原样发：不担切片风险 ----
     pcm2 = [_mk(False)] * 2 + [_mk(True)] * 20 + [_mk(False)] * 2
@@ -3072,12 +3082,13 @@ def t_asr_silence_trim() -> None:
 
     # ---- ⑤ pad 必须存在：贴边裁会把慢语速老人的词头切一半 ----
     #    把 pad 打到 0 做变异：同样的输入应当得到更短（且更危险）的输出。
-    real_pad = S._TRIM_PAD_FRAMES
-    S._TRIM_PAD_FRAMES = 0
+    real_hp, real_tp = S._TRIM_HEAD_PAD_FRAMES, S._TRIM_TAIL_PAD_FRAMES
+    S._TRIM_HEAD_PAD_FRAMES = 0
+    S._TRIM_TAIL_PAD_FRAMES = 0
     try:
         out5 = _session(10, 29, len(pcm))._trim_silence_edges(list(pcm))
     finally:
-        S._TRIM_PAD_FRAMES = real_pad
+        S._TRIM_HEAD_PAD_FRAMES, S._TRIM_TAIL_PAD_FRAMES = real_hp, real_tp
     check("12j ★ pad 是真实防线（pad=0 变异后输出更短，说明断言能抓到切除词头）",
           len(out5) == 20 and len(out5) < len(out),
           f"pad0_out={len(out5)} normal_out={len(out)}")
@@ -3114,8 +3125,8 @@ def t_asr_silence_trim() -> None:
     out6 = _session(s6._first_speech_frame, s6._last_speech_frame,
                     len(s6._pcm), s6._speech_idx)._trim_silence_edges(
         list(s6._pcm))
-    check("12j · VAD 区间喂给裁剪：30 帧 → 21 帧（8-2 .. 24+2）",
-          len(out6) == 21, f"out={len(out6)} want=21")
+    check("12j · VAD 区间喂给裁剪：30 帧 → 语音 17 帧 + 头尾 pad",
+          len(out6) == 17 + HP + TP, f"out={len(out6)} want={17 + HP + TP}")
 
 
 def t_asr_silence_gap() -> None:
@@ -3160,10 +3171,13 @@ def t_asr_silence_gap() -> None:
 
     def _continuous(pcm: list[bytes], first: int, last: int) -> list[bytes]:
         """对照组：老行为（只裁头尾）会送出的连续窗口。"""
-        pad = S._TRIM_PAD_FRAMES
-        a = max(0, first - pad)
-        b = min(len(pcm) - 1, last + pad)
+        a = max(0, first - S._TRIM_HEAD_PAD_FRAMES)
+        b = min(len(pcm) - 1, last + S._TRIM_TAIL_PAD_FRAMES)
         return pcm[a:b + 1]
+
+    # 与 t_trim 里同一套：pad 从常量取，不写死数字（见 12j ① 的说明）
+    HP = S._TRIM_HEAD_PAD_FRAMES
+    TP = S._TRIM_TAIL_PAD_FRAMES
 
     def _frames_ok(out) -> bool:
         """返回值必须是**帧列表**（与入参 list[bytes] 同型）。
@@ -3181,32 +3195,42 @@ def t_asr_silence_gap() -> None:
     out1 = _sess(10, 29, idx1)._trim_silence_edges(list(pcm1))
     want1 = _continuous(pcm1, 10, 29)
     check("12n ① 单段连续语音：结果与「只裁头尾」的连续窗口逐帧一致（零回归）",
-          _frames_ok(out1) and out1 == want1 and len(out1) == 24,
+          _frames_ok(out1) and out1 == want1
+          and len(out1) == 20 + HP + TP,
           f"类型={type(out1).__name__} out={len(out1)}帧 want={len(want1)}帧 "
           f"相同={out1 == want1}")
 
     # ---- ② 两段语音中间夹 20 秒静音 ⇒ 拼接，两段语音帧全在 ----
     #    20s = 334 帧（60ms/帧），远超 2000ms 闸门。
     gap = 334
-    pcm2 = ([_mk(0)] * 5 + [_mk(1)] * 10 + [_mk(0)] * gap
+    # ⚠️ 头部静音必须**长于** pad：头部静音比 pad 还短时 start 会被夹到 0，
+    #    "省下的静音"不到 _TRIM_MIN_SAVE_MS（300ms）闸门，裁剪整段被跳过 ——
+    #    那样这些用例测的就不是裁剪逻辑了。2026-11-03 把头 pad 从 2 帧加到
+    #    6 帧时，原来 5 帧的头部静音正好踩到这个边界（假红），统一改成 12 帧。
+    lead = 12
+    pcm2 = ([_mk(0)] * lead + [_mk(1)] * 10 + [_mk(0)] * gap
             + [_mk(2)] * 10 + [_mk(0)] * 5)
-    first2, last2 = 5, 5 + 10 + gap + 9
-    idx2 = list(range(5, 15)) + list(range(15 + gap, 25 + gap))
+    first2, last2 = lead, lead + 10 + gap + 9
+    idx2 = (list(range(lead, lead + 10))
+            + list(range(lead + 10 + gap, lead + 20 + gap)))
     out2 = _sess(first2, last2, idx2)._trim_silence_edges(list(pcm2))
     cont2 = _continuous(pcm2, first2, last2)
-    want2 = pcm2[5 - 2:15 + 2] + pcm2[15 + gap - 2:25 + gap + 2]
+    want2 = (pcm2[first2 - HP:first2 + 10 + TP]
+             + pcm2[last2 - 9 - HP:last2 + 1 + TP])
     check("12n ② 夹 20s 静音：被拼接，长度远小于连续窗口，两段语音帧逐帧都在",
-          _frames_ok(out2) and out2 == want2 and len(out2) == 28
+          _frames_ok(out2) and out2 == want2
+          and len(out2) == 2 * (10 + HP + TP)
           and len(out2) * 3 < len(cont2),
           f"类型={type(out2).__name__} out={len(out2)}帧 cont={len(cont2)}帧 "
           f"逐帧相同={out2 == want2}")
 
     # ---- ③a 中间只夹 400ms（7 帧）静音 ⇒ 间隔 ≤ 480ms 算同一段，不切 ----
     #    句中换气/轻声音节就是这个量级，切了 ASR 直接丢字。
-    pcm3 = ([_mk(0)] * 5 + [_mk(1)] * 10 + [_mk(0)] * 7
+    pcm3 = ([_mk(0)] * lead + [_mk(1)] * 10 + [_mk(0)] * 7
             + [_mk(2)] * 10 + [_mk(0)] * 5)
-    first3, last3 = 5, 31
-    idx3 = list(range(5, 15)) + list(range(22, 32))
+    first3, last3 = lead, lead + 26
+    idx3 = (list(range(lead, lead + 10))
+            + list(range(lead + 17, lead + 27)))
     out3 = _sess(first3, last3, idx3)._trim_silence_edges(list(pcm3))
     cont3 = _continuous(pcm3, first3, last3)
     check("12n ③a 句中只夹 400ms 静音：间隔 ≤ 480ms 算同一段，仍走连续窗口",
@@ -3216,10 +3240,11 @@ def t_asr_silence_gap() -> None:
     # ---- ③b 中间夹 1200ms（20 帧）静音 ⇒ 间隔够大能断开，但省下的
     #      (20-2*2)=16 帧 = 960ms 没到 2000ms 闸门 ⇒ 仍走连续窗口。
     #      这条是"保守闸"唯一的判据来源，变异测试打的就是它。
-    pcm3b = ([_mk(0)] * 5 + [_mk(1)] * 10 + [_mk(0)] * 20
+    pcm3b = ([_mk(0)] * lead + [_mk(1)] * 10 + [_mk(0)] * 20
              + [_mk(2)] * 10 + [_mk(0)] * 5)
-    first3b, last3b = 5, 44
-    idx3b = list(range(5, 15)) + list(range(35, 45))
+    first3b, last3b = lead, lead + 39
+    idx3b = (list(range(lead, lead + 10))
+             + list(range(lead + 30, lead + 40)))
     out3b = _sess(first3b, last3b, idx3b)._trim_silence_edges(list(pcm3b))
     cont3b = _continuous(pcm3b, first3b, last3b)
     check("12n ③b 句中夹 1200ms 静音：省 960ms 未到 2000ms 闸门，仍走连续窗口",
@@ -3228,8 +3253,8 @@ def t_asr_silence_gap() -> None:
 
     # ---- ④ 三段语音、各夹 10s 静音 ⇒ 拼成 3 段，总长 ≈ 三段 + 各自 pad ----
     gap4 = 167                       # 10s
-    pcm4, idx4 = [_mk(0)] * 5, []
-    pos = 5
+    pcm4, idx4 = [_mk(0)] * lead, []
+    pos = lead
     for tag in (1, 2, 3):
         idx4 += list(range(pos, pos + 10))
         pcm4 += [_mk(tag)] * 10
@@ -3238,12 +3263,12 @@ def t_asr_silence_gap() -> None:
             pcm4 += [_mk(0)] * gap4
             pos += gap4
     pcm4 += [_mk(0)] * 5
-    first4, last4 = 5, pos - 1
+    first4, last4 = lead, pos - 1
     cont4 = _continuous(pcm4, first4, last4)
     out4 = _sess(first4, last4, idx4)._trim_silence_edges(list(pcm4))
     check("12n ④ 三段语音各夹 10s 静音：拼成 3 段，总长 = 三段 + 各自 pad",
           _frames_ok(out4)
-          and len(out4) == 3 * (10 + 2 * S._TRIM_PAD_FRAMES)
+          and len(out4) == 3 * (10 + HP + TP)
           and len(out4) < len(cont4) // 5,
           f"类型={type(out4).__name__} out={len(out4)}帧 cont={len(cont4)}帧")
 

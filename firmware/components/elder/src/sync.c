@@ -607,9 +607,37 @@ static int32_t ordinal_from_iso_date(const char *s)
     return (int32_t)elder_rmd_ordinal_of(y, m, d);
 }
 
+/* 把 src 按**整字**拷进 dst（只在 UTF-8 字符边界收尾）。
+ *
+ * 为什么需要它：服务端 ``MedicineItem.name`` 的 max_length 是 32 **字符**，
+ * 32 个汉字就是 96 字节，已经超过一行明细的 95 字节上限（显示层
+ * lcd_display.cc 的拆行缓冲同样只有 96 字节）。直接 snprintf 截断会把最后
+ * 一个汉字切成半个 —— LVGL 画出来是乱码方块，比少显示几个字难看得多。
+ *
+ * 非法/截断的字节按 1 字节处理（clen 兜底为 1）：数据脏也要保证越界安全。 */
+static void copy_utf8_head(char *dst, size_t cap, const char *src)
+{
+    size_t n = 0;
+    if (dst == NULL || cap == 0) return;
+    if (src != NULL) {
+        while (src[n] != '\0') {
+            const unsigned char c = (unsigned char)src[n];
+            size_t clen = 1;
+            if (c >= 0xF0)      clen = 4;
+            else if (c >= 0xE0) clen = 3;
+            else if (c >= 0xC0) clen = 2;
+            if (n + clen + 1 > cap) break;   /* +1 留给结尾 '\0' */
+            n += clen;
+        }
+    }
+    if (src != NULL) memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
 static void parse_reminders(cJSON *root, elder_rmd_item_t *out,
                             elder_rmd_when_t *when_out,
                             uint8_t *med_counts, elder_med_name_t *med_names,
+                            elder_med_line_t *med_lines,
                             uint8_t *out_count)
 {
     uint8_t n = 0;
@@ -706,13 +734,20 @@ static void parse_reminders(cJSON *root, elder_rmd_item_t *out,
 
         /* 药数与第一味药名 —— 同一规则展开出的多条 item 共用同一份。
          *
-         * 只认数组长度与 [0].name：dose 不取（设备侧不念剂量，念错剂量比
-         * 不念更危险），下标 1..3 的药名也不取（判断"吃了哪一味"是服务端
-         * 大模型的职责，固件只负责把问题问出口）。
+         * 只认数组长度与 [0].name：下标 1..3 的药名不取（判断"吃了哪一味"
+         * 是服务端大模型的职责，固件只负责把问题问出口）。
          * 字段缺失/类型不对一律按 0 处理 —— 0 的语义是「未知」，长按会走
-         * 老的「直接确认」路径，绝不会因为解析失败让老人确认不了。 */
+         * 老的「直接确认」路径，绝不会因为解析失败让老人确认不了。
+         *
+         * ⚠️ 2026-11-03 起**额外**拼一行「药名 剂量」给屏幕看
+         *    （用户实报「服药提醒页只有标题，没有种类和剂量」）。
+         *    这一行**只用于显示**，绝不参与确认判断、也绝不被念出来 ——
+         *    念错剂量的代价是老人多吃/少吃药，显示错至少他能自己核对。
+         *    拼法：最多列 2 味（320×240 的明细位放不下更多），
+         *    其余用「等N味」收口。 */
         uint8_t med_cnt = 0;
         char med_first[ELDER_MED_NAME_MAX + 1] = "";
+        char med_line[ELDER_MED_LINE_MAX + 1] = "";
         if (cJSON_IsArray(jmed)) {
             int msz = cJSON_GetArraySize(jmed);
             if (msz > 255) msz = 255;          /* counts 是 uint8_t，防溢出 */
@@ -726,6 +761,54 @@ static void parse_reminders(cJSON *root, elder_rmd_item_t *out,
                      * 正常数据不会被截断。这里仍然用 snprintf：万一历史脏数据
                      * 超长，截断也比越界安全。 */
                     snprintf(med_first, sizeof(med_first), "%s", jname->valuestring);
+                }
+                /* ---- 拼显示行 ---- */
+                size_t used = 0;
+                int shown = 0;
+                cJSON *m = NULL;
+                cJSON_ArrayForEach(m, jmed) {
+                    if (shown >= 2) break;
+                    cJSON *jn = cJSON_IsObject(m) ? cJSON_GetObjectItem(m, "name") : NULL;
+                    cJSON *jd = cJSON_IsObject(m) ? cJSON_GetObjectItem(m, "dose") : NULL;
+                    if (!cJSON_IsString(jn) || jn->valuestring[0] == '\0') continue;
+                    const char *dose = cJSON_IsString(jd) ? jd->valuestring : "";
+                    /* 名字与剂量之间不留空格：「降压药1片」比「降压药 1片」
+                     * 少一个字符宽，320 像素一行能多放一个字。剂量本身若
+                     * 自带单位（"1片"/"5mg"）读起来是连贯的。 */
+                    int w = snprintf(med_line + used, sizeof(med_line) - used,
+                                     "%s%s%s", used > 0 ? "、" : "",
+                                     jn->valuestring, dose);
+                    if (w <= 0 || (size_t)w >= sizeof(med_line) - used) {
+                        /* 放不下就**回退**到上一味为止，不留半截药名：
+                         * 半截药名比没有药名更容易让老人吃错。 */
+                        med_line[used] = '\0';
+                        break;
+                    }
+                    used += (size_t)w;
+                    shown++;
+                }
+                if (shown > 0 && msz > shown) {
+                    snprintf(med_line + used, sizeof(med_line) - used,
+                             "等%d味", msz);
+                }
+                /* 兜底：连第一味都放不下。
+                 *
+                 * 服务端 ``name`` 的 max_length 是 32 **字符** —— 32 个汉字
+                 * 就是 96 字节，已经超过一行明细的 95 字节上限（显示层
+                 * lcd_display.cc 的拆行缓冲也是 96）。这时：
+                 *   · 直接 snprintf 截断 ⇒ 最后一个汉字被切成半个，
+                 *     LVGL 画出的是乱码方块；
+                 *   · 整条丢掉 ⇒ 屏上退回"只有标题"的老样子，
+                 *     正是用户 2026-11-03 报的那个问题。
+                 * 所以按**整字**截断：宁可少显示后几个字，也不出乱码。 */
+                if (shown == 0) {
+                    cJSON *m0b = cJSON_GetArrayItem(jmed, 0);
+                    cJSON *jn0 = cJSON_IsObject(m0b)
+                                     ? cJSON_GetObjectItem(m0b, "name") : NULL;
+                    if (cJSON_IsString(jn0) && jn0->valuestring[0] != '\0') {
+                        copy_utf8_head(med_line, sizeof(med_line),
+                                       jn0->valuestring);
+                    }
                 }
             }
         }
@@ -759,9 +842,10 @@ static void parse_reminders(cJSON *root, elder_rmd_item_t *out,
                 snprintf(it->label, sizeof(it->label), "%s", title);
                 /* 同一规则展开出的多条 item 共用同一份排期 */
                 when_out[n] = w;
-                /* 药数/药名同理：同一规则的所有时刻挂的是同一批药 */
+                /* 药数/药名/显示行同理：同一规则的所有时刻挂的是同一批药 */
                 med_counts[n] = med_cnt;
                 memcpy(med_names[n], med_first, sizeof(med_names[n]));
+                memcpy(med_lines[n], med_line, sizeof(med_lines[n]));
                 n++;
             }
         } else {
@@ -1213,6 +1297,9 @@ typedef struct {
      * 这块也必须在堆上（+2KB），理由与上面 items/when 完全相同。 */
     uint8_t          med_counts[ELDER_REMINDER_MAX];
     elder_med_name_t med_names[ELDER_REMINDER_MAX];
+    /* 「药名 剂量」显示行（2026-11-03）：+1.5KB，同样必须在堆上 ——
+     * 同步任务栈 8KB，真机上 6 条提醒就把栈压爆过（见上面 items/when 的说明）。 */
+    elder_med_line_t med_lines[ELDER_REMINDER_MAX];
 } sync_rmd_buf_t;
 
 /* ---- 服务端代确认（R1，2026-10-31）----
@@ -1565,6 +1652,7 @@ static esp_err_t do_sync(void)
          * 不清零的话上一轮的残留会被当成"这一条挂了几味药"。 */
         memset(rb->med_counts, 0, sizeof(rb->med_counts));
         memset(rb->med_names, 0, sizeof(rb->med_names));
+        memset(rb->med_lines, 0, sizeof(rb->med_lines));
         /* 「服务端说没有」与「这轮响应不完整」必须分开判 —— 判据是
          * **键是否存在、类型对不对**，而不是「解析出几条」。
          *
@@ -1588,7 +1676,8 @@ static esp_err_t do_sync(void)
         cJSON *jrem = cJSON_GetObjectItem(root, "reminders");
         if (cJSON_IsArray(jrem)) {
             parse_reminders(jrem, rb->items, rb->when,
-                            rb->med_counts, rb->med_names, &count);
+                            rb->med_counts, rb->med_names, rb->med_lines,
+                            &count);
             /* ⚠️ replace_all 的返回值里**混着落盘结果**（函数末尾
              * `return elder_reminder_flush()`）。NVS 满时它返回错误，但表其实
              * 已经装进 RAM 了 —— 若只认 ESP_OK，NVS 一满，子女的手机端代确认
@@ -1608,7 +1697,8 @@ static esp_err_t do_sync(void)
              * 漏写这一句的后果是**5 分钟后药数归零**（心跳整表重装一次），
              * 长按追问退化成"直接确认"—— 症状很隐蔽，只有日志能看出来。 */
             if (table_ok) {
-                elder_reminder_set_med_info(rb->med_counts, rb->med_names, count);
+                elder_reminder_set_med_info(rb->med_counts, rb->med_names,
+                                            rb->med_lines, count);
             }
         } else {
             ESP_LOGW(TAG, "响应里没有 reminders 数组（老服务端或字段缺失），"

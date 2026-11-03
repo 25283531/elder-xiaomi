@@ -862,6 +862,33 @@ static bool CanStartDialog()
            Application::GetInstance().GetDeviceState() == kDeviceStateIdle;
 }
 
+/* 此刻能不能**播一句本地预录片段**。
+ *
+ * ⚠️ 2026-11-03 用户实报「长按服药确认按键，没有提示音，松开之后也没有播放
+ *    声音，我主动说我吃过药了，才进入服用了哪种药物的流程」——**完全静音**。
+ *
+ * 根因不是片段资源坏了，而是这一行原来写的是 `CanStartDialog()`：
+ *   · 那个判据要求设备在 **Idle**（它判的是"播完能不能接着开麦"）；
+ *   · 而连续对话（realtime）下设备一直停在 **Listening**，Idle 判据恒假；
+ *   · 于是片段不播 → 落到 TTS 兜底 → AskThenListenTask 一看"不在待机"
+ *     立刻 return ⇒ 两条路都不出声。老人按满了 3 秒，听到的是彻底的安静。
+ *
+ * 片段是编在 .rodata 里的本地资源，**播放不需要联网、也不需要设备待机**，
+ * 只要音频输出没被正在进行的播报占着（Speaking）就行。所以判据放宽到
+ * 「Idle 或 Listening」：
+ *   · Idle      → 播完再 StartListening（ListenAfterClipTask 负责）；
+ *   · Listening → 本来就在听，播完什么都不用做。
+ *
+ * 不放行 Speaking / Connecting：前者会把正在说的话顶掉（ResetDecoder 在
+ * SetDeviceState(Speaking) 里刚做过，插一段进去必然破音），后者音频通道还没
+ * 建好，PlaySound 只会丢帧。 */
+static bool CanPlayClip()
+{
+    const DeviceState st = Application::GetInstance().GetDeviceState();
+    return OnIsOnline(nullptr) &&
+           (st == kDeviceStateIdle || st == kDeviceStateListening);
+}
+
 /* 「先播预录问句、播完再开麦」的专用任务（2026-11-03 用户需求）。
  *
  * 用户原话：「如果用户长按时显示的是服药提醒，就播放第二句，并进入聆听状态，
@@ -893,6 +920,12 @@ static void ListenAfterClipTask(void *arg)
     if (app.GetDeviceState() == kDeviceStateIdle) {
         app.StartListening();
         ESP_LOGI(TAG, "预录问句播完（%lu ms），进入聆听", (unsigned long)wait_ms);
+    } else if (app.GetDeviceState() == kDeviceStateListening) {
+        /* 连续对话下设备本来就在听（长按前就停在 Listening）。
+         * 这时**不需要**再 StartListening —— 那会先 AbortSpeaking，
+         * 而此刻并没有人在说话，白白把音频通道重开一次。 */
+        ESP_LOGI(TAG, "预录问句播完（%lu ms），设备已在聆听态",
+                 (unsigned long)wait_ms);
     } else {
         /* 这 2~4 秒里老人可能已经用别的方式开了对话（或设备被 APP 抢占）。
          * 此时**不抢**：StartListening 会 AbortSpeaking，把正在说的话掐断。 */
@@ -1155,10 +1188,10 @@ void OnKey(elder_key_event_t ev, void *ctx)
              * **只有开不了麦时**（离线 / 设备忙）才退回直接确认 —— 信息缺失
              * 不能让老人确认不了，"按了就记上"比"按了没反应"安全得多。 */
             uint8_t med_n = elder_reminder_med_count((uint8_t)idx);
-            if (med_n == 0 && !CanStartDialog()) {
+            if (med_n == 0 && !CanPlayClip()) {
                 elder_rgb_button_confirmed();
                 ConfirmMedicine(idx, ELDER_CFM_BUTTON);
-                ESP_LOGW(TAG, "长按：药数未知且当前开不了麦（离线/忙）⇒ 直接确认 #%d",
+                ESP_LOGW(TAG, "长按：药数未知且此刻播不了片段（离线/忙）⇒ 直接确认 #%d",
                          idx);
                 break;
             }
@@ -1229,11 +1262,31 @@ void OnKey(elder_key_event_t ev, void *ctx)
              * 老人回一句"吃了"它就够判断了。
              *
              * 片段不可用 / 开不了麦 ⇒ 逐字退回原来的 TTS 追问（下面那段）。 */
-            if (CanStartDialog() && elder_clip_play(ELDER_CLIP_MED_CONFIRM)) {
+            if (CanPlayClip() && elder_clip_play(ELDER_CLIP_MED_CONFIRM)) {
                 ListenAfterClip(ELDER_CLIP_MED_CONFIRM);
                 ESP_LOGI(TAG, "长按：播预录问句「您确认已经完成这次服药了吗？」"
-                              "（%u 味药，提醒 #%d），播完进聆听",
-                         (unsigned)med_n, idx);
+                              "（%u 味药，提醒 #%d，state=%d），播完进聆听",
+                         (unsigned)med_n, idx,
+                         (int)Application::GetInstance().GetDeviceState());
+                break;
+            }
+
+            /* 走到这里说明片段没播出去 —— **必须留下原因**。
+             * 2026-11-03 的现场就是这里静默失败：片段被 CanStartDialog()
+             * 挡住、TTS 兜底又被 AskThenListenTask 的"不在待机"挡掉，
+             * 老人按满 3 秒却一点声音都没有，串口里连一行日志都找不到。 */
+            ESP_LOGW(TAG, "长按：预录问句未播（state=%d，clip=%d），退回 TTS 追问",
+                     (int)Application::GetInstance().GetDeviceState(),
+                     (int)CanPlayClip());
+
+            /* TTS 兜底的前提是 **Idle**：OnSpeak() 里 `state==Idle` 才发
+             * MCP 请求，其余状态静默丢弃。原来不管三七二十一先建任务，
+             * 任务自己再判一次并静默 return —— 那正是"按了没声音"的第二个
+             * 静默出口。现在在**建任务之前**就判，判不过就明说。 */
+            if (!CanStartDialog()) {
+                ESP_LOGE(TAG, "长按：既播不了片段、也不在待机（state=%d），"
+                              "本次无法追问；提醒仍挂在屏上，可再按一次",
+                         (int)Application::GetInstance().GetDeviceState());
                 break;
             }
 

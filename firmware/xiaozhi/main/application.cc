@@ -967,6 +967,30 @@ void Application::SetDeviceState(DeviceState state) {
             display->SetStatus(Lang::Strings::LISTENING);
             display->SetEmotion("neutral");
 
+            /* ---- 显式唤醒必须"盖过"服务端的待机冷却（2026-11-03）----
+             *
+             * 现场：老人说完「不聊了」，服务端下发 standby、并进入
+             * VOICE_DISMISS_COOLDOWN_SEC（默认 **180 秒**）的冷却 —— 冷却期内
+             * 它丢弃所有上行音频、连 listen start 也忽略（session.py 的
+             * _on_binary / _on_listen）。服务端靠什么解除？只有
+             * `{"type":"listen","state":"detect"}`（唤醒词那条）。
+             *
+             * 而**按键唤醒走的是 ToggleChatState，从来不发 detect** ——
+             * 于是老人按一下键、开口说话，设备在推流、服务端全扔，最长聋
+             * 三分钟。用户实报「偶发性的我说话设备完全没有识别到」就是这条。
+             *
+             * 判据用 **Idle → Listening** 这一次跃迁：它就是"有人明确让设备
+             * 开始听"（按键 / 唤醒词 / 提醒追问）。播报完自动回 listening 是
+             * Speaking → Listening，不在此列 —— 那条正是冷却要挡的。
+             *
+             * 发 detect 而不是别的：服务端 _on_listen 的 detect 分支本来就
+             * 是"唤醒词到达，解除待机"，语义完全对得上；它不播音、不弹提示，
+             * 只是解冷却 + 清缓冲。 */
+            if (previous_state == kDeviceStateIdle &&
+                protocol_ != nullptr && protocol_->IsAudioChannelOpened()) {
+                protocol_->SendWakeWordDetected("按键唤醒");
+            }
+
             // Make sure the audio processor is running
             if (!audio_service_.IsAudioProcessorRunning()) {
                 audio_service_.EnableVoiceProcessing(true);

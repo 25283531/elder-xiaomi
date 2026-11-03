@@ -51,6 +51,22 @@ extern "C" {
 #define ELDER_MED_NAME_MAX      127
 typedef char elder_med_name_t[ELDER_MED_NAME_MAX + 1];
 
+/* 一条提醒的「药名 + 剂量」明细行（**只给人看**，不参与确认判断）。
+ *
+ * 2026-11-03 用户实报：「服药提醒页面上只显示了标题，没有显示需要服药的
+ * 种类和剂量。」—— 卡片上只有「该吃<标题>了 / 请及时服用」两行，老人
+ * 根本不知道要吃哪几种药、各吃多少。
+ *
+ * 为什么不在设备上拼：剂量是家属在 APP 上填的自由文本（``MedicineItem.dose``，
+ * 上限 64 字），单位写法五花八门（"1片" / "半片" / "5mg" / "一次两粒"）。
+ * 固件只拿到 ``medicines[].name`` + ``dose``，拼法必须与服务端 APP 端一致 ——
+ * 所以这里存的是**服务端已经拼好的一行**，设备只负责显示，不再二次加工。
+ *
+ * 96 字节 × 16 条 = 1.5KB 静态 RAM（与 med_name 一样只进 RAM、绝不进 NVS
+ * blob —— 加进 elder_rmd_item_t 会让 V1/V2 前缀断言失效、老用户整表清空）。 */
+#define ELDER_MED_LINE_MAX      95
+typedef char elder_med_line_t[ELDER_MED_LINE_MAX + 1];
+
 typedef enum {
     ELDER_RMD_IDLE = 0,      /* 未到时间 */
     ELDER_RMD_PENDING,       /* 已触发，等待确认 */
@@ -453,6 +469,8 @@ int elder_reminder_first_ringing(void);
  *
  * @param counts       与 items[] 同下标；counts[i] = 该条提醒 medicines 数组长度
  * @param first_names  与 items[] 同下标；medicines[0].name（可为 NULL）
+ * @param lines        与 items[] 同下标；服务端拼好的「药名 剂量」显示行
+ *                     （可为 NULL ⇒ 明细行不显示，退回只有标题+提示语的老样子）
  * @param n            条目数，超过 ELDER_REMINDER_MAX 的部分忽略
  *
  * 生命周期（三条，漏一条就会「药数莫名其妙归零」或「拿错药名去确认」）：
@@ -465,6 +483,7 @@ int elder_reminder_first_ringing(void);
  */
 void elder_reminder_set_med_info(const uint8_t *counts,
                                  const elder_med_name_t *first_names,
+                                 const elder_med_line_t *lines,
                                  uint8_t n);
 
 /**
@@ -477,6 +496,14 @@ uint8_t elder_reminder_med_count(uint8_t idx);
 
 /** 第一味药名；未知返回空串（不是 NULL，调用方可直接 snprintf） */
 const char *elder_reminder_first_med_name(uint8_t idx);
+
+/**
+ * @brief 该条提醒的「药名 剂量」明细行（服务端拼好，设备只显示）。
+ *
+ * 未知 / 非服药类 / 服务端没下发 ⇒ 返回空串（不是 NULL）。
+ * 调用方判空串跳过即可，不要用它判断"有没有药"（那是 med_count 的事）。
+ */
+const char *elder_reminder_med_line(uint8_t idx);
 
 /**
  * @brief 生成全屏提醒文案 —— **唯一真源**。
