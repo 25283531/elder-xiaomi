@@ -911,19 +911,25 @@ def t_fallback_policy() -> None:
 
 # ================================================================ K 组：音色解析
 def t_voice_resolution() -> None:
-    """音色解析：**配置行说了算**，跨厂商音色自动退回该厂商默认。
+    """音色解析：**角色说了算，配置行兜底**，跨厂商音色自动退回兜底/默认。
 
-    为什么这条必须是断言（2026-10-22 生产事故）
-    ------------------------------------------
-    真机「有文字、没声音」的直接原因就在这里：腾讯云那一行的 ``tts_voice`` 列与
+    为什么这条必须是断言（2026-10-22 生产事故 + 2026-11-03 用户实报）
+    ----------------------------------------------------------------
+    2026-10-22 真机「有文字、没声音」的直接原因：腾讯云那一行的 ``tts_voice`` 列与
     ``params.voice`` 都是空的，而角色音色是 ``zh-CN-XiaoxiaoNeural``（Edge 的音色
     名）。``tts()`` 原实现只转发调用方 voice ⇒ 腾讯云回「VoiceType 必须是整数」
     ⇒ 整句音频被跳过，屏幕上文字却照常打。
 
+    当时的修法是「配置行音色压过角色」（``_row_voice(row) or voice``），副作用是
+    **角色音色从此永远不生效**：只要管理员在 TTS 配置里选过音色，用户端角色页
+    怎么改都没用（2026-11-03 用户实报「人格预设的音色从来没有生效」）。
+    现在的判据是「角色 → 配置行 → 厂商默认」，两边都过形态过滤：
+    角色音色跨厂商时被置空、由配置行接手，这才是 2026-10-22 那次事故的正解。
+
     本组用打桩捕获**真正发给厂商的 voice**，验的是分发后的结果；只加了
     ``_row_voice`` 却忘了在 ``tts()`` 里调用它，照样红。
     """
-    print("\n── K. 音色解析：配置行优先 + 跨厂商音色退回默认 ──")
+    print("\n── K. 音色解析：角色优先 + 配置行兜底 + 跨厂商退回默认 ──")
     from app.voice import asr_tts, tts_edge, tts_tencent
 
     captured: list[str] = []
@@ -990,6 +996,22 @@ def t_voice_resolution() -> None:
         asr_tts.tts(None, "你好", voice="", row=trow(params={}))
         check("K5 两边都没指定音色 → 空串（由厂商默认决定）",
               captured == [""], repr(captured))
+
+        # K7：角色音色**合法**时必须压过配置行 —— 音色是角色的属性
+        # （device_api.sync 只下发 role.tts_voice，用户端也只让用户改角色的音色）。
+        # 2026-11-03 用户实报「音色从来没生效」：原写法让配置行音色无条件压过角色，
+        # 于是用户在角色页选什么都没用，实际听到的永远是配置行那一个。
+        captured.clear()
+        asr_tts.tts(None, "你好", voice="601008", row=trow(params={"voice": "601009"}))
+        check("K7 角色音色合法时压过配置行（音色归角色）",
+              captured == ["601008"], repr(captured))
+
+        # K8：角色音色合法、配置行也填了 tts_voice 列 → 同样是角色优先。
+        # 两种存法都要认，否则换个存法这条优先级就静默失效。
+        captured.clear()
+        asr_tts.tts(None, "你好", voice="601008", row=trow(tts_voice="601010"))
+        check("K8 配置行 tts_voice 列同样只是兜底（不压角色）",
+              captured == ["601008"], repr(captured))
     finally:
         tts_tencent.tts = orig_tencent
         tts_edge.synth_pcm = orig_edge
@@ -1055,13 +1077,13 @@ MUTATIONS: dict[str, tuple[str, str, list[str]]] = {
     ),
     # 删掉「跨厂商音色形态过滤」—— 角色级 Edge 音色又会硬塞给腾讯云（"没声音"原样复现）
     "M8": (
-        "    voice = _shape_ok_voice(style, _row_voice(row) or voice)\n",
+        "    voice = _shape_ok_voice(style, voice) or _shape_ok_voice(style, _row_voice(row))\n",
         "    voice = voice\n",
         ["K1 TTS 配置弹窗选的音色", "K3 跨厂商音色"],
     ),
-    # 删掉「配置行音色优先」—— 弹窗里选的音色又变死数据（只在角色未指定时才生效）
+    # 删掉「配置行音色兜底」—— 弹窗里选的音色在角色没指定 / 音色跨厂商时又变死数据
     "M9": (
-        "    voice = _shape_ok_voice(style, _row_voice(row) or voice)\n",
+        "    voice = _shape_ok_voice(style, voice) or _shape_ok_voice(style, _row_voice(row))\n",
         "    voice = _shape_ok_voice(style, voice)\n",
         ["K1 TTS 配置弹窗选的音色", "K2 配置行 tts_voice"],
     ),
