@@ -139,25 +139,30 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/16m.csv"
 # 离线命令词（elder_cmd/elder_mn/custom_wake_word）已删除，NVS 离线提醒
 # 引擎（reminder.c 到点播报）保留。
 #
-# --- 降噪：改用 NSNet2 神经网络降噪（2026-10-31 用户拍板，第 1 步）---
-# 现状（改前）：CONFIG_SR_NSN_WEBRTC —— 但 **实际根本没开降噪**。
-#   afe_audio_processor.cc 只在 esp_srmodel_filter(models, ESP_NSNET_PREFIX)
-#   命中「NSNet 模型」时才 ns_init=true；WebRTC NS 是算法不是模型 ⇒ 恒 false。
-#   真机日志证据：AFE Pipeline 的 NS 槽是空的
-#   `|AEC(SR_HIGH_PERF)| ->  -> |VAD(WebRTC)| -> |WakeNet(...)|`
-#   （管线格式串 `[input] -> %s%s%s%s%s%s[output]` 共 6 槽，中间那个空位就是 NS）
+# --- 降噪：WebRTC NS（2026-11-04 更正 10-31 的错误选择）---
 #
-# 改成 NSNET2 之后，模型进 model 列表 ⇒ ns_init=true + afe_ns_mode=AFE_NS_MODE_NET，
-# 管线变成 `|AEC(...)| -> |NS(nsnet2...)| -> ...`，且 **NS 在 VAD 之前**，
-# 正好是「先降噪再判断有没有人说话」的原生顺序。
+# 10-31 把这里从 SR_NSN_WEBRTC 改成了 SR_NSN_NSNET2，理由是"模型进 model 列表
+# ⇒ ns_init=true"。**这个理由不成立**：本机分区表（partitions/v2/16m.csv）只有
+# nvs/otadata/phy_init/ota_0/ota_1/assets，**没有 `model` 分区** ⇒
+# `esp_srmodel_init("model")` 拿不到模型列表 ⇒
+# `esp_srmodel_filter(models, ESP_NSNET_PREFIX, NULL)` 恒为 nullptr ⇒
+# `ns_init = false` 是唯一结局。当时注释里"nsnet2 模型 337KB 随 app 镜像走"
+# 这句也没兑现：模型不在 app 里，在 model 分区里。
 #
-# ⚠️ 这一步只动降噪，**不动数据流**（不做 VAD 门控）。目的是单独观察 NSNet2 对
-#    听感与 ASR 识别率的影响 —— 用户硬约束「声音不许再变差」，混在一起改就分不清
-#    是哪一项导致的。VADNet 与上行门控是第 2、3 步。
+# 真机证据（2026-11-04 开机日志，grep "AFE Pipeline"）：
+#   `[input] -> |AEC(SR_HIGH_PERF)| ->  -> |VAD(WebRTC)| -> |WakeNet(...)|`
+#   NS 槽至今是空的 —— 也就是说「改用 NSNet2」这两个星期，一帧降噪都没做。
 #
-# 体积：nsnet2 模型 337KB，随 app 镜像走（分区表里没有 model 分区）。
-#       app 3.00MB → 约 3.34MB，分区 0x3f0000≈3.94MB，放得下。
-CONFIG_SR_NSN_NSNET2=y
+# 改回 WebRTC NS：它是**算法**不是模型，不需要 model 分区，配了就能真的生效。
+# 代码侧配套（afe_audio_processor.cc）：模型找不到时走 WebRTC 分支，不再静默关闭。
+#
+# 判据只能看开机日志的管线串（应出现 `|NS(WebRTC)|` 或类似字样）——
+# grep 产物二进制不算数：模型缺失时字符串照样在。
+#
+# 想关掉降噪做 A/B：把下面这行换成 `CONFIG_SR_NSN_NSNET2=y` 即可 ——
+# 本机没有 model 分区，NSNet2 加载不到，代码会走"无降噪"那一支。**不用改代码**。
+# （esp-sr 的 SR_NSN_MODEL_LOAD 是 choice，必选一项，所以"关"只能靠这个间接办法。）
+CONFIG_SR_NSN_WEBRTC=y
 # 业务后端地址（2026-10-18 起 IP 直连：域名未备案被厂商按 SNI 阻断，
 # 连 IP 不带 SNI 可绕过；服务端配 IP 证书后可开证书校验，见 Kconfig 帮助）
 CONFIG_ELDER_SERVER_URL="https://152.136.230.132"

@@ -5,6 +5,18 @@
 
 #define TAG "AfeAudioProcessor"
 
+/* 是否启用 WebRTC 降噪（算法，不需要 model 分区）。
+ *
+ * 开关直接用 esp-sr 自己的 choice（Kconfig.projbuild 的 SR_NSN_MODEL_LOAD），
+ * 这样"关降噪"只是模板里一行，不必改代码。两个符号都处理，代码在**两种
+ * 配置下都必须能编译** —— 否则 CI 只编到其中一支，另一支永远是没编过的
+ * 死代码（本仓踩过：写了不跑比没写更坏）。 */
+#ifdef CONFIG_SR_NSN_WEBRTC
+constexpr bool kWebrtcNs = true;
+#else
+constexpr bool kWebrtcNs = false;
+#endif
+
 AfeAudioProcessor::AfeAudioProcessor()
     : afe_data_(nullptr) {
     event_group_ = xEventGroupCreate();
@@ -49,11 +61,49 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
         afe_config->ns_init = true;
         afe_config->ns_model_name = ns_model_name;
         afe_config->afe_ns_mode = AFE_NS_MODE_NET;
+    } else if (kWebrtcNs) {
+        /* 2026-11-04：**本机永远走这一支**，因为分区表里没有 `model` 分区
+         * （partitions/v2/16m.csv 只有 nvs/otadata/phy_init/ota_0/ota_1/assets）。
+         * 没有模型列表 ⇒ `esp_srmodel_filter(models, ESP_NSNET_PREFIX, NULL)`
+         * 恒为 nullptr ⇒ 原来那句 `ns_init = false` 就是**唯一结局**。
+         *
+         * 后果：10-31 那次提交「降噪改用 NSNet2」**至今一帧降噪都没做**，
+         * 开机日志的管线串是铁证（NS 槽是空的）：
+         *   `[input] -> |AEC(SR_HIGH_PERF)| ->  -> |VAD(WebRTC)| -> |WakeNet(...)|`
+         * 而且它当时把模板从 SR_NSN_WEBRTC 改成了 SR_NSN_NSNET2，等于
+         * 把一个"不需要模型、本来能生效"的降噪换成了一个"永远加载不到"的。
+         *
+         * 现在改回 WebRTC NS：它是**算法**不是模型，不需要 model 分区。
+         * 开关仍是 esp-sr 自己的 choice（CONFIG_SR_NSN_WEBRTC / NSNET2），
+         * 想关掉降噪只改模板一行，不用碰代码。 */
+        static char kWebrtcNsName[] = "WEBRTC";   // esp-sr 约定的伪模型名
+        afe_config->ns_init = true;
+        afe_config->ns_model_name = kWebrtcNsName;
+        afe_config->afe_ns_mode = AFE_NS_MODE_WEBRTC;
     } else {
         afe_config->ns_init = false;
     }
 
-    afe_config->agc_init = false;
+    /* 2026-11-04：AGC 从「关」改成「开」。这是本轮唯一有实测证据支撑的改动。
+     *
+     * 证据（生产留证 wav `asr_empty_20261104-004208_bb05dae5.wav`，6.6 秒）：
+     *   峰值 0.036（-29 dBFS）、rms 0.0026；而正常说话峰值该在 -6~-12 dBFS。
+     *   同一时刻底噪只有 0.0003 ⇒ **SNR ≈ 37 dB，噪声根本不是问题，电平才是**。
+     * 表现：老人说「你刚才没有说内容吗？」，ASR 只返回「当当。你刚才没有说。」
+     *   —— 开头「当当」是上一句 TTS 的 AEC 残留，尾巴「内容吗」整段丢失。
+     *   轻声的句尾字在被压低 25 dB 的信号里，识别器直接当成了噪声。
+     *
+     * 为什么是 AGC 而不是单纯乘一个固定增益：固定增益会把近处说话推到削波，
+     * 而 AGC 对远场（轻声）多给、对近场（大声）少给 —— 正是"远距离也能识别"
+     * 需要的特性。目标电平取 -6 dBFS（不是 WebRTC 默认的 -3）留 6 dB 余量，
+     * 避免老人凑近说话时削顶（削顶对 ASR 的伤害比小声更大）。
+     *
+     * ⚠️ AGC 作用在 **AFE 输出（上行，ASR 听到的那一路）**，与播放通路
+     * 完全无关 —— 不违反"声音已正常、不许再修出破音/卡顿"的硬约束。 */
+    afe_config->agc_init = true;
+    afe_config->agc_mode = AFE_AGC_MODE_WEBRTC;
+    afe_config->agc_compression_gain_db = 9;
+    afe_config->agc_target_level_dbfs = 6;
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
 
 #ifdef CONFIG_USE_DEVICE_AEC

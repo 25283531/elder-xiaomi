@@ -108,6 +108,12 @@ TARGETS = {
     #    失败，整台设备起不来（不是某个功能没有），所以提交前必须先过这里。
     "application.cc": ROOT / "firmware" / "xiaozhi" / "main" / "application.cc",
     "audio_service.cc": ROOT / "firmware" / "xiaozhi" / "main" / "audio" / "audio_service.cc",
+    # 2026-11-04 加：AFE 配置（AGC / 降噪）就在这里。它编译失败的后果和
+    # application.cc 同级 —— 整机起不来（AFE 创建不出来就没有音频任务）。
+    # 而且这里的错误特别隐蔽：`afe_config->agc_xxx` 字段名写错、枚举类型
+    # 传错（afe_agc_mode_t / afe_ns_mode_t）都只在这一处报。
+    "afe_audio_processor.cc": ROOT / "firmware" / "xiaozhi" / "main" / "audio"
+                              / "processors" / "afe_audio_processor.cc",
 }
 
 #: 需要确保存在的宏（见坑 3）。
