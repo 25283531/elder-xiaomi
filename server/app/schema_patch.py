@@ -390,6 +390,21 @@ NEW_COLUMNS: Final[list[tuple[str, str, str, str]]] = [
     # ⚠️ 这一条漏登记 = 生产库永远没有这一列：本仓没有 Alembic，
     #    db.create_all() 只建**缺失的表**，绝不给已存在的表加列。
     ("reminders", "medicines", "TEXT DEFAULT '[]'", "JSON"),
+    # ---- reminders / reminder_events：时区偏差快照（2026-11-04）----
+    # 用户定下的存储口径：「服务端记录在数据库的时候记录为北京时间加上时区偏差」。
+    # 值是**相对北京时间的偏差分钟**（正 = 比北京早，如 Africa/Lagos = -420）。
+    #
+    # 两列都必须带 DEFAULT 0：老库补列后既有行读出 0，而 0 在语义上**不是**
+    # 歧义值 ——「规则就是北京时间」与「没有记录」都解析成 config.TZ，
+    # 与补列前逐字一致，因此升级本身不会改变任何一条提醒的响铃时刻。
+    # 漏 DEFAULT 的话老行读出 NULL ⇒ ReminderOut 的 ``int`` 直接校验失败，
+    # 后果是提醒列表与设备心跳一起 500（见本文开头的铁律）。
+    #
+    # ⚠️ 这两列**不参与**排期计算（``tz`` 才是权威解读方式），只在 ``tz``
+    #    不可用时兜底、以及给前端显示"比北京晚 7 小时"。所以补列不需要回填：
+    #    回填反而会去猜历史行的时区，猜错就把响铃时刻整体平移。
+    ("reminders", "tz_offset_min", "INTEGER DEFAULT 0", "INT NOT NULL DEFAULT 0"),
+    ("reminder_events", "tz_offset_min", "INTEGER DEFAULT 0", "INT NOT NULL DEFAULT 0"),
     # ---- devices：已配网设备「改 WiFi」（2026-10-30，契约见 _wifi-spec.md）----
     # 前四列都带 DEFAULT：存量设备补列后读出 0 / '' / '' / ''，语义正是
     # 「从未改过 WiFi」，不需要回填。**漏 DEFAULT 就会 NULL 炸序列化**，

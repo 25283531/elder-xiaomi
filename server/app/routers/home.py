@@ -179,7 +179,13 @@ def _medicine_today(db: Session, device_ids: list[int],
             if rid not in rule_zone:
                 continue
             zone = rule_zone[rid]
-            if event_instant(ev.due_at).astimezone(zone).date() != datetime.now(zone).date():
+            # ⚠️ 必须把 ev.tz 一起传进去。漏了它 event_instant 会按
+            # config.TZ（北京）补 tzinfo，把一条外国时区的规则算到另一个
+            # 绝对时刻上，再 astimezone(zone) 回来就跨了日界 ——
+            # 症状是「今天的服药记录里少了一次 / 多了一次」，而不是报错。
+            if event_instant(ev.due_at, ev.tz or "",
+                             int(ev.tz_offset_min or 0)).astimezone(zone).date() \
+                    != datetime.now(zone).date():
                 continue
             key = (rid, ev.due_at.strftime("%H:%M"))
             slot = slots.get(key)

@@ -119,19 +119,13 @@ def _reminder_tz(request, dev: models.Device, explicit: str = "") -> str:
     不返回非法值：``Reminder.tz`` 是客户端可控输入，落一条坏值会让排期线程
     在后台抛 ``ZoneInfoNotFoundError``，而那个异常被 ``run_forever`` 吞掉，
     表现是"这条规则永远不排期"。
+
+    ⚠️ **实现搬去了** ``geo.reminder_timezone``，这里只保留名字。原因是
+    ``routers/devices`` 的「设备时区」接口必须告诉家属"**实际**会按哪个时区
+    生效"，而它只能用与创建提醒**完全同一条**回落链 —— 两处各写一遍的后果是
+    "提示说北京、实际按纽约"，且两边的日志都正常（没有任何异常可看）。
     """
-    given = geo.valid_timezone(explicit)
-    if given:
-        return given
-    dev_tz = geo.device_timezone(dev)
-    if dev_tz:
-        return dev_tz
-    if request is not None:
-        try:
-            return geo.resolve_request(request).timezone
-        except Exception:  # noqa: BLE001
-            pass
-    return ""
+    return geo.reminder_timezone(request, dev, explicit)
 
 
 def _reject_once_without_date(payload: ReminderIn) -> None:
@@ -180,6 +174,10 @@ def create_reminder(device_pk: int, payload: ReminderIn, request: Request,
     dev = db.get(models.Device, device_pk)
     data = payload.model_dump()
     data["tz"] = _reminder_tz(request, dev, data.get("tz", ""))
+    # 与 tz **同一时刻**落的偏差快照（相对北京时间，分钟）。由服务端算：
+    # ``ReminderIn`` 里刻意没有这个字段，客户端传什么都不认 —— 它是 tz 的
+    # 派生结论，让客户端能设就是第二处真源。
+    data["tz_offset_min"] = geo.beijing_offset_min(data["tz"])
     r = models.Reminder(device_id=device_pk, creator_id=user.id, **data)
     db.add(r)
     # flush 而不是 commit：审计行要 reminder_id，而流水必须与业务变更
@@ -324,6 +322,12 @@ def update_reminder(reminder_pk: int, payload: ReminderIn, request: Request,
     # 因为"家属这次在另一个国家改了个标题"而漂移 —— 那会把老人已经习惯的
     # 服药时间整体平移。要改时区必须显式传。
     data["tz"] = geo.valid_timezone(data.get("tz", "")) or r.tz or ""
+    # tz 变了（或本来就是坏值被纠正了）就重算偏差快照。
+    # 只在 tz 真的变化时重算，避免"家属改了个标题"把换季后的偏差又刷一遍 ——
+    # 那本身无害，但会让流水里的 tz_offset_min 看起来"莫名其妙地跳了一下"。
+    new_tz = data["tz"]
+    if new_tz != (r.tz or ""):
+        data["tz_offset_min"] = geo.beijing_offset_min(new_tz)
     for k, v in data.items():
         setattr(r, k, v)
     # updated_at 是 **UTC** 类字段（不是 due_at 那种墙上时间）。

@@ -199,6 +199,50 @@ class DeviceOut(ORMBase):
     created_at: datetime
 
 
+class DeviceTimezoneOut(ORMBase):
+    """「这台设备现在按哪个时区」—— 新建提醒前给家属看的那一块。
+
+    背景（2026-11-04 用户需求）：家属手机在北美、设备在非洲、服务器在北京。
+    家属在手机上填"上午 8 点"，必须当场告诉他这句话会被**哪个钟**执行，
+    否则他会以为是北美的 8 点。响铃链路本来就按设备时区走
+    （``routers/reminders._reminder_tz``），缺的一直是**告知**。
+
+    ``hint`` 是**服务端拼好的整句**，前端只渲染、不许自己拼：网页
+    （``static/user.html``）与 APP（``uni-app``）是两套前端，同一句话各拼
+    一遍必然漂移 —— 本仓已经因为"清单/文案有两份真源"踩过一次（音色清单）。
+
+    ``ok=False`` 表示**判不出来**（设备从没上报过公网 IP / IP 是内网 /
+    查询无结果），此时 ``timezone`` 为空串、``hint`` 说明会退回哪一级兜底。
+    **判不出来不是错误**：设备在 NAT 后面、刚出厂还没联过网都会这样，
+    接口照常 200，只是文案不同 —— 把它做成 4xx 会让前端在正常场景下报错。
+    """
+
+    ok: bool = True
+    device_pk: int
+    #: IANA 名（``Africa/Lagos``）。空串 = 判不出来。
+    timezone: str = ""
+    #: 该时区相对 UTC 的偏移（分钟，东为正）。``Africa/Lagos`` = 60。
+    offset_minutes: int = 0
+    #: 相对**北京时间**的偏差（分钟，正 = 比北京早）。``Africa/Lagos`` = -420。
+    #: 与 ``Reminder.tz_offset_min`` 同一套口径，前端拿它把用户填的钟点
+    #: 换算成"相当于北京时间几点"。
+    offset_from_beijing_min: int = 0
+    #: 大洲中文名（``非洲``）。只用于展示，认不出是空串。
+    region: str = ""
+    #: 2 位国家码。判不出来是空串。
+    country: str = ""
+    #: 判定来源：``proxy`` / ``geoip`` / ``api`` / ``device`` / ``default`` / ``""``。
+    #: **必须如实返回** —— 链路静默退化时表现是"所有人都是北京时间"，
+    #: 与"配置全对"长得一模一样，没有它就只能靠猜。
+    source: str = ""
+    #: 该时区此刻的墙上时间（ISO 串，带偏移），给前端做"设备那边现在是几点"。
+    local_now: str = ""
+    #: 设备最后一次上报 IP 的时刻（UTC）。NULL = 从未上报。
+    last_seen_at: datetime | None = None
+    #: 服务端拼好的整句提示，前端直接渲染。
+    hint: str = ""
+
+
 class DeviceAgentIn(ORMBase):
     """给设备绑定一个 agent 角色（POST /api/devices/{pk}/agent）。
 
@@ -1260,6 +1304,12 @@ class ReminderOut(ReminderIn):
     created_at: datetime
     updated_at: datetime
     next_fire_at: datetime | None = None
+    #: 这条规则的钟点相对**北京时间**的偏差（分钟，正 = 比北京早）。
+    #: 只读派生值：**绝不能加进 ``ReminderIn``** —— 那样客户端就能伪造它，
+    #: 而它是 ``tz`` 的派生结论（服务端创建/修改时现算，见
+    #: ``routers/reminders.create_reminder``）。前端拿它只是为了显示
+    #: 「比北京晚 7 小时」，以及把用户填的钟点换算成"相当于北京几点"。
+    tz_offset_min: int = 0
     # ---- 软删除（2026-10-30）----
     # ⚠️ 这四个字段**只能加在 ReminderOut，绝不能加进 ReminderIn**：
     # ``ReminderIn.model_dump()`` 会被 router 直接展开成

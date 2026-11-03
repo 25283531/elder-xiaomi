@@ -649,6 +649,27 @@ class Reminder(Base):
     # 存量规则当初就是按北京时间创建的，把它标成北京时间才是如实记录）。
     tz: Mapped[str] = mapped_column(String(64), default="", server_default="")
 
+    # 这条规则的钟点相对**北京时间**的偏差（分钟，正 = 比北京早）。
+    # 例：``Africa/Lagos`` → ``-420``；``Asia/Shanghai`` → ``0``。
+    #
+    # 与 ``tz`` 的分工（**读之前先看这段，否则很容易变成两处真源**）：
+    #   * ``tz`` 是**权威**解读方式 —— 只要它是合法 IANA 名，排期/还原一律用它，
+    #     本列**不参与**任何计算；
+    #   * 本列是**快照**，只有两个用途：① 接口/管理端直接显示"比北京晚 7 小时"
+    #     （不必为了显示一句中文去查 tzdata）；② ``tz`` 不可用时（历史行被写坏、
+    #     或某天 tzdata 不再认识这个旧名）作为 ``schedule.event_instant`` 的
+    #     兜底，让它仍能还原成绝对时刻 —— 没有它就只能退回 ``config.TZ``，
+    #     那会整整差出一个时区。
+    #
+    # 为什么是"相对北京"而不是"相对 UTC"：用户定下的存储口径就是
+    # 「记录为北京时间加上时区偏差」。相对 UTC 的偏移在 ``tz`` 里已经能算出来，
+    # 存成相对北京才对得上那句话，也才让人一眼看出"这台设备比家里晚几小时"。
+    #
+    # 带 server_default 0：老库补列后既有行读出 0。0 在这里**不是**歧义值 ——
+    # 「北京时间」与「没有记录」都解析成 config.TZ，与改造前逐字一致。
+    tz_offset_min: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0")
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -716,6 +737,16 @@ class ReminderEvent(Base):
     # 为什么冗余一份而不是连表：序列化时要给 due_at 补偏移，而 Pydantic 的
     # field_serializer 拿不到关联对象；空串 = 历史数据 = config.TZ。
     tz: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # 这一实例的钟点相对**北京时间**的偏差（分钟，正 = 比北京早）。
+    #
+    # 与 ``Reminder.tz_offset_min`` 同一套语义，但**不是**复制规则的值：
+    # 这里记的是 ``due_at`` **那一个时刻**的偏差（``materialize_events`` 用
+    # ``beijing_offset_min(zone, due_at)`` 现算）。差别只在有夏令时的国家：
+    # 一条 08:00 的规则跨越换季时，前后两次实例的偏差会差 60 分钟，
+    # 而"这次提醒相当于北京几点"必须按**这次**算 —— 复制规则创建时的快照
+    # 会在换季后的半年里稳定偏一小时。
+    tz_offset_min: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0")
     fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

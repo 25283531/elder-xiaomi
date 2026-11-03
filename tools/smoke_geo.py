@@ -390,6 +390,17 @@ def _rule(**kw):
     return models.Reminder(**base)
 
 
+def _ev(due_at, tz: str = "", offset_min: int = 0):
+    """一条"从库里读回来"的实例：SQLite 不保留 tzinfo，due_at 是裸钟点。
+
+    刻意用真实 ``models.ReminderEvent`` 而不是 SimpleNamespace —— 后者不会
+    暴露"模型上没有这一列"这种错，而 ``event_due_utc`` 是用 ``getattr``
+    取 ``tz_offset_min`` 的，字段名写错时会静默取到默认值 0（永远绿）。
+    """
+    return models.ReminderEvent(reminder_id=1, device_id=1, due_at=due_at,
+                                tz=tz, tz_offset_min=offset_min)
+
+
 def t_schedule_tz() -> None:
     print("\n── F. 提醒按规则自身时区展开 ──")
     d = date(2026, 10, 22)
@@ -439,6 +450,80 @@ def t_schedule_tz() -> None:
     check("F9 北京规则在同一时刻之后的下一次是**当日** 08:00（当地次日 08:00 = UTC 00:00 次日）",
           nxt_bj is not None and nxt_bj.date() == date(2026, 10, 23),
           str(nxt_bj))
+
+    # ---- 时区偏差快照（2026-11-04：存储口径「北京时间 + 偏差」）----
+    #
+    # 这一组守的是**符号**。偏差写反了不会报错，只会让每一条外国规则
+    # 差出两倍时差（拉各斯本该晚 7 小时，写成 +420 就变成早 7 小时），
+    # 而"到点不响 / 半夜响"正是服药提醒最不能出的错。
+    check("F10 拉各斯相对北京偏差 -420（比北京晚 7 小时）",
+          geo.beijing_offset_min("Africa/Lagos") == -420,
+          str(geo.beijing_offset_min("Africa/Lagos")))
+    check("F11 北京自己偏差为 0",
+          geo.beijing_offset_min("Asia/Shanghai") == 0,
+          str(geo.beijing_offset_min("Asia/Shanghai")))
+    check("F12 空串按 config.TZ 算，偏差 0（**不是** -480）",
+          geo.beijing_offset_min("") == 0,
+          str(geo.beijing_offset_min("")))
+    check("F13 纽约夏令时期间偏差 -720（比北京晚 12 小时）",
+          geo.beijing_offset_min("America/New_York",
+                                 datetime(2026, 10, 22, 8, 0)) == -720,
+          str(geo.beijing_offset_min("America/New_York",
+                                     datetime(2026, 10, 22, 8, 0))))
+
+    # tz 名坏掉时用偏差兜底：这是 tz_offset_min 列**唯一**的运行时用途。
+    check("F14 tz 坏掉 + 偏差 -420 ⇒ 仍还原成 UTC 07:00",
+          schedule.event_instant(naive, "Bad/Zone", -420)
+          == datetime(2026, 10, 22, 7, 0, tzinfo=timezone.utc),
+          str(schedule.event_instant(naive, "Bad/Zone", -420)))
+    check("F15 tz 坏掉 + 偏差 0 ⇒ 退回北京（与改造前逐字一致）",
+          schedule.event_instant(naive, "Bad/Zone", 0)
+          == datetime(2026, 10, 22, 0, 0, tzinfo=timezone.utc),
+          str(schedule.event_instant(naive, "Bad/Zone", 0)))
+    check("F16 tz 名合法时偏差**完全不参与**（仍是纽约 12:00）",
+          schedule.event_instant(naive, "America/New_York", -420)
+          == datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc),
+          str(schedule.event_instant(naive, "America/New_York", -420)))
+    check("F17 event_due_utc 真的读了 tz_offset_min（不是只看 tz）",
+          schedule.event_due_utc(_ev(naive, "Bad/Zone", -420))
+          == datetime(2026, 10, 22, 7, 0, tzinfo=timezone.utc),
+          str(schedule.event_due_utc(_ev(naive, "Bad/Zone", -420))))
+
+    # 展示文案：大洲 + 偏差。**服务端唯一真源**，两套前端只渲染不拼。
+    check("F18 region_of 认得出大洲", geo.region_of("Africa/Lagos") == "非洲",
+          geo.region_of("Africa/Lagos"))
+    check("F19 region_of 认不出时返回空串（不猜）",
+          geo.region_of("Bad/Zone") == "", geo.region_of("Bad/Zone"))
+    check("F20 offset_text 处理半小时时区",
+          geo.offset_text(330) == "UTC+5:30", geo.offset_text(330))
+    _hint = geo.tz_hint("Africa/Lagos")
+    check("F21 tz_hint 同时给出大洲、IANA 名与偏差",
+          "非洲" in _hint and "Africa/Lagos" in _hint and "晚 7 小时" in _hint,
+          _hint)
+    check("F22 北京规则的 tz_hint 说「相同」而不是「晚 0 小时」",
+          "与北京时间相同" in geo.tz_hint("Asia/Shanghai"),
+          geo.tz_hint("Asia/Shanghai"))
+
+    # ---- 「判不出设备时区」时的提示必须说**真实**的回落目标 ----
+    #
+    # 创建提醒的真实回落链是「设备时区 → **创建者时区** → config.TZ」
+    # （geo.reminder_timezone）。家属在北美用手机建提醒、设备判不出来时，
+    # 落库的是北美时区 —— 提示若写死 config.TZ 就是在骗人，而这条提示
+    # 恰恰只在"人不在国内"时才有意义。
+    from app.routers.devices import build_device_timezone  # 延迟导入：只这一段要用
+
+    _noip = models.Device(id=9901, device_id="tznone", name="无 IP", ip="")
+    _saved_rt = geo.reminder_timezone
+    try:
+        geo.reminder_timezone = lambda *a, **k: "America/New_York"
+        _o = build_device_timezone(_noip, object())
+        check("F23 判不出时 ok=False（不是抛异常）", _o.ok is False)
+        check("F24 判不出时提示说的是**创建者**时区，不是写死 config.TZ",
+              "America/New_York" in _o.hint, _o.hint)
+        check("F25 判不出时不谎称按北京时间",
+              "Asia/Shanghai" not in _o.hint, _o.hint)
+    finally:
+        geo.reminder_timezone = _saved_rt
 
 
 # ============================================================ G. 真实 HTTP
