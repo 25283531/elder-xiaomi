@@ -10,6 +10,8 @@
     python tools/gh_api.py runs                       # 最近 10 次工作流运行
     python tools/gh_api.py watch <run_id>             # 跟踪一次运行直到结束
     python tools/gh_api.py log  <run_id>              # 下载并打印失败作业日志
+    python tools/gh_api.py artifacts <run_id>         # 列出该次运行的产物
+    python tools/gh_api.py artifact  <run_id> <name> <outdir>   # 下载并解压
 
 GH_TOKEN 从环境变量读取，或放 %TEMP%\\gh_token.txt。
 """
@@ -22,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 
 OWNER = "25283531"
 REPO = "voice-avatar-box"
@@ -152,6 +155,65 @@ def cmd_log(args):
         print(out)
 
 
+def cmd_artifacts(args):
+    """列一次运行的全部产物（id / 大小 / 名字 / 是否过期）。
+
+    为什么要看 ``expired``：GitHub 的 artifact 默认只留 90 天，过期后下载接口
+    返回 410 而不是 404 —— 直接下会拿到一段 JSON 当 zip，解压才报错。
+    先列一眼比事后猜"为什么下载的文件坏了"省事。
+    """
+    run_id = args[0]
+    d = api(f"{API}/actions/runs/{run_id}/artifacts?per_page=100")
+    arts = d.get("artifacts", [])
+    if not arts:
+        print("该 run 没有产物")
+        return
+    for a in arts:
+        mb = a["size_in_bytes"] / 1048576
+        print(f"{a['id']:<14} {mb:>8.2f}MB  expired={str(a['expired']):<5}  {a['name']}")
+
+
+def cmd_artifact(args):
+    """下载并解压一个产物。用法：artifact <run_id> <name> <outdir>"""
+    run_id, name, outdir = args[0], args[1], args[2]
+    d = api(f"{API}/actions/runs/{run_id}/artifacts?per_page=100")
+    hit = [a for a in d.get("artifacts", []) if a["name"] == name]
+    if not hit:
+        have = ", ".join(a["name"] for a in d.get("artifacts", [])) or "(无)"
+        raise SystemExit(f"run {run_id} 没有名为 {name} 的产物；现有：{have}")
+    art = hit[0]
+    if art.get("expired"):
+        raise SystemExit(f"产物 {name} 已过期（GitHub 默认只留 90 天）")
+
+    os.makedirs(outdir, exist_ok=True)
+    zpath = os.path.join(outdir, name + ".zip")
+    # ⚠️ 下载接口返回 302 指向对象存储，必须 -L；且**不能**带
+    #    Accept: application/vnd.github+json（那会让它回 JSON 元数据而不是 zip）。
+    r = subprocess.run([
+        "curl", "-sSL", "--http1.1", "-m", "900",
+        "-H", f"Authorization: Bearer {TOKEN}",
+        "-o", zpath,
+        f"https://api.github.com{API}/actions/artifacts/{art['id']}/zip",
+    ], capture_output=True)
+    if r.returncode != 0:
+        raise SystemExit(f"下载失败 rc={r.returncode} {r.stderr.decode('utf-8', 'replace')[:200]}")
+    # 鉴权失败 / 过期时返回的是 JSON 而不是 zip —— 必须先验，否则 extractall
+    # 只会抛一句看不懂的 BadZipFile。
+    if not zipfile.is_zipfile(zpath):
+        head = open(zpath, "rb").read(300).decode("utf-8", "replace")
+        raise SystemExit(f"下载到的不是 zip（多半是鉴权失败或产物过期）：{head}")
+
+    with zipfile.ZipFile(zpath) as z:
+        z.extractall(outdir)
+    os.unlink(zpath)
+
+    print(f"已解压到 {os.path.abspath(outdir)}：")
+    for root, _dirs, files in os.walk(outdir):
+        for f in sorted(files):
+            p = os.path.join(root, f)
+            print(f"  {os.path.getsize(p):>12d}  {os.path.relpath(p, outdir)}")
+
+
 def main():
     a = sys.argv[1:]
     if not a:
@@ -168,6 +230,10 @@ def main():
         cmd_watch(rest)
     elif cmd == "log":
         cmd_log(rest)
+    elif cmd == "artifacts":
+        cmd_artifacts(rest)
+    elif cmd == "artifact":
+        cmd_artifact(rest)
     else:
         raise SystemExit(__doc__)
 
