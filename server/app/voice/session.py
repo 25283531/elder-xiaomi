@@ -357,19 +357,38 @@ _REMINDER_TOOLS: Final[frozenset[str]] = frozenset(
 #:     复核提示、把 ``enter_standby`` 工具放开给它 —— 由模型结合上下文判。
 #:
 #: 分档模式由 ``config.VOICE_DISMISS_LLM_VERIFY`` 控制（weak/all/off）。
+#:
+#: ⚠️ 2026-11-03 用户实报「他已经说了先不聊了，还是频繁在说抱歉我没听清」：
+#: 「不聊了」「晚安」「我睡了」原先都在**弱档** ⇒ 只置 ``_dismiss_candidate``、
+#: 交模型复核；模型若不调 ``enter_standby``（默认 ``VOICE_DISMISS_LLM_VERIFY
+#: = "weak"`` 时它本来就没被要求调），本轮什么都不会发生 ⇒ 老人被反复念
+#: 「我没听清」，而他刚刚明确说过不想聊了。**这是打脸，不是没听清。**
+#: ⇒ 这些语义上**只可能是"结束会话"**的说法升到强档直判：说完立刻待机，
+#:   不再赌一次模型往返。
+#:
+#: 判据怎么划：强档 = 离开当前对话语境就不成立的话（"退下""不聊了""晚安"
+#: "我睡了"）；弱档 = 在正常陪聊里也常出现的话（"不用了""没事了""停一下"
+#: "再见""安静""小点声"）—— 那些继续交模型看上下文。
+#: 同一句**只能出现在一档**：``_dismiss_tier`` 先强后弱，重复虽不出错，
+#: 但会让人误以为两档都在管它，日后改一档忘了另一档。
 _DISMISS_STRONG_RE: Final[re.Pattern[str]] = re.compile(
     r"退下|下去吧|一边去|待机|待命|进入待机|"
     r"闭嘴|静音|别出声|不出声|"
-    r"让我安静|让我清静|我想静静")
+    r"让我安静|让我清静|我想静静|"
+    # ---- 明确的结束语（2026-11-03 从弱档升上来，见上面的实报）----
+    r"不聊|别聊|不用聊|聊到这儿|聊到这|"
+    r"不说了|别说了|不用说了|不要再说了|"
+    r"晚安|睡吧|我睡了|我要睡了|要睡了|该睡了|去睡了")
 #: 弱判据。刻意**不收**「好了/行了/知道了/好/嗯」这类通用应答 ——
 #: 它们几乎每轮都会出现，命中即调一次复核，纯属白烧 token 和首句时延。
 _DISMISS_WEAK_RE: Final[re.Pattern[str]] = re.compile(
     r"走开|走吧|你走|出去|走了|我走了|要出门|"
     r"休息吧|去休息|你休息|歇着吧|歇会儿|歇一会|"
-    r"睡吧|睡觉吧|我睡了|我要睡了|要睡了|该睡了|去睡了|困了|"
-    r"不聊|别聊|不用聊|聊到这儿|聊到这|先这样吧|就这样吧|到此为止|"
-    r"不说了|别说了|不用说了|不要再说了|别讲了|别念了|别吵了|别嚷嚷|"
-    r"小点声|安静|再见|拜拜|晚安|"
+    # 「睡觉吧」「困了」留在弱档：「我有点困了」常常只是陈述，不是逐客令。
+    r"睡觉吧|困了|"
+    r"先这样吧|就这样吧|到此为止|"
+    r"别讲了|别念了|别吵了|别嚷嚷|"
+    r"小点声|安静|再见|拜拜|"
     r"你忙|不用管我|别管我|"
     r"不用了|没事了|别放了|停一下|停止播放")
 
@@ -380,6 +399,26 @@ _DISMISS_RE: Final[re.Pattern[str]] = re.compile(
 #: 服务端侧待机工具名。与设备 MCP 的 ``self.elder.standby`` 是两回事：
 #: 这个是给**大模型**调的（判意图），那个是**下发给固件**的（真停麦）。
 _STANDBY_TOOL_NAME: Final[str] = "enter_standby"
+
+#: 连续空识别的待机阈值（2026-11-03 用户实报「说了先不聊了还在频繁说抱歉
+#: 我没听清」）。
+#:
+#: 为什么是 3，而不是 1 或 2：
+#:   * 1 次就待机太狠 —— 老人**确实**可能只说了一半、被环境声盖掉、或者
+#:     说话前先清了清嗓子。第一次照旧念 ``EMPTY_UTTERANCE_REPLY`` 给他一个
+#:     "我在这儿，你再说一遍"的机会，这是产品该有的礼貌；
+#:   * 2 次仍不待机：realtime 模式下设备播报完就回 listening，中间那点
+#:     回声残留很容易再送一次空 ASR，2 次就待机等于"偶尔一次真没听清就被
+#:     关掉"；
+#:   * 3 次时，"连续三次都没认出任何字"已经不是 ASR 的偶然失手，而是
+#:     麦克风前面**没有人想说话**（老人走了 / 已经不想聊了 / 只是房间噪声）。
+#:     此时继续念"我没听清"就是对着空气自言自语 —— 老人听到的是"设备坏了"。
+#:     待机是唯一能真正结束这件事的动作（设备回 Idle 并重新打开唤醒词）。
+#:
+#: 计数只在**有效识别**时清零（见 ``_run_turn`` 里 ``_last_active_at`` 那行），
+#: 重新武装监听时也清零（见 ``_rearm_listening``）—— 否则一次待机冷却之后
+#: 计数还停在 3，下一句话刚开口就被判待机。
+_EMPTY_ASR_STANDBY_STREAK: Final[int] = 3
 
 
 def _dismiss_tier(utterance: str) -> str:
@@ -945,6 +984,12 @@ class VoiceSession:
         # 到期后由 idle 态收到音频的那条兜底自动恢复。
         self._dismissed_until: float = 0.0
 
+        # ---- 连续空识别计数（2026-11-03 用户实报）----
+        # "老人已经说了不想聊，设备还在反复念『抱歉，我没听清』"的根因就是
+        # 这个数字不存在：每一次空 ASR 都被当成**第一次**，于是永远念同一句。
+        # 语义与清零时机见 ``_EMPTY_ASR_STANDBY_STREAK`` 的注释。
+        self._empty_asr_streak: int = 0
+
         # ---- 「结束对话」意图复核（2026-10-22 用户需求）----
         # 本轮命中了待机关键词、且走"交大模型复核"那条路时为非空（档位名）。
         # 生命周期只在**一轮**之内：
@@ -1279,8 +1324,24 @@ class VoiceSession:
             # 连续对话会话里，设备还在推流但服务端已回 idle —— 就是
             # _rearm_listening 注释里那个死锁。设备以为我们在听，我们
             # 以为会话结束了。⇒ 把上行音频当作设备重新宣布 listening。
-            log.info("[%s] idle 态仍收到上行音频，按连续对话重新武装监听",
-                     self.session_id)
+            #
+            # ⚠️ 2026-11-03 **刻意保留**这条自动恢复（没有改成"只认 listen
+            # start / 真实人声才重新武装"）：待机那次 ``self.elder.standby``
+            # 是 3 秒超时的 best-effort，失败只 log（见 _enter_standby）——
+            # 那时设备仍停在 realtime listening 且**不会重发 listen start**。
+            # 若这里也不自动恢复，老人怎么喊都没人应（曾实测聋 164 秒），
+            # 那个代价远大于"冷却过后多念一句没听清"。
+            # 所以取折中：冷却刚过时清零连续空识别计数并打日志，让下一次
+            # 空识别从"第 1 次"重新开始，而不是直接跳到第 3 次待机。
+            if self._dismissed_until:
+                log.info("[%s] 待机冷却已过，上行音频重新武装监听"
+                         "（state=%s，连续空识别计数清零）",
+                         self.session_id, self.state)
+                # 归零 = 标记"这次冷却已经消费掉"，后面的帧不再重复打日志。
+                self._dismissed_until = 0.0
+            else:
+                log.info("[%s] idle 态仍收到上行音频，按连续对话重新武装监听",
+                         self.session_id)
             self._rearm_listening()
         if self.state == "speaking" and self._continuous():
             # 全双工打断（F2）：realtime 模式设备播报时仍在推流（AEC 已把
@@ -1809,6 +1870,13 @@ class VoiceSession:
           2. 服务端在 idle 态收到上行音频时，自动按连续对话重新武装
              （本函数，覆盖固件不发消息的路径，如 ASR 失败后的 alert）。
         """
+        # 重新武装 = 新的一场收听：连续空识别清零。
+        # 不清零的话，一次待机冷却之后计数还停在阈值上 —— 老人刚开口说
+        # 第一句、恰好被 ASR 判空，就立刻被判"连续多次为空"再待机一次。
+        if self._empty_asr_streak:
+            log.info("[%s] 重新武装监听（原 state=%s），连续空识别计数 %d → 0",
+                     self.session_id, self.state, self._empty_asr_streak)
+        self._empty_asr_streak = 0
         if self._barge_handover:
             # 全双工打断（F2）的交接保护：这次 rearm 不是"新的一轮"，
             # 而是被我们自己的 abort 掐断的那一轮的延续。链条：
@@ -1846,6 +1914,65 @@ class VoiceSession:
         if self._watchdog_task is not None and not self._watchdog_task.done():
             self._watchdog_task.cancel()
         self._watchdog_task = asyncio.create_task(self._silence_watchdog())
+
+    # ------------------------------------------------ 空识别（2026-11-03）
+    def _empty_asr_action(self) -> str:
+        """决定这次空识别该做什么，并推进计数。
+
+        返回四种动作之一（空串 = 什么都不做）：
+
+          * ``""``        —— **不出声、不计数**。用于"老人已经表示不聊了"的
+            两种状态：冷却期内（``_dismissed_until`` 未过期）或服务端已
+            ``idle``。此刻任何"我没听清"都是在打脸：他刚说过不想聊。
+            也正因为不计数，冷却结束后重新开口不会被前账拖累。
+          * ``"speak"``   —— 连续第 1 次：照旧念 ``EMPTY_UTTERANCE_REPLY``。
+            老人确实可能只说了一半、或者被环境声盖掉了。
+          * ``"silent"``  —— 连续第 2 次：只记日志，静默等他自己再说。
+            再念一遍"您能再说一遍吗"就开始有"自言自语"的观感了。
+          * ``"standby"`` —— 连续第 N 次（``_EMPTY_ASR_STANDBY_STREAK``）：
+            会话真的结束（设备回 Idle、重新打开唤醒词）。阈值为什么是 3
+            见该常量的注释。
+
+        单独抽成**纯判定**（不 await、不发包）是为了能被冒烟脚本直接断言：
+        真机验证这条链路要说十几句话，成本高到没人会去做。
+        """
+        if self.state == "idle":
+            # 已待机（可能是 _enter_standby 之后设备仍在推流）：一律不出声。
+            log.info("[%s] 已待机态收到空识别，保持安静", self.session_id)
+            return ""
+        if self._dismissed_until and time.monotonic() < self._dismissed_until:
+            # 冷却期内的空识别理论上走不到这里（_on_binary 已丢弃上行音频），
+            # 但 listen stop / 看门狗兜底仍可能起一轮 —— 这里必须再挡一次，
+            # 否则「说了不聊 → 冷却中又念一句没听清」照样会发生。
+            log.info("[%s] 待机冷却中（还剩 %.0fs）收到空识别，保持安静",
+                     self.session_id, self._dismissed_until - time.monotonic())
+            return ""
+        self._empty_asr_streak += 1
+        if self._empty_asr_streak >= _EMPTY_ASR_STANDBY_STREAK:
+            return "standby"
+        if self._empty_asr_streak == 1:
+            return "speak"
+        return "silent"
+
+    async def _handle_empty_asr(self, started: float) -> None:
+        """执行 :meth:`_empty_asr_action` 的决定（唯一出口，便于断言）。"""
+        action = self._empty_asr_action()
+        if not action:
+            return
+        if action == "standby":
+            log.info("[%s] 连续 %d 次识别为空（阈值 %d），会话到此为止 → 待机",
+                     self.session_id, self._empty_asr_streak,
+                     _EMPTY_ASR_STANDBY_STREAK)
+            # farewell 留空：老人没在等告别，静默回 Idle 比"我先休息了"更不打扰。
+            await self._enter_standby("连续多次识别为空", farewell="")
+            return
+        if action == "speak":
+            log.info("[%s] 识别结果为空（连续第 %d 次），念固定回复",
+                     self.session_id, self._empty_asr_streak)
+            await self._speak_reply(EMPTY_UTTERANCE_REPLY, started)
+            return
+        log.info("[%s] 识别结果为空（连续第 %d 次），保持安静等老人再开口",
+                 self.session_id, self._empty_asr_streak)
 
     async def _enter_standby(self, reason: str, farewell: str = "") -> None:
         """让设备真正进入待机：念完（可选的）告别语 → 固件切 idle。
@@ -2280,9 +2407,14 @@ class VoiceSession:
 
         if not utterance:
             # ASR 没认出东西：不调 LLM（让模型根据空文本编一句只会产出
-            # 更空的客套，且白花一次配额与 token），直接念固定回复。
-            log.info("[%s] 识别结果为空", self.session_id)
-            await self._speak_reply(EMPTY_UTTERANCE_REPLY, started)
+            # 更空的客套，且白花一次配额与 token）。
+            #
+            # ⚠️ 2026-11-03 用户实报「他已经说了先不聊了，还是频繁在说
+            # 抱歉我没听清」—— 这里原先**无条件**念一句固定回复，于是
+            # 「服务端念没听清 → 设备回 Listening → 再空 ASR → 再念」这个
+            # 环一旦启动就永不停止（设备端 listening 态没有超时，也不跑
+            # 唤醒词）。处置全部收进 _handle_empty_asr，判据与理由见那里。
+            await self._handle_empty_asr(started)
             return ""
 
         # ---- 「结束对话」意图（2026-10-22 改：关键词 → 分档 → 必要时大模型复核）----
@@ -2311,6 +2443,9 @@ class VoiceSession:
         # 放在 dismiss 判据**之后**：老人说"退下吧"不该把空闲计时器续期，
         # 那一刻会话已经结束了。放在 ASR 空结果之后同理（空识别不是内容）。
         self._last_active_at = time.monotonic()
+        # 认出了真内容 ⇒ 连续空识别归零。不清零的话计数会跨轮累计：
+        # 老人早上空过两次、下午随便说一句，第三次空识别就把他直接待机了。
+        self._empty_asr_streak = 0
 
         # ---- 屏上是否正挂着待确认的服药提醒（清单，可能多条）----
         # 两个用途：① 注入 system 让模型知道该调 confirm_reminder、还剩哪味要问；
