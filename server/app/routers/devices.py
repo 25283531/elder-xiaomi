@@ -170,6 +170,7 @@ def build_device_timezone(dev: models.Device,
         source=guess.source,
         local_now=datetime.now(zone).isoformat(timespec="seconds"),
         hint=geo.tz_hint(name),
+        short=geo.tz_short(name),
         **base,
     )
 

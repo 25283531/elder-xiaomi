@@ -504,6 +504,25 @@ def t_schedule_tz() -> None:
           "与北京时间相同" in geo.tz_hint("Asia/Shanghai"),
           geo.tz_hint("Asia/Shanghai"))
 
+    # ---- 短版（表格单元格用）----
+    #
+    # 为什么要单独断言 short、而不是"内容相等"顺带过：它是**另一条下游契约**。
+    # 「我的设备」表和管理端设备表直接渲染这一格，它一旦退化成整句
+    # （「设备最后一次所在地是 …」），表现不是报错而是**表格行高被撑成三行**，
+    # 而 CI 全绿。这与 MEMORY 第 17 条同一个道理：契约属性必须单独断言。
+    _short = geo.tz_short("Africa/Lagos")
+    check("F26 tz_short 给出大洲、偏移与相对北京（一行放得下）",
+          "非洲" in _short and "UTC+1" in _short and "晚北京 7h" in _short,
+          _short)
+    check("F27 tz_short 不是整句（不许把 tz_hint 的句式漏进表格）",
+          "设备最后一次所在地" not in _short and len(_short) <= 40,
+          _short)
+    check("F28 北京规则的 tz_short 说「与北京同时」",
+          "与北京同时" in geo.tz_short("Asia/Shanghai"),
+          geo.tz_short("Asia/Shanghai"))
+    check("F29 tz_short 认不出时区名时返回空串（不猜、不留半句）",
+          geo.tz_short("Bad/Zone") == "", geo.tz_short("Bad/Zone"))
+
     # ---- 「判不出设备时区」时的提示必须说**真实**的回落目标 ----
     #
     # 创建提醒的真实回落链是「设备时区 → **创建者时区** → config.TZ」
@@ -522,8 +541,33 @@ def t_schedule_tz() -> None:
               "America/New_York" in _o.hint, _o.hint)
         check("F25 判不出时不谎称按北京时间",
               "Asia/Shanghai" not in _o.hint, _o.hint)
+        # 判不出的分支 short 必须是空串 —— 前端靠它区分「判不出」（显示
+        # 「判不出」+ 兜底说明）和「还在查」（显示「…」）。留成整句会骗人。
+        check("F30 判不出时 short 是空串",
+              _o.short == "", repr(_o.short))
     finally:
         geo.reminder_timezone = _saved_rt
+
+    # ---- 判得出那一支：short 必须**真的被赋值** ----
+    #
+    # 接口加字段最典型的失误就是漏了某个分支的赋值：pydantic 给了默认值 ""，
+    # 于是接口 200、字段存在、测试全绿，前端却永远显示「判不出」。
+    # 所以这里必须断言「非空」，而不是断言"字段存在"。
+    _saved_guess = geo.device_guess
+    try:
+        geo.device_guess = lambda dev: geo.Guess(
+            timezone="Africa/Lagos", offset_minutes=60,
+            country="NG", source="geoip", ip="197.1.2.3")
+        _o2 = build_device_timezone(_noip, object())
+        check("F31 判得出时 ok=True 且 short 非空",
+              _o2.ok is True and bool(_o2.short),
+              f"ok={_o2.ok} short={_o2.short!r}")
+        check("F32 short 与 hint 同源（同一支分支、同一套 region/偏差口径）",
+              "非洲" in _o2.short and "晚北京 7h" in _o2.short
+              and "非洲" in _o2.hint and "晚 7 小时" in _o2.hint,
+              f"short={_o2.short!r} hint={_o2.hint!r}")
+    finally:
+        geo.device_guess = _saved_guess
 
 
 # ============================================================ G. 真实 HTTP

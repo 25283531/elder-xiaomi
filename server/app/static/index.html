@@ -253,7 +253,7 @@
         <table v-if="shownDevices.length">
           <thead><tr>
             <th>名称</th><th>设备标识</th><th>硬件型号</th><th>类型</th><th>拥有者</th>
-            <th>接入时间</th><th>系统版本</th><th>状态</th>
+            <th>接入时间</th><th>系统版本</th><th>时区</th><th>状态</th>
             <th class="num">token 用量</th><th>操作</th>
           </tr></thead>
           <tbody>
@@ -268,6 +268,19 @@
               <td>{{ownerName(d)}}</td>
               <td class="muted">{{fmt(d.created_at)}}</td>
               <td class="muted">{{d.fw_version||'未上报'}}</td>
+              <!-- 设备时区（2026-11-04 用户要求）。管理员排障最常误判的一件事：
+                   「8 点没响」其实响了，只是按**设备所在地**的钟响的 ——
+                   家属在北美说 8 点、设备在拉各斯，那 8 点等于北京时间 15:00。
+                   文案全部来自服务端（short 短版给这一格、hint 整句挂 title），
+                   前端一个字都不拼（网页与 APP 各拼一遍必然漂移）。
+                   ok=false（判不出来）时 short 是空串 → 显示「判不出」并挂原因，
+                   **不标红**：设备在 NAT 后面、刚出厂没联过网都会这样。 -->
+              <td class="muted" style="font-size:12px"
+                  :title="(devTzMap[d.id]||{}).hint||''">
+                <template v-if="devTzMap[d.id] && devTzMap[d.id].short">{{devTzMap[d.id].short}}</template>
+                <template v-else-if="devTzMap[d.id]">判不出</template>
+                <span v-else class="muted">…</span>
+              </td>
               <td><span class="tag" :class="d.online?'ok':''">{{d.online?'在线':'离线'}}</span></td>
               <td class="num">
                 <span v-if="devTokens(d.id)">{{devTokens(d.id).toLocaleString()}}</span>
@@ -359,7 +372,7 @@
           这样他们能看到自己刚改了什么。
         </p>
         <table v-if="shownReminders.length">
-          <thead><tr><th>标题</th><th>类型</th><th>时间</th><th>重复</th><th>确认</th><th>状态</th><th>操作</th></tr></thead>
+          <thead><tr><th>标题</th><th>类型</th><th title="提醒按设备所在时区的钟点响铃。管理员在别的时区看这一列会差几个小时，不是数据错">时间（设备时区）</th><th>重复</th><th>确认</th><th>状态</th><th>操作</th></tr></thead>
           <tbody>
             <tr v-for="r in shownReminders" :key="r.id">
               <td>
@@ -369,6 +382,13 @@
                 <div class="muted" style="font-size:12px" v-if="medText(r)">{{medText(r)}}</div>
                 <div class="muted" style="font-size:12px">下次：{{fmt(r.next_fire_at)}}</div>
                 <div class="muted" style="font-size:12px">设备：{{deviceName(r.device_id)}}</div>
+                <!-- 这台设备的时区。放在「设备」下一行而不是单独一列：
+                     提醒表的列已经 7 个，再加一列会把「时间」挤到换行。
+                     时区文案由服务端拼（devTzMap[...].short），前端不拼。 -->
+                <div class="muted" style="font-size:12px"
+                     :title="(devTzMap[r.device_id]||{}).hint||''">
+                  时区：{{(devTzMap[r.device_id]||{}).short || ((devTzMap[r.device_id]||{}).hint ? '判不出' : '…')}}
+                </div>
               </td>
               <td>{{typeName(r.rtype)}}</td>
               <td>{{(r.times_of_day||[]).join(' ')}}</td>
@@ -1554,6 +1574,10 @@ createApp({
       // 设备页的只读态：搜索框 + 每台设备的 token 用量。
       // 用量按设备逐台取（见 loadDeviceTokens 的注释），故与 devices 分开存。
       devFilter: '', devBusy: false, devUsageBusy: false, devTokensById: {},
+      // 每台设备按哪个时区（GET /api/devices/{pk}/timezone），按设备 id 缓存。
+      // 缺键 = 还没查到 / 查失败（那一格显示「…」或「判不出」）。
+      // 与 devTokensById 同样按设备逐台取，理由见 loadDevTzAll 的注释。
+      devTzMap: {},
       ownerNames: {},
       // 提醒页筛选（管理员跨用户排查用）。remDeviceFilter 传后端过滤，
       // remUserFilter 是前端过滤 —— 后端 reminders 列表不返回 creator 的用户名，
@@ -1983,8 +2007,36 @@ createApp({
         this.devices = r;
         if (this.curDeviceId && !r.some(d => d.id === this.curDeviceId)) this.curDeviceId = null;
         if (!this.curDeviceId && r.length) this.curDeviceId = r[0].id;
+        // 时区是**增强信息**，与 token 用量并列逐台补，都不阻塞设备表本身。
+        // 不 await：一个时区接口慢不该让整张设备表停在"正在读取设备列表…"。
+        this.loadDevTzAll();
         await this.loadDeviceTokens();
       }finally{ this.devBusy = false; }
+    },
+    // 逐台补「设备按哪个时区」（GET /api/devices/{pk}/timezone）。
+    //
+    // 管理员为什么也要看：排障时最常见的误判是「提醒没响」——
+    // 其实响了，只是按**设备所在地**的钟响的。家属报"8 点没响"、
+    // 而设备在拉各斯，那 8 点其实是北京时间 15:00。没有这一列，
+    // 管理员只能去猜、或者手工翻设备的 IP 再查时区。
+    //
+    // 串行 + 已缓存不重取：设备本来就少，并发省不了多少，反而在弱网下
+    // 同时压多个请求更容易整页卡住。单台失败只让那一格留空。
+    async loadDevTzFor(id, force){
+      if (!id) return null;
+      if (!force && this.devTzMap[id]) return this.devTzMap[id];
+      try{
+        const t = await this.api('/api/devices/'+id+'/timezone');
+        if (t) this.devTzMap[id] = t;      // Vue 3 Proxy 响应式，直接赋值即可
+        return t || null;
+      }catch(e){
+        return null;
+      }
+    },
+    async loadDevTzAll(){
+      for (const d of this.devices){
+        if (!this.devTzMap[d.id]) await this.loadDevTzFor(d.id);
+      }
     },
     // 管理员代解绑（POST /api/devices/{pk}/unbind，仅管理员，204 无响应体）。
     //

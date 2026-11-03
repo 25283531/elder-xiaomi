@@ -150,6 +150,34 @@ def main() -> int:
         dev_pk = (bind or {}).get("device_pk")
         check("绑定拿到 device_token", code == 200 and bool(dev_token), f"HTTP {code}")
 
+        # ---------------------------------------------- 2b. 设备时区接口
+        # 网页端与 APP 的「设备时区」都只读这一个接口（GET /api/devices/{pk}/timezone），
+        # 前端一个字都不自己拼。所以这里必须验**序列化出来的形状**，而不只是
+        # "函数算得对" —— 字段漏进 DeviceTimezoneOut 是最典型的失误：
+        # 函数是对的、单测全绿，接口却少一个 key，前端那一格永远是空的。
+        #
+        # 本脚本里的设备没有公网 IP（ip=""），所以多半走「判不出」那一支。
+        # 判得出那一支的内容断言在 tools/smoke_geo.py 的 F31/F32（用注入的
+        # device_guess 造，不依赖外网），两边分工，不重复也不留缺口。
+        code, tz = req("GET", f"/api/devices/{dev_pk}/timezone", None, tok)
+        check("设备时区接口 200", code == 200, f"HTTP {code}")
+        _missing = [k for k in ("ok", "timezone", "offset_from_beijing_min",
+                                "region", "source", "hint", "short")
+                    if k not in (tz or {})]
+        check("设备时区接口字段齐备（含 short）", not _missing,
+              "缺 " + ",".join(_missing) if _missing else json.dumps(tz, ensure_ascii=False)[:160])
+        check("short 是字符串（不是 null / 数字）",
+              isinstance((tz or {}).get("short"), str), repr((tz or {}).get("short")))
+        # 契约：判得出 ⇒ short 非空（前端靠它渲染那一格）；判不出 ⇒ short 空
+        # 且 hint 非空（前端显示「判不出」+ 说明会退回哪一级兜底）。
+        # 两种情形都必须让前端有东西可显示，不能两个都空。
+        if (tz or {}).get("ok"):
+            check("判得出时 short 非空", bool((tz or {}).get("short")), repr(tz.get("short")))
+        else:
+            check("判不出时 short 为空串且 hint 非空",
+                  (tz or {}).get("short") == "" and bool((tz or {}).get("hint")),
+                  f"short={tz.get('short')!r} hint={tz.get('hint')!r}")
+
         # ---------------------------------------------- 3. 上报断网自建提醒
         batch = [
             {"client_key": "1-0800-早上的药", "title": "早上的药", "rtype": 0,

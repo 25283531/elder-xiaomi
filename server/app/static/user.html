@@ -324,7 +324,7 @@
           唤醒设备进入对话可立即生效。
         </div>
         <table v-if="devices.length">
-          <thead><tr><th>名称</th><th>标识</th><th>状态</th><th>硬件型号</th><th>固件版本</th><th>绑定时间</th><th>形象</th><th>人格角色</th><th>操作</th></tr></thead>
+          <thead><tr><th>名称</th><th>标识</th><th>状态</th><th>硬件型号</th><th>固件版本</th><th>时区</th><th>绑定时间</th><th>形象</th><th>人格角色</th><th>操作</th></tr></thead>
           <tbody>
             <tr v-for="d in devices" :key="d.id">
               <td>{{d.name}}</td>
@@ -337,6 +337,17 @@
                    → fmt() 返「—」，**不回落 created_at**（语义不同）。 -->
               <td class="muted">{{d.hardware_model||'未知'}}</td>
               <td class="muted">{{d.fw_version||'未上报'}}</td>
+              <!-- 设备时区（2026-11-04 用户要求）：提醒的钟点按**这个**时区执行。
+                   文案全部来自服务端（short 短版给这一格、hint 整句挂 title），
+                   前端一个字都不拼 —— 网页与 APP 各拼一遍必然漂移。
+                   ok=false（判不出来）时 short 是空串，显示「判不出」并说明原因，
+                   不显示红色错误：设备在 NAT 后面 / 刚出厂还没联过网都会这样。 -->
+              <td class="muted" style="font-size:12px"
+                  :title="(devTzMap[d.id]||{}).hint||''">
+                <template v-if="devTzMap[d.id] && devTzMap[d.id].short">{{devTzMap[d.id].short}}</template>
+                <template v-else-if="devTzMap[d.id]">判不出</template>
+                <span v-else class="muted">…</span>
+              </td>
               <td class="muted">{{fmt(d.bound_at)}}</td>
               <td>
                 <select :value="d.avatar_id||''" @change="applyAvatar(d,$event)">
@@ -395,7 +406,7 @@
 
         <template v-if="rView==='list'">
           <table v-if="reminders.length">
-            <thead><tr><th>标题</th><th>类型</th><th>时间</th><th>重复</th><th>确认</th><th>状态</th><th>操作</th></tr></thead>
+            <thead><tr><th>标题</th><th>类型</th><th title="提醒按设备所在时区的钟点响铃，不是按您手机的时区">时间（设备时区）</th><th>重复</th><th>确认</th><th>状态</th><th>操作</th></tr></thead>
             <tbody>
               <tr v-for="r in reminders" :key="r.id">
                 <td>
@@ -1360,15 +1371,19 @@ createApp({
       // 提醒
       curDeviceId: null, reminders: [], events: [],
       rBox: null, rForm: null, timesText:'', weekText:'', monthText:'',
-      // 这台设备按哪个时区提醒（GET /api/devices/{pk}/timezone）。
+      // 每台设备按哪个时区提醒（GET /api/devices/{pk}/timezone），按设备 id 缓存。
       //
       // 为什么必须显示：提醒是**从设备上响出来**的，"早上 8 点吃药"指的是
       // 老人眼前那个钟的 8 点。家属手机在北美、设备在非洲时，按手机时区理解的
       // 8 点会整整错 7 小时 —— 这是服药提醒，错小时是安全问题。
       //
-      // null = 还没查到 / 查失败（整块不显示）；ok=false = 判不出来（显示
+      // 为什么是 map 而不是单个对象：家里可能有多台设备（客厅/卧室），
+      // 「我的设备」表要逐台显示。只存一台的话，切换设备时另一台就得重新请求，
+      // 而且表里会同时出现"这台有、那台空着"的错乱观感。
+      //
+      // 缺键 = 还没查到 / 查失败（整块不显示）；ok=false = 判不出来（显示
       // 服务端给的兜底说明）。**判不出来不是错误**，不能因此拦住保存。
-      devTz: null,
+      devTzMap: {},
       // 提醒操作历史（GET /api/reminders/audits）。提醒是**软删除**，删掉的规则
       // 仍在库里，这个视图就是"删掉的提醒去哪了"的答案。
       //   rView          'list' = 当前提醒 / 'history' = 操作历史
@@ -1473,6 +1488,15 @@ createApp({
     // confirm_method_text，前端不再翻译一遍枚举，避免两边文案漂移。
     confirmedItems(){
       return this.medItems.filter(it => it.state === 2);
+    },
+    // 当前选中设备的时区（弹窗提示条用）。从 devTzMap 里取，取不到就是 null。
+    //
+    // ⚠️ 也必须是 computed：模板里 `v-if="devTz"` 依赖它，写成 data 就会在
+    // 切换设备后保持旧值 —— 提示条会拿 A 设备的时区说 B 设备的提醒。
+    devTz(){
+      const id = this.curDeviceId;
+      if (!id) return null;
+      return this.devTzMap[id] || null;
     },
     // 用户填的第一个钟点换算成"相当于北京时间几点"。空串 = 算不出来 / 不必显示。
     //
@@ -1676,6 +1700,9 @@ createApp({
         const r = await this.api('/api/devices'); if(!r) return;
         this.devices = r;
         if (!this.curDeviceId && r.length) this.curDeviceId = r[0].id;
+        // 时区是**增强信息**，不 await：设备表先渲染出来，时区那格随后填上。
+        // await 在这里等于让"时区接口慢"变成"整张设备表慢"。
+        this.loadDevTzAll();
       }catch(e){ this.err = '设备列表加载失败：' + e.message; }
     },
     // createDevice()（按 MAC 登记设备）已删：它与 bindDeviceByCode 结果重复，
@@ -1876,16 +1903,35 @@ createApp({
       // 缓存的时区会让提示条说错地方 —— 而这条提示正是给"人不在国内"用的。
       this.loadDevTz();
     },
-    // 拉「这台设备按哪个时区」。失败**只影响提示条**，绝不影响保存：
-    // 查不到就不显示这一块，用户照常能建提醒（服务端照样按设备时区落库）。
+    // 拉「这台设备按哪个时区」。失败**只影响提示条 / 表格里的那一格**，
+    // 绝不影响保存：查不到就不显示，用户照常能建提醒（服务端照样按设备时区落库）。
     // 把一次只读的辅助请求做成保存的前置条件，等于让"提示查不到"变成
     // "提醒建不了"。
-    async loadDevTz(){
-      if (!this.curDeviceId){ this.devTz = null; return; }
+    //
+    // force=true 时忽略缓存重拉 —— 打开提醒弹窗时用：设备可能刚换过网络
+    // （出差、搬家），缓存的时区会让提示条说错地方，而这条提示正是给
+    // "人不在国内"用的。
+    async loadDevTzFor(id, force){
+      if (!id) return null;
+      if (!force && this.devTzMap[id]) return this.devTzMap[id];
       try{
-        this.devTz = await this.api('/api/devices/'+this.curDeviceId+'/timezone');
+        const t = await this.api('/api/devices/'+id+'/timezone');
+        if (t) this.devTzMap[id] = t;     // Vue 3 是 Proxy 响应式，直接赋值即可
+        return t || null;
       }catch(e){
-        this.devTz = null;
+        return null;
+      }
+    },
+    async loadDevTz(){
+      if (!this.curDeviceId) return;
+      await this.loadDevTzFor(this.curDeviceId, true);
+    },
+    // 设备表加载完后逐台补时区。**串行**而不是 Promise.all：
+    // 家里设备本来就只有一两台，并发省不了多少，反而在弱网下同时压 3 个请求，
+    // 更容易整页卡在"正在读取"。单台失败不影响其它台。
+    async loadDevTzAll(){
+      for (const d of this.devices){
+        if (!this.devTzMap[d.id]) await this.loadDevTzFor(d.id);
       }
     },
     async saveReminder(){

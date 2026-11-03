@@ -241,6 +241,11 @@ class DeviceTimezoneOut(ORMBase):
     last_seen_at: datetime | None = None
     #: 服务端拼好的整句提示，前端直接渲染。
     hint: str = ""
+    #: 同一件事的**短版**（``尼日利亚 · UTC+01:00 · 晚北京 7h``），给表格
+    #: 单元格用。与 ``hint`` 同源（``geo.tz_short``），前端**不许自己拼** ——
+    #: 网页与 APP 各拼一遍必然漂移，那是音色清单踩过的坑。
+    #: 空串 = 判不出来，此时前端显示 ``hint``（说明会退回哪一级兜底）。
+    short: str = ""
 
 
 class DeviceAgentIn(ORMBase):
