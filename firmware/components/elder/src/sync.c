@@ -914,7 +914,17 @@ void elder_sync_on_reminder_state(const elder_rmd_item_t *item, elder_rmd_state_
         /* 确认方式由 elder_reminder_confirm_ex() 暂存：
          * 按键路径传 BUTTON，断网语音确认（「吃过了」）传 VOICE。
          * 这里若写死 BUTTON，离线补发的回执会把语音确认误报成按键，
-         * 子女端看到的依从率数据就不可信了。 */
+         * 子女端看到的依从率数据就不可信了。
+         *
+         * ⚠️ 2026-11-03 起这里还多背了一条业务：**全置信（语音+按键）**。
+         *    服务端 device_api 的 report_event 只在「库里已是 VOICE、设备回执
+         *    是 BUTTON 且 CONFIRMED」时合并成 VOICE_AND_BUTTON(5)。所以设备
+         *    报上来的 method 必须**如实**来自 elder_reminder_last_confirm_method()
+         *    （= 这次确认到底是纯语音，还是按键发起 + 对话确认）。
+         *    谁把这一行改成写死 ELDER_CFM_VOICE，全置信就永远算不出来 ——
+         *    子女端再也分不出"老人自己按过键"和"只是嘴上说了句吃了"。
+         *    这条依赖没有编译期保护，也没有静态门禁 —— 只能靠这段注释守。
+         *    改这一行之前先想清楚：你动的是"全置信能不能算出来"。 */
         elder_sync_enqueue_event(sid, due, ELDER_EV_CONFIRMED,
                                  (elder_confirm_method_t)elder_reminder_last_confirm_method(),
                                  "confirmed");

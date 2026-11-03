@@ -23,6 +23,7 @@
 #include "sdkconfig.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_timer.h"   // esp_timer_get_time()：按键发起标记的时间戳（纯 RAM）
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -441,6 +442,31 @@ static int64_t s_last_announced_min = -1;
  * 到期分钟而不是 time(NULL)，理由见 s_last_announced_min 的注释。 */
 static int64_t s_last_escalated_min = -1;
 
+/* 「这一次服药确认是**按键发起**的」标记（2026-11-03 用户裁决）。
+ *
+ * 语义（这是本变量的全部意义，别简化成"老人按过键"）：
+ *   老人长按了服药提醒的确认键 → 设备不直接确认，而是追问「您吃的是哪种药？」
+ *   → 服务端在后续对话里问清药名、判定完成 → 这次确认是**语音 + 按键**，
+ *   服务端 ConfirmMethod.VOICE_AND_BUTTON(5) = 用户说的"全置信"。
+ *   老人没按任何键、直接在对话里说「我吃了降压药」⇒ 仅语音(1)，不是全置信。
+ *
+ * 为什么必须两个字段：
+ *   · server_id 定位"哪一条提醒"。否则老人先按了 8:00 的降压药、转头去说
+ *     20:00 的钙片，那条钙片会被算成全置信 —— 替老人编造了一次没做过的按键。
+ *   · 时间戳是有效期。老人按了键却聊了半小时才说药名，中间可能已经干别的
+ *     去了，"按键发起"这个前提已经不成立，必须自动失效。
+ *
+ * 有效期 10 分钟的理由：与半置信复核窗（reminder.c 的 HALF 窗口）同量级，
+ * 足够走完「问一句 → 老人想一下 → 回答 → 服务端判定」这段对话；再长就会
+ * 把一次按键"贷"到下一顿饭上。
+ *
+ * 只活在 RAM（不进 NVS、不进 g.table）：重启后标记消失 ⇒ 退化成"仅语音"。
+ * 宁可少记一次全置信，也不能凭一个来历不明的旧标记替老人编造按键 ——
+ * 依从率数据一旦掺假就再也修不回来。 */
+static uint32_t s_med_armed_server_id = 0;
+static int64_t s_med_armed_us = 0;
+static const int64_t kMedArmedTtlUs = 10LL * 60 * 1000000;   /* 10 分钟 */
+
 /* 时段词（用户 2026-11-03 定义）：
  *   上午 <12:00、中午 12:00–13:59、下午 14:00–17:59、晚上 ≥18:00 */
 static const char *TimeOfDayWord(int hour)
@@ -515,14 +541,17 @@ void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
         }
 
         /* ---- 话术带时段，必须走 TTS（2026-11-03 用户需求）----
-         * 「提醒音效 + 您今天上午/中午/下午/晚上 + 有一条服药提醒，请您知悉」。
+         * 「提醒音效 + 您今天上午/中午/下午/晚上 + 有服药提醒，请您知悉」。
+         *
+         * 2026-11-03 用户第二版措辞：去掉「一条」—— 老人听到"一条"会以为
+         * 还有别的、去数，而他此刻只需要知道"这个时段有这件事"。
          *
          * 为什么不能用预录片段：片段是编译进 .rodata 的固定资源，
          * `PlaySound` 只吃一个 `string_view`，运行时**零参数化能力** ——
          * 它永远只会说「您有一条服药提醒」，念不出时段（更念不出药名）。
          * 所以这条路径走 ScheduleAnnounce() 的 TTS 分支。 */
         char speak[96];
-        snprintf(speak, sizeof(speak), "您今天%s有一条%s，请您知悉",
+        snprintf(speak, sizeof(speak), "您今天%s有%s，请您知悉",
                  TimeOfDayWord(DueHour(item)),
                  item->type == ELDER_RMD_TYPE_MEDICINE ? "服药提醒" : "待办事项");
 
@@ -693,6 +722,19 @@ int FirstUndoneReminder()
     return elder_reminder_first_ringing();
 }
 
+/* 按下标取条目（只读）。越界 / 表未就绪返回 nullptr。
+ *
+ * 为什么不在 OnKey 里直接调 elder_reminder_list()：本文件要用"这一条是不是
+ * 服药类"两次（短按防误触、长按记按键发起标记），各写一遍遍历迟早漂移，
+ * 而漂移的表现是"短按被挡、长按没记标记"这类只在真机上看得见的行为差异。 */
+static const elder_rmd_item_t *ItemAt(int idx)
+{
+    const elder_rmd_table_t *tbl = nullptr;
+    if (elder_reminder_list(&tbl) != ESP_OK || tbl == nullptr) return nullptr;
+    if (idx < 0 || idx >= tbl->count) return nullptr;
+    return &tbl->items[idx];
+}
+
 /* method 区分「按键确认」与「语音确认」（ELDER_CFM_BUTTON / ELDER_CFM_VOICE）。
  * 这个值会随回执上报服务端，子女端据此区分「老人自己按的」还是「跟小智说的」，
  * 所以两条路不能都填 BUTTON —— 否则事后无法判断确认的真实来源。 */
@@ -786,6 +828,7 @@ void OnKey(elder_key_event_t ev, void *ctx)
     switch (ev) {
     case ELDER_KEY_EV_SHORT: {
         int idx = -1;
+        bool open_window = false;
         if (elder_input_confirm_window_active() && s_arming_id >= 0) {
             idx = s_arming_id;
         } else if (elder_ui_reminder_showing() ||
@@ -800,12 +843,66 @@ void OnKey(elder_key_event_t ev, void *ctx)
              *  现在没有兜底分支了，选不中目标就是彻底没反应。） */
             idx = FirstUndoneReminder();
             if (idx >= 0) {
-                elder_input_open_confirm_window();   /* 让界面立刻进确认态 */
-                s_arming_id = idx;
+                /* 先**不**开确认窗：下面要先判"是不是服药类"。服药类连窗都
+                 * 不能开 —— 确认窗 + #1 呼吸灯是"按一下就能确认"的视觉承诺，
+                 * 而这个动作对服药提醒已经被禁掉了（见下方防误触注释）。 */
+                open_window = true;
             }
         }
 
         if (idx >= 0) {
+            /* ---- 服药类**禁止短按确认**（2026-11-03 用户需求，防误触）----
+             *
+             * 短按是 0.3 秒的动作，老人擦屏幕、挪设备、手抖碰一下都可能触发；
+             * 而服药确认是医疗行为：误确认会让设备停掉提醒（老人真的漏服），
+             * 也会让子女端看到"已服药"的假依从率。所以服药类必须走长按 3 秒
+             * （要持续用力，几乎不可能误触），短按在这里**什么都不做**。
+             *
+             * 非服药（喝水/日程/运动）保持原来的短按确认：那些事误确认的
+             * 代价只是少提醒一次，不值得让老人多花 3 秒。
+             *
+             * ⚠️ 确认窗必须**在判完类型之后**才开（上面的 open_window 就是
+             *    为此延后的）：先开再关会让屏幕先闪一下确认态，老人看到的是
+             *    "设备认了、又反悔了"。已经开着的窗（idx 来自 s_arming_id）
+             *    也一并收掉 —— 那种状态只可能来自旧逻辑残留，留着就是亮着
+             *    一个按不动的承诺。
+             *
+             * ---- 顺带核实：本项目有没有"可配置的短按定义"？----
+             * **没有，一处都没有。** 2026-11-03 逐个 grep 过：
+             *   · sync.c 解析服务端下发只认提醒规则（reminders + when），
+             *     没有任何按键/动作字段；NVS 里只有 evtq / token / epoch /
+             *     tzmin 四个键，也没有按键映射；
+             *   · elder_reminder.h 的 elder_rmd_item_t 全是提醒字段
+             *     （type/label/hour/minute/repeat_mask/enabled…），
+             *     没有 short_press_action 之类；
+             *   · ui.c 只负责"显示什么"，不参与按键行为决策；
+             *   · elder_input 只上报 SHORT / LONG_HOLD / RELEASE 三个**原始
+             *     事件**，行为全部在 OnKey 里写死（本文件就是唯一真源）。
+             * 上游 xiaozhi 板级代码里的 `short_press_time = 500` 是**去抖/
+             * 判定阈值**（多少毫秒算短按），不是"短按做什么"，别混为一谈。
+             * ⇒ 对用户可以明确回答：不存在短按定义配置项，短按行为在代码里
+             *   固定，所以"不能设置短按定义"是代码事实，不是漏做了功能。 */
+            const elder_rmd_item_t *target = ItemAt(idx);
+            if (target == nullptr) {
+                /* 取不到条目 = 表未就绪或下标错。服药确认是医疗行为，
+                 * 信息不明时**宁可不确认**（fail-closed），不能赌它是日程。 */
+                elder_input_close_confirm_window();
+                s_arming_id = -1;
+                ESP_LOGE(TAG, "短按：取不到提醒 #%d 的条目，拒绝确认（fail-closed）",
+                         idx);
+                break;
+            }
+            if (target->type == ELDER_RMD_TYPE_MEDICINE) {
+                elder_input_close_confirm_window();
+                s_arming_id = -1;
+                ESP_LOGI(TAG, "短按：提醒 #%d「%s」是服药提醒，不支持短按确认"
+                              "（防误触），请长按 3 秒", idx, target->label);
+                break;
+            }
+            if (open_window) {
+                elder_input_open_confirm_window();   /* 让界面立刻进确认态 */
+                s_arming_id = idx;
+            }
             elder_rgb_button_confirmed();   /* #1 闪深蓝绿 3 次 */
             ConfirmMedicine(idx, ELDER_CFM_BUTTON);
         } else {
@@ -873,6 +970,29 @@ void OnKey(elder_key_event_t ev, void *ctx)
                 elder_rgb_button_confirmed();
                 ConfirmMedicine(idx, ELDER_CFM_BUTTON);
                 break;
+            }
+
+            /* ---- 记下"这次确认是按键发起的"（2026-11-03 用户裁决）----
+             *
+             * 只有走到这里（长按 + 有药名信息 ⇒ 进追问）才算。上面 med_n==0
+             * 那条是直接确认，回执本来就报 BUTTON，不需要这个标记。
+             *
+             * 标记的用途：老人接下来在对话里说清吃了哪味药，服务端判定完成
+             * 后回灌 confirm_reminder(server_id)，设备据此报 BUTTON，服务端
+             * 把「先 VOICE 后 BUTTON」合并成 VOICE_AND_BUTTON(5) —— 全置信。
+             * 没有这个标记就只能报 VOICE（仅语音），用户明确说那不是全置信。
+             *
+             * server_id == 0（本地自建、服务端不认识的提醒）：不置位。
+             * 那种条目本来就不会被服务端回灌确认，标记只会挂在那里过期。
+             * 有效期与清空时机见变量定义处。 */
+            const elder_rmd_item_t *armed_item = ItemAt(idx);
+            if (armed_item != nullptr && armed_item->server_id != 0) {
+                s_med_armed_server_id = armed_item->server_id;
+                s_med_armed_us = esp_timer_get_time();
+                ESP_LOGI(TAG, "按键发起标记置位：server_id=%lu（提醒 #%d，%u 味药），"
+                              "有效期 10 分钟",
+                         (unsigned long)armed_item->server_id, idx,
+                         (unsigned)med_n);
             }
 
             char prompt[192];
@@ -1075,18 +1195,28 @@ extern "C" int elder_confirm_pending_medicine(void)
  *    一句『吃了』、没人核实"，而这里是服务端在完整对话里问清了哪味药之后
  *    才判定的，置信度已经够；落 HALF 会让 done_today 不置位、全屏提醒不收、
  *    10 分钟后 HALF_EXPIRED 又什么都不上报（终态永远到不了家属端）。
- *    但**上报方式仍是 ELDER_CFM_VOICE**：不能为了让状态变 DONE 就谎报
- *    BUTTON —— 那会替老人编造一次他没按过的键，服务端还会把它合并成
- *    VOICE_AND_BUTTON(5)。方式与置信度是两件事，分开表达。
+ *
+ * ---- 上报的 method 由「这次确认是不是按键发起」决定（2026-11-03 用户裁决）----
+ * 用户原话：「先按了服药提醒按键进行确认，再通过追问的方式确认服用的哪一种药，
+ * 那就属于语音+按键的全置信」。所以：
+ *   · 命中 s_med_armed_server_id（同一条提醒 + 10 分钟内）⇒ **BUTTON**。
+ *     设备报 CONFIRMED + BUTTON，服务端把它和库里已有的 VOICE 合并成
+ *     VOICE_AND_BUTTON(5) —— 这就是"全置信"。
+ *     顺序上是成立的：服务端 voice/tools.py 的 confirm_reminder **先**把
+ *     ev.confirm_method 写成 VOICE 并 commit，**之后**才 device_call 通知
+ *     设备；所以这条 BUTTON 回执到达时，库里确实还是 VOICE。
+ *   · 未命中 ⇒ **VOICE**。老人没按过键，只是说了句"我吃了降压药"——
+ *     那就是仅语音，不是全置信。
+ * 注意：命不命中都走同一条 force_done=true 的路径，**状态都是 DONE**。
+ * "已确认"是状态，"置信度"是另一个维度 —— 别因为 method 是 BUTTON 就把
+ * 这里换成非 force_done 的 confirm_ex，那会让状态退回 HALF_CONFIRMED，
+ * 屏幕收不起来、家属端也等不到终态。
  *
  * server_id == 0（没传 / 类型不对 / 传了 0）：**完全走旧路径**
  *   elder_confirm_pending_medicine()。服务端某个版本没带参数时不能因此
  *   让语音确认彻底失效 —— 宁可退化成"确认正在响铃的那条"。
- *   注意这条旧路径**仍然是半置信**（真人只说了句"吃了"），这是刻意的。
- *
- * 确认方式固定 ELDER_CFM_VOICE：服务端认定这是语音确认，它那套
- * 「先 VOICE 后 BUTTON 合并成 VOICE_AND_BUTTON(5)」的逻辑依赖这个值。
- * 改成 BUTTON 会让"老人自己按的"和"跟小智说的"再也分不开。
+ *   注意这条旧路径**仍然是半置信**（真人只说了句"吃了"），这是刻意的；
+ *   它也不消费按键发起标记（拿不到 server_id 就没法证明是"这一条"）。
  *
  * 返回：0 = 已确认；-1 = 本地没有正在等确认的该条（服务端收到 false，
  *       据此知道设备状态没同步上）。 */
@@ -1096,11 +1226,42 @@ extern "C" int elder_confirm_reminder_by_server_id(uint32_t server_id)
         return elder_confirm_pending_medicine();
     }
 
-    esp_err_t rc = elder_reminder_confirm_server(server_id, ELDER_CFM_VOICE);
+    /* 按键发起标记：命中 ⇒ 报 BUTTON（服务端合并成全置信），否则报 VOICE。 */
+    const int64_t now_us = esp_timer_get_time();
+
+    /* 先清过期的：过期标记留着没有任何用处，还会让"是不是按键发起"这个问题
+     * 每次都多一次分支判断。清掉之后下面的判据只剩"同一条提醒"一个条件。 */
+    if (s_med_armed_us > 0 && (now_us - s_med_armed_us) > kMedArmedTtlUs) {
+        ESP_LOGI(TAG, "按键发起标记已过期（%lld 秒 > 600 秒），作废",
+                 (long long)((now_us - s_med_armed_us) / 1000000));
+        s_med_armed_server_id = 0;
+        s_med_armed_us = 0;
+    }
+
+    const bool armed = (s_med_armed_server_id != 0 &&
+                        s_med_armed_server_id == server_id);
+
+    uint8_t method = ELDER_CFM_VOICE;
+    if (armed) {
+        method = ELDER_CFM_BUTTON;
+        ESP_LOGI(TAG, "定向确认：server_id=%lu 是按键发起的（%lld 秒前）⇒ "
+                      "上报 BUTTON，服务端合并成语音+按键（全置信）",
+                 (unsigned long)server_id,
+                 (long long)((now_us - s_med_armed_us) / 1000000));
+    }
+
+    esp_err_t rc = elder_reminder_confirm_server(server_id, method);
     if (rc != ESP_OK) {
-        ESP_LOGW(TAG, "定向语音确认失败（server_id=%lu, rc=%d）",
-                 (unsigned long)server_id, (int)rc);
+        ESP_LOGW(TAG, "定向语音确认失败（server_id=%lu, method=%u, rc=%d）",
+                 (unsigned long)server_id, (unsigned)method, (int)rc);
         return -1;
+    }
+
+    /* 标记用一次就作废：这次按键的"贷款"已经还掉了，留着会让同一条提醒
+     * 的下一轮（比如明天的同一个 server_id）也被算成全置信。 */
+    if (s_med_armed_server_id == server_id) {
+        s_med_armed_server_id = 0;
+        s_med_armed_us = 0;
     }
 
     /* 收尾与 ConfirmMedicine() 保持一致：状态机已经由 reminder.c 改完
