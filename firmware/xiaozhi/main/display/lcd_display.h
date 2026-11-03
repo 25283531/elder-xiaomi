@@ -121,6 +121,14 @@ protected:
     void StopIdleMarquee();      /* 幂等：没在跑就只清状态 */
     bool idle_marquee_running_ = false;
     lv_obj_t* idle_marquee_image_ = nullptr;    /* 懒创建，只建一个 */
+    /* 第二张（错开半个行程）：设计稿主区里同时能看到 3~4 个圆，只放一张的话
+     * 任何时刻屏上只有一个 60px 的圆漂在 320px 空场里，观感是"有个东西在飘"。
+     * 两张共用同一条 lv_anim（同一个 exec 回调里算两个 x），相位天然同步。 */
+    lv_obj_t* idle_marquee_image2_ = nullptr;
+    int32_t idle_marquee_size_ = 0;             /* 表情边长，exec 回调算错位用 */
+    /* AdvanceIdleMarqueeImage() 的轮流标志：每次换图只填一张，
+     * 一次回绕（exec 回调里连调两次）正好把两张都换掉。 */
+    bool idle_marquee_second_turn_ = false;
     int32_t idle_marquee_last_x_ = 0;           /* 上一帧的 x，用来判「滚完一轮」 */
     size_t idle_marquee_next_ = 0;              /* 下一张在 ready 列表里的下标 */
     /* 本次启动时校验过"取得到图"的名字（指向静态字面量，无需释放）。
