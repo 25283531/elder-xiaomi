@@ -633,8 +633,8 @@ static void tick(void)
      *
      * ⚠️ 文案由 elder_reminder_screen_text() **统一生成**（2026-11-03 改）。
      *    原先这里与 elder_bridge.cc 的 OnReminder(PENDING) 各写一份完全相同的
-     *    snprintf，注释写着「改一处就要改两处」—— 这一轮要加「（还有 N 条）」
-     *    与时段话术，两份手写必然漂移，而漂移的表现是「屏幕上的句子在两条
+     *    snprintf，注释写着「改一处就要改两处」—— 那一轮要加「不止一条」的
+     *    提示与时段话术，两份手写必然漂移，而漂移的表现是「屏幕上的句子在两条
      *    路径之间来回跳」，老人会以为是两条不同的提醒。
      *    ⇒ 现在只有一处实现，bridge 也调它，不存在"两处"了。 */
     if (has_pending_confirm() && !elder_ui_reminder_showing()) {
@@ -1697,10 +1697,6 @@ void elder_reminder_screen_text(const elder_rmd_item_t *item, char *out, size_t 
         snprintf(head, sizeof(head), "%s时间到了", item->label);
     }
 
-    /* 「（还有 N 条）」：同一分钟里除自己之外还有几条等着确认。
-     * 需求原话是「让老人知道不止一条」。N 只算**已触发**的，所以第一条
-     * 触发时不会预支后面的条数（tick 在同一轮里会紧接着触发剩下的，
-     * 屏幕会连着刷新到最终值，老人看到的是最后一次）。 */
     /* 「同一分钟里的其他条目」：2026-11-03 用户需求 ——
      * 「如果累积的有多条提醒，则同时显示在一屏上」。
      *
