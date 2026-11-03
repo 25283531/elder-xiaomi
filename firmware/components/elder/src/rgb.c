@@ -1292,6 +1292,26 @@ void elder_rgb_button_confirmed(void)
     xSemaphoreGive(g.lock);
 }
 
+/* 「受理了、但还没有结果」—— 见 elder_rgb.h 里 2026-11-03 的那段说明。
+ *
+ * 只对**正在渐变**的那一轮生效：不在渐变里（没按过、或本轮已经出过结果）
+ * 时调它必须完全没有副作用，否则会把别人正在放的结果闪烁掐掉。 */
+void elder_rgb_button_acknowledged(void)
+{
+    if (!g.ready) return;
+    uint32_t t_ms = now_ms();
+
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    if (g.btn_mode == BTN_GRADIENT) {
+        g.btn_resolved = true;   /* 松开时不再补粉色闪（那正是用户实报的错误灯） */
+        g.btn_mode = g.btn_pending ? BTN_ATTRACT : BTN_OFF;
+        g.btn_phase_ms = t_ms;
+        ESP_LOGI(TAG, "按键已受理但未出结果（追问中）⇒ #1 回到%s，不闪结果色",
+                 g.btn_pending ? "橙色呼吸" : "熄灭");
+    }
+    xSemaphoreGive(g.lock);
+}
+
 void elder_rgb_button_pending(bool pending)
 {
     if (!g.ready) return;

@@ -81,6 +81,28 @@ protected:
     void AntiBurnInStep();
     lv_timer_t* anti_burn_timer_ = nullptr;
     uint32_t last_ui_change_tick_ = 0;      /* lv_tick 毫秒 */
+
+    /* ---- 对话分页（2026-11-03 用户需求）----
+     *
+     * 「用户说的话和 AI 说的话放在不同的两页，如果一页显示不全，自动翻页」。
+     * 实现是**按页滚动**左列容器 bottom_bar_，不是两个 label 轮显：
+     * 一段话本身就可能跨页，轮显只能二选一，翻不了页内。
+     *
+     * 页高 = 整行文字的整数倍（不是容器高度）：188px 的容器按 42px 行高只
+     * 放得下 4 行（168px），按 188 滚会把交界处那一行切成半截字。
+     *
+     * 所有成员只在 LVGL 任务里读写（SetChatMessage / 定时器回调都在持锁后
+     * 调用），所以不需要 atomic。 */
+    int ChatLineH();        /* 一行多少像素：字体行高 + 行间距，现算不缓存 */
+    int ChatPageH();        /* 一页多少像素：整行倍数 */
+    void ChatPageLayout();  /* 重新量文字、决定是否让回答另起一页、按需起定时器 */
+    void ChatPageStep();    /* 定时器回调：滚到下一页，最后一页停住 */
+    lv_timer_t* chat_page_timer_ = nullptr;
+    int chat_page_index_ = 0;       /* 当前页号，0 起 */
+    int chat_page_count_ = 0;       /* 总页数 */
+    int chat_page_h_ = 0;           /* 页高（像素） */
+    int chat_page_max_scroll_ = 0;  /* 内容高 - 容器高，最后一页可能滚不到整页 */
+
     /* 设备当前是否处于待机态（kDeviceStateIdle）。防烧屏屏保的唯一开关。
      *
      * 谁写：StartAntiBurnInTimer() 里注册的 DeviceStateEventManager 回调，
