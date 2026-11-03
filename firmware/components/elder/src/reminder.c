@@ -1431,11 +1431,15 @@ esp_err_t elder_reminder_confirm_remote(uint32_t server_id, time_t due_at,
  *   · OnReminder 没有 HALF_CONFIRMED 分支 ⇒ 全屏提醒不收，老人以为没确认；
  *   · 10 分钟后 HALF_EXPIRED，sync 层对它是**空 case**（故意不上报）⇒
  *     服务端和家属端永远等不到终态，这条提醒悬在半空。
- * 所以这里落 DONE。但 **method 仍然必须是 VOICE**：服务端按上报的 method
- * 判断"是老人说的还是子女代点的"，并据此把「先 VOICE 后 BUTTON」合并成
- * VOICE_AND_BUTTON(5)。为了拿到 DONE 就把 method 改成 BUTTON，等于替老人
- * 编造了一次他没做过的按键 —— 依从率数据从此不可信，而且这条路再也不会
- * 被升级成"语音+按键"（它本来就不是按键）。
+ * 所以这里落 DONE。上报方式由**调用方**决定（2026-11-03 放宽）：
+ *   · 老人只说了句「吃了」 ⇒ VOICE；
+ *   · 老人先长按了确认键（设备因此进入追问）、再说清吃了哪一味 ⇒ BUTTON。
+ * 服务端靠「先 VOICE 后 BUTTON ⇒ VOICE_AND_BUTTON(5)」这条规则把后者算成
+ * 语音+按键（用户定义的"全置信"）。**不要**看到 BUTTON 就以为这里写错了：
+ * 它不是"老人按了一下确认键"（那种确认根本不会走到本函数，直接 confirm_ex
+ * 就 DONE 了），而是"按键发起 + 对话确认"这个组合在设备侧的唯一表达方式。
+ * 反过来也不能为了拿 DONE 就一律报 BUTTON —— 那会替没按过键的老人编造
+ * 按键，依从率数据从此不可信。
  * ⇒ 方式（method）与置信度（force_done）必须分开表达，这也是
  *    confirm_ex_inner() 存在的理由。 */
 esp_err_t elder_reminder_confirm_server(uint32_t server_id,
@@ -1443,10 +1447,16 @@ esp_err_t elder_reminder_confirm_server(uint32_t server_id,
 {
     if (server_id == 0) return ESP_ERR_INVALID_ARG;
 
-    /* 只接受 VOICE：这个入口的语义是"服务端判定"，不是"按键"。传别的值
-     * 不是"更保险"，而是把语义换成了另一个人做的另一件事。调用点只有
-     * elder_bridge.cc 一处，错了就该当场炸出来，而不是静默记错方式。 */
-    if (confirm_method != ELDER_CFM_VOICE) return ESP_ERR_INVALID_ARG;
+    /* 只接受 VOICE / BUTTON。传别的值不是"更保险"，而是把语义换成了另一个
+     * 人做的另一件事：APP(3) 是子女在手机端点代确认、NONE(0) 是没有确认，
+     * 两者在这条路径上没有任何人能产生 ⇒ 出现就是调用方写错了，该当场炸
+     * 出来，而不是静默记错方式。
+     *
+     * ⚠️ 别"顺手收紧成只允许 VOICE"：收紧之后设备只能报 VOICE，服务端那条
+     *    合并规则的第二个条件永远不成立 ⇒ 全置信（VOICE_AND_BUTTON）永远
+     *    算不出来，用户明确要求的"语音+按键"就彻底没有了。 */
+    if (confirm_method != ELDER_CFM_VOICE && confirm_method != ELDER_CFM_BUTTON)
+        return ESP_ERR_INVALID_ARG;
 
     int idx = pick_item_for_confirm(server_id, 0);
     if (idx < 0) {

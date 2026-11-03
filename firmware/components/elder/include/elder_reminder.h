@@ -363,19 +363,27 @@ esp_err_t elder_reminder_confirm_remote(uint32_t server_id, time_t due_at,
  * 半置信的前提是"只有一句『吃了』、没人核实"；这条路径的前提是服务端在
  * 完整对话里问清了是哪味药，置信度已经够。落 HALF 会让 done_today 不置位、
  * 全屏提醒不收、10 分钟后 HALF_EXPIRED 又什么都不上报（见 .c 里的详述）。
- * 但上报的 method **仍然是 VOICE** —— 服务端靠它区分"老人说的"与"子女点的"，
- * 不能为了拿 DONE 而谎报成 BUTTON。
+ *
+ * 上报的 method 由调用方按「这次确认是不是按键发起」决定（2026-11-03 用户裁决）：
+ *   - 老人没按键、只在对话里说"我吃了降压药" ⇒ VOICE(1)，仅语音；
+ *   - 老人先长按确认键（设备据此进入追问）、再说清是哪一味 ⇒ BUTTON(2)，
+ *     服务端按「先 VOICE 后 BUTTON」把这条实例合并成
+ *     VOICE_AND_BUTTON(5) = 语音+按键（全置信）。
+ * ⚠️ 这里的 BUTTON **不等于**"老人按了一下确认键"（那种确认不走本函数）。
+ * 它是"按键发起 + 对话确认"这个组合的唯一表达方式，别为了"保险"改成只报 VOICE
+ * —— 那样全置信永远算不出来。
  *
  * 定位规则：在同一 server_id 的所有条目里挑 enabled 且正在等确认
  * （PENDING / CONFIRM_WIN / ESCALATED / HALF_CONFIRMED）的那条；多条时取
  * fired_due_at 最大（= 最近触发 = 此刻正在响铃的那条，与 first_ringing 同口径）。
  *
  * @param server_id      服务端 reminders.id（= elder_rmd_item_t.server_id）
- * @param confirm_method 只接受 ELDER_CFM_VOICE(1)（别的值直接报错，见 .c）
+ * @param confirm_method 只接受 ELDER_CFM_VOICE(1) / ELDER_CFM_BUTTON(2)
+ *                       （其他值直接报错，见 .c）
  * @return ESP_OK                已确认（重复调用幂等）
  *         ESP_ERR_NOT_FOUND     本地没有正在等确认的该条 —— 调用方应回 false，
  *                               让服务端知道设备侧状态没同步上
- *         ESP_ERR_INVALID_ARG   server_id == 0 或 confirm_method != VOICE
+ *         ESP_ERR_INVALID_ARG   server_id == 0 或 method 不是 VOICE/BUTTON
  */
 esp_err_t elder_reminder_confirm_server(uint32_t server_id,
                                         uint8_t confirm_method);
