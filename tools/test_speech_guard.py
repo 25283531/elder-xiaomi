@@ -380,6 +380,12 @@ def t8_reasoning_trace() -> None:
         "分析一下：老人想知道明天天气。",
         "思考：这个问题的答案是什么。",
         "reasoning: the user asks about weather.",
+        # ---- 2026-11-03 生产日志里**实际漏出去**的那一句 ----
+        # 会话 981fcf70 那一轮 8 句拦下 7 句，只有它被念给了老人：
+        # 既不以「用户」开头，也没有「让我/我需要/我先」⇒ 锚行首的正则全落空。
+        "这个情况，我得先看看。",
+        "这个情况我得先看看今天天气怎么样。",
+        "这得先确认一下，用户说的是明天还是后天。",
     ]
     for text in block:
         reason = _speech_block_reason(_speech_clean(text))

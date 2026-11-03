@@ -241,6 +241,15 @@ extern const char ogg_elder_skipped_start[] asm("_binary_elder_skipped_ogg_start
 extern const char ogg_elder_skipped_end[] asm("_binary_elder_skipped_ogg_end");
 extern const char ogg_elder_no_reminder_start[] asm("_binary_elder_no_reminder_ogg_start");
 extern const char ogg_elder_no_reminder_end[] asm("_binary_elder_no_reminder_ogg_end");
+/* 2026-11-03 长按即时应答（用户需求）：
+ *   elder_sched_done.ogg  → 「日程已确认完成，我就不在屏幕显示了」
+ *   elder_med_confirm.ogg → 「您确认已经完成这次服药了吗？」
+ * 两条都由 tools/make_elder_clips.py 生成（在生产容器里跑，本机没有 TTS 密钥），
+ * 文件放在 main/assets/common/ 下，CMake 的 COMMON_SOUNDS 用 GLOB 收，不用改配置。 */
+extern const char ogg_elder_sched_done_start[] asm("_binary_elder_sched_done_ogg_start");
+extern const char ogg_elder_sched_done_end[] asm("_binary_elder_sched_done_ogg_end");
+extern const char ogg_elder_med_confirm_start[] asm("_binary_elder_med_confirm_ogg_start");
+extern const char ogg_elder_med_confirm_end[] asm("_binary_elder_med_confirm_ogg_end");
 
 // id → 内嵌 OGG 的视图。返回空的 string_view 表示"没有这条片段"，
 // 调用方（elder_clip_play 的上游）据此回落 TTS。
@@ -268,6 +277,12 @@ static std::string_view ClipSound(int id)
     case ELDER_CLIP_NO_REMINDER:
         return {static_cast<const char *>(ogg_elder_no_reminder_start),
                 static_cast<size_t>(ogg_elder_no_reminder_end - ogg_elder_no_reminder_start)};
+    case ELDER_CLIP_SCHED_DONE:
+        return {static_cast<const char *>(ogg_elder_sched_done_start),
+                static_cast<size_t>(ogg_elder_sched_done_end - ogg_elder_sched_done_start)};
+    case ELDER_CLIP_MED_CONFIRM:
+        return {static_cast<const char *>(ogg_elder_med_confirm_start),
+                static_cast<size_t>(ogg_elder_med_confirm_end - ogg_elder_med_confirm_start)};
     default:
         return {};
     }
@@ -530,7 +545,7 @@ void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
          * 文案里的主行动仍然是「长按按钮」（2026-10-29 用户实报后定的）：
          * xiaozhi 只在 listening 态才上传音频，待机时对着设备说话不可能有
          * 反应，所以屏幕不能把「说一句」写成指引。 */
-        char screen_text[160];
+        char screen_text[256];
         elder_reminder_screen_text(item, screen_text, sizeof(screen_text));
         elder_ui_show_reminder(screen_text);
 
@@ -830,6 +845,75 @@ static void HideReminderIfResolved(const char *why)
  *   · protocol_ 为空（未激活 / 未连上）时 StartListening 只打日志就返回，
  *     不崩、不死循环 —— 所以离线长按的最终表现是"问不出来"，提醒仍然挂屏；
  *   · 设备不在 Idle 时本任务直接放弃，不去抢正在进行的对话。 */
+
+/* 此刻能不能"说一句 + 开麦"。
+ *
+ * 三个判据缺一不可：
+ *   · OnIsOnline()          —— 设备状态不是配网/启动中（TTS 通道前提）；
+ *   · elder_net_is_online() —— 后端最近一次 HTTP 成功（软状态）；
+ *   · 设备在 Idle           —— StartListening 只在 Idle / Speaking 有动作，
+ *                              Speaking 分支会先 AbortSpeaking() 把声音掐断。
+ *
+ * 注意这里**不是**"能不能播预录片段"的判据：片段是本地资源，离线也能播。
+ * 它判的是"播完能不能接着开麦进对话"。 */
+static bool CanStartDialog()
+{
+    return OnIsOnline(nullptr) && elder_net_is_online() &&
+           Application::GetInstance().GetDeviceState() == kDeviceStateIdle;
+}
+
+/* 「先播预录问句、播完再开麦」的专用任务（2026-11-03 用户需求）。
+ *
+ * 用户原话：「如果用户长按时显示的是服药提醒，就播放第二句，并进入聆听状态，
+ * **避免因等待服务端合成而长时间没有说话，让老人以为设备没有响应**。」
+ *
+ * 为什么用"实测时长 + 余量"而不是等回调：`AudioService::PlaySound` 没有任何
+ * 完成回调（见 elder_clip.h 的说明），按 kClipMs 延时是这套 API 下唯一确定的
+ * 顺序保证 —— 与 ScheduleAnnounce 的 kChimeMs 同一套做法。
+ *
+ * 为什么余量只给 400ms 而不是更多：这句问完老人就会开口，等太久他会以为
+ * 设备没听见、再说一遍，反而把这一轮挤掉。400ms 只够解码器起播与 I2S 缓冲。
+ *
+ * 栈 4096：本任务只做 vTaskDelay + StartListening()，不拼 JSON、不碰 LVGL。
+ * （对比 AskThenListenTask 的 5120 —— 它要过一次 elder_ui_speak。） */
+struct ClipListenArg {
+    elder_clip_id_t id;
+};
+
+static void ListenAfterClipTask(void *arg)
+{
+    auto *p = static_cast<ClipListenArg *>(arg);
+    const elder_clip_id_t id = p->id;
+    delete p;
+
+    auto &app = Application::GetInstance();
+    const uint32_t wait_ms = elder_clip_duration_ms(id) + 400;
+    vTaskDelay(pdMS_TO_TICKS(wait_ms));
+
+    if (app.GetDeviceState() == kDeviceStateIdle) {
+        app.StartListening();
+        ESP_LOGI(TAG, "预录问句播完（%lu ms），进入聆听", (unsigned long)wait_ms);
+    } else {
+        /* 这 2~4 秒里老人可能已经用别的方式开了对话（或设备被 APP 抢占）。
+         * 此时**不抢**：StartListening 会 AbortSpeaking，把正在说的话掐断。 */
+        ESP_LOGW(TAG, "预录问句播完，但设备不在待机（state=%d），不进聆听",
+                 (int)app.GetDeviceState());
+    }
+    vTaskDelete(nullptr);
+}
+
+static void ListenAfterClip(elder_clip_id_t id)
+{
+    auto *arg = new ClipListenArg{id};
+    if (xTaskCreate(ListenAfterClipTask, "rmd_listen", 4096, arg, 3,
+                    nullptr) != pdPASS) {
+        /* 建不出任务 ⇒ 不会开麦。片段已经播出去了，老人会以为"它问完了在等我"，
+         * 所以必须留下 ERROR，不能静默。 */
+        ESP_LOGE(TAG, "开麦任务创建失败，本次不会进入聆听");
+        delete arg;
+    }
+}
+
 static void AskThenListenTask(void *arg)
 {
     auto *text = static_cast<std::string *>(arg);
@@ -1014,13 +1098,46 @@ void OnKey(elder_key_event_t ev, void *ctx)
          * 先给灯再改状态：老人按下 3 秒那一刻就要看到"成了"，
          * 而不是等提醒引擎落完 NVS 才亮。
          *
-         * ⚠️ 2026-11-03 起，「长按 = 直接确认」只对**药数未知**的提醒成立。
-         *    挂了 1 味或 >=2 味药的服药提醒，长按改成"问一句 + 进对话"，
-         *    由服务端大模型判断哪条日程完成（见下面的分支与 AskThenListenTask）。
+         * ⚠️ 2026-11-03 起，「长按 = 直接确认」只对**日程/待办类**成立。
+         *    服药类（不论几味药）长按改成"先播一句预录问句 + 进对话"，
+         *    由服务端大模型判断哪条日程完成（见下面的分支与 ListenAfterClip）。
          *    原因：固件只拿到"有几味药、第一味叫什么"，拿不到"老人吃了哪几味"；
-         *    直接标完成等于替老人谎报服药。 */
+         *    直接标完成等于替老人谎报服药。
+         *    唯一的例外是"药数未知且开不了麦"（离线）—— 那时直接确认，
+         *    否则老人会按了没反应。 */
         int idx = FirstUndoneReminder();
         if (idx >= 0) {
+            /* ---- 日程/待办类：播预录应答并**退回对话状态**（2026-11-03 用户需求）----
+             *
+             * 用户原话：「如果用户长按按键时屏幕显示的是日程，就播放第一句，
+             * 并从提醒状态的显示退回到对话状态」。
+             *
+             * 为什么这一类可以"按了就记上"：日程/喝水/运动误确认的代价只是
+             * 少提醒一次；服药类才必须问清（见下面那条分支）。原逻辑对这类
+             * 本来就是直接确认，这次只补一句人声 —— 老人按满 3 秒后要立刻
+             * 听到"成了"，而不是只有一声哔。
+             *
+             * 顺序：先确认（收全屏提醒 + 0.5 秒 SUCCESS 哔），再播片段。
+             * 反过来会让老人先听完 3.8 秒才看到屏收起来，"按了没反应"的
+             * 观感一点没变。
+             *
+             * 判据用 type 而不是 med_count：med_count 为 0 的**服药**提醒
+             * 不能走这里（那会把"没问过"的服药当成日程记完成）。 */
+            const elder_rmd_item_t *head_item = ItemAt(idx);
+            if (head_item != nullptr &&
+                head_item->type != ELDER_RMD_TYPE_MEDICINE) {
+                elder_rgb_button_confirmed();
+                ConfirmMedicine(idx, ELDER_CFM_BUTTON);
+                if (!elder_clip_play(ELDER_CLIP_SCHED_DONE)) {
+                    /* 片段资源缺失（旧分区 / play_clip 未接线）：退回 TTS。
+                     * 在线时才有声；离线至少屏幕已经收了，不会再挂一张
+                     * "按不动的卡片"。 */
+                    elder_ui_speak("日程已确认完成，我就不在屏幕显示了");
+                }
+                ESP_LOGI(TAG, "长按：日程类提醒 #%d 已确认，播预录应答并退回对话态",
+                         idx);
+                break;
+            }
             /* ---- 多药提醒（2026-11-03 用户需求）----
              *
              * 服药种类 > 1：长按后**不确认**，改为问「您吃的是哪种药？」
@@ -1034,12 +1151,15 @@ void OnKey(elder_key_event_t ev, void *ctx)
              * 确定日程是否完成"，所以走同一条对话路径。
              *
              * 药数 == 0（未知，典型是刚开机还没同步到 medicines）：
-             * **保持原路径直接确认**。信息缺失不能让老人确认不了 ——
-             * 这时"按了就记上"比"按了没反应"安全得多。 */
+             * 能进对话就照样问一句（问法不点药名，由服务端按待确认清单判断）；
+             * **只有开不了麦时**（离线 / 设备忙）才退回直接确认 —— 信息缺失
+             * 不能让老人确认不了，"按了就记上"比"按了没反应"安全得多。 */
             uint8_t med_n = elder_reminder_med_count((uint8_t)idx);
-            if (med_n == 0) {
+            if (med_n == 0 && !CanStartDialog()) {
                 elder_rgb_button_confirmed();
                 ConfirmMedicine(idx, ELDER_CFM_BUTTON);
+                ESP_LOGW(TAG, "长按：药数未知且当前开不了麦（离线/忙）⇒ 直接确认 #%d",
+                         idx);
                 break;
             }
 
@@ -1096,6 +1216,27 @@ void OnKey(elder_key_event_t ev, void *ctx)
              *    5 次（= 你没按够），而老人按得完全正确。见
              *    elder_rgb_button_acknowledged() 的说明。 */
             elder_rgb_button_acknowledged();
+
+            /* ---- 先出声、再开麦（2026-11-03 用户需求，本次改造的核心）----
+             *
+             * 预录片段是编在 .rodata 里的本地资源：长按到达 3 秒那一刻就出声，
+             * 不经过「请求发出 → 厂商首帧 → 下发 → 解码」这条链（实测 1~3 秒
+             * 完全没声音 —— 正是用户投诉的那个感受）。
+             *
+             * 服务端不需要知道"刚才问的是哪句"：每轮对话开头它都会把
+             * 「已到点、尚未确认的服药提醒清单 + 逐味进度」注入 system
+             * （server/app/voice/session.py 的 _PENDING_REMINDER_HINT），
+             * 老人回一句"吃了"它就够判断了。
+             *
+             * 片段不可用 / 开不了麦 ⇒ 逐字退回原来的 TTS 追问（下面那段）。 */
+            if (CanStartDialog() && elder_clip_play(ELDER_CLIP_MED_CONFIRM)) {
+                ListenAfterClip(ELDER_CLIP_MED_CONFIRM);
+                ESP_LOGI(TAG, "长按：播预录问句「您确认已经完成这次服药了吗？」"
+                              "（%u 味药，提醒 #%d），播完进聆听",
+                         (unsigned)med_n, idx);
+                break;
+            }
+
             auto *payload = new std::string(prompt);
             /* 栈 5120 与 kAnnounceTaskStack 对齐：两者都走
              * elder_ui_speak → OnSpeak → std::string 拼 JSON + ESP_LOG，
@@ -1118,11 +1259,21 @@ void OnKey(elder_key_event_t ev, void *ctx)
              * 待办 auto_done 之后引擎里就没有待确认项了）。老人长按的意思
              * 仍然是"这件事我做了"，所以先收屏，再决定这条日志是 ERROR
              * 还是 INFO —— 收不掉才说明真脱节。 */
+            const bool screen_was_showing = elder_ui_reminder_showing();
             HideReminderIfResolved("长按：当前无待确认项");
             if (elder_ui_reminder_showing()) {
                 ESP_LOGE(TAG, "⚠️ 全屏提醒还挂着，但引擎里没有待确认项 —— "
                               "长按无效。screen 与引擎状态已脱节，"
                               "请把这条日志连同开机日志一起反馈");
+            } else if (screen_was_showing) {
+                /* 屏上原本挂着日程卡（"播报即完成"，引擎里已无待确认项）：
+                 * 老人按这一下的意思仍然是"这件事我做了"，所以给他一句
+                 * 「日程已确认完成，我就不在屏幕显示了」—— 否则屏突然收掉、
+                 * 一声不响，他会以为是自己按错了。 */
+                if (!elder_clip_play(ELDER_CLIP_SCHED_DONE)) {
+                    elder_ui_speak("日程已确认完成，我就不在屏幕显示了");
+                }
+                ESP_LOGI(TAG, "长按：日程卡已收（引擎无待确认项），播预录应答");
             } else {
                 ESP_LOGI(TAG, "长按 3 秒：当前没有待确认的提醒，不确认");
             }

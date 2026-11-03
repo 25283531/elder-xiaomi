@@ -139,6 +139,13 @@ jobs:
       - name: 内置语音片段 OpusHead 校验（24kHz / mono / 60ms）
         run: python tools/verify_elder_clips.py
 
+      # 2026-11-03 用户需求三条（长按即时应答 / 字幕累积 / 多条提醒同屏）。
+      # 这三件事都只能在真机上跑，本机唯一能守的是**接线**：
+      # 片段有没有被调用、字幕追加分支还在不在、旧文案有没有被改回去。
+      # 断言一律"先剥注释再匹配代码位"——本仓踩过防回归注释自己踩红的坑。
+      - name: 长按应答 / 字幕累积 / 多条提醒同屏（静态接线）
+        run: python tools/smoke_longpress_subtitle.py
+
   build:
     name: 编译 ESP32-S3 固件
     runs-on: ubuntu-latest

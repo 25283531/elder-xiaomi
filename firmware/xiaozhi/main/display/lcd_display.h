@@ -103,6 +103,16 @@ protected:
     int chat_page_h_ = 0;           /* 页高（像素） */
     int chat_page_max_scroll_ = 0;  /* 内容高 - 容器高，最后一页可能滚不到整页 */
 
+    /* 上一句 assistant 字幕到达的时刻（lv_tick，毫秒）。
+     *
+     * 用来判断"这一句是接着上一句说的，还是新的一轮回答"。为什么需要：
+     * 字幕现在是**累积**的（见 SetChatMessage），而清空时机只有"用户话到达"
+     * 这一个。有些轮次根本没有用户话（按键发起、服务端主动播报），
+     * 不清的话上一轮的回答会和这一轮拼在一起。
+     * 判据取 20 秒：一句回答内部相邻两句的间隔是 1~4 秒（TTS 语速），
+     * 两轮之间隔着老人说话 + 服务端思考，通常远超 20 秒。 */
+    uint32_t chat_assistant_tick_ = 0;
+
     /* 设备当前是否处于待机态（kDeviceStateIdle）。防烧屏屏保的唯一开关。
      *
      * 谁写：StartAntiBurnInTimer() 里注册的 DeviceStateEventManager 回调，

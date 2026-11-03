@@ -199,8 +199,17 @@ async def _quiet_while_dismissed() -> None:
           "冷却过期后的空识别：回到第 1 次（照常出声）", f"spoken={rec3.spoken}")
 
 
-# --------------------------------- 4. 重新武装时清零（否则一开口就待机）
-async def _rearm_clears_streak() -> None:
+# ------------------- 4. 重新武装**不许**清零（用户实报的那条 bug）
+async def _rearm_keeps_streak() -> None:
+    """重新武装监听必须**保留**连续空识别计数。
+
+    2026-11-03 用户实报：「他已经说了先不聊了，还是频繁在说抱歉我没听清」。
+    根因就是这里原本清零：realtime 模式下每一轮 TTS 播完设备都会重发
+    listen start ⇒ 每轮都清零 ⇒ 计数永远到不了阈值 ⇒ 每次都按"第 1 次"
+    念 EMPTY_UTTERANCE_REPLY，silent / standby 两个分支从来没被执行过。
+
+    所以断言要写成**反向**的：清零 = 红。
+    """
     rec = _Recorder()
     sess = _make_session(rec)
     sess._empty_asr_streak = _EMPTY_ASR_STANDBY_STREAK
@@ -211,8 +220,9 @@ async def _rearm_clears_streak() -> None:
     sess._silence_watchdog = _noop_watchdog   # type: ignore[method-assign]
     sess._rearm_listening()
     await asyncio.sleep(0)                    # 让 create_task 起的看门狗跑完
-    check(sess._empty_asr_streak == 0,
-          "重新武装监听：连续空识别计数清零", f"streak={sess._empty_asr_streak}")
+    check(sess._empty_asr_streak == _EMPTY_ASR_STANDBY_STREAK,
+          "重新武装监听：连续空识别计数**保持不变**（不许清零）",
+          f"streak={sess._empty_asr_streak}")
     check(sess.state == "listening", "重新武装监听：state = listening",
           f"state={sess.state}")
 
@@ -247,7 +257,7 @@ def _reset_on_real_content_wired() -> None:
 def main() -> int:
     asyncio.run(_three_empties())
     asyncio.run(_quiet_while_dismissed())
-    asyncio.run(_rearm_clears_streak())
+    asyncio.run(_rearm_keeps_streak())
     _reset_on_real_content_wired()
 
     passed = sum(1 for ok, _, _ in results if ok)
