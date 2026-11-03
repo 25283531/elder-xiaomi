@@ -85,21 +85,22 @@ static void report_wakenet(void)
  * 显示风格自检。
  *
  * 我们在 sdkconfig.defaults 里刻意关掉了 emote（CONFIG_USE_EMOTE_MESSAGE_STYLE），
- * 改用标准 LVGL 消息样式：elder 定制了 70/30 对话布局（对话区 70%、状态区 30%），
- * 而 emote 是一整块全屏动画，会把对话区顶掉——两者在同一份 sdkconfig 里互斥，
+ * 改用标准 LVGL 消息样式：elder 把对话界面定制成「左列文字 + 右侧头像圆」
+ * （2026-11-03 按设计稿改的；更早的 2026-10-19 版是上下 70/30 分割，已废弃），
+ * 而 emote 是一整块全屏动画，会把文字区顶掉——两者在同一份 sdkconfig 里互斥，
  * 误开的表现是「开机有大表情、对话文字被盖住」，不看配置根本猜不到原因。
  */
 static void report_display_style(void)
 {
 #if defined(CONFIG_USE_DEFAULT_MESSAGE_STYLE) && CONFIG_USE_DEFAULT_MESSAGE_STYLE
-    ESP_LOGI(TAG, "显示风格=标准 LVGL（elder 70/30 对话布局生效）");
+    ESP_LOGI(TAG, "显示风格=标准 LVGL（elder 对话界面：左列文字 + 右侧头像圆）");
 #else
     ESP_LOGE(TAG, "标准 LVGL 消息样式未启用，对话布局定制不会生效");
 #endif
 
 #ifdef CONFIG_USE_EMOTE_MESSAGE_STYLE
     ESP_LOGE(TAG, "emote 表情风格处于启用态（CONFIG_USE_EMOTE_MESSAGE_STYLE），"
-                  "它会覆盖 elder 的 70/30 对话布局 —— 请在 sdkconfig.defaults 里关掉它");
+                  "它会覆盖 elder 的对话界面布局 —— 请在 sdkconfig.defaults 里关掉它");
 #endif
 }
 

@@ -24,7 +24,7 @@ prebuild_check.py —— 编译前的配置一致性自检（秒级，先于 idf
 C1. ``sdkconfig`` 残留且与 ``sdkconfig.defaults`` 冲突（★ 本次事故的真凶）
 C2. 关键选项与「仓库里的期望值」不符（如显示风格/唤醒词/分区表）
 C3. 分区表文件存在（配置指向的文件别是空指针）
-C4. merge 注入完整（elder 组件 + 70/30 布局标记）
+C4. merge 注入完整（elder 组件 + 对话界面布局标记）
 
 用法：
     python tools/prebuild_check.py           # 有问题退 1
@@ -464,7 +464,7 @@ def main() -> int:
             [sys.executable, str(ROOT / "tools" / "merge_to_xiaozhi.py"), "--check"],
             capture_output=True, text=True, timeout=120, cwd=str(ROOT),
         ).returncode
-        check("C4 merge 注入完整（elder 组件 + 70/30 布局）", rc == 0,
+        check("C4 merge 注入完整（elder 组件 + 对话界面布局）", rc == 0,
               "" if rc == 0 else "merge_to_xiaozhi.py --check 失败，先跑 merge")
     except Exception as exc:  # noqa: BLE001
         check("C4 merge 注入完整", False, f"无法执行 merge --check: {exc}")
