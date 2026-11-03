@@ -1498,6 +1498,25 @@ void LcdDisplay::AntiBurnInStep() {
      * 直接进锁最省事：20 秒一次，代价可以忽略。 */
     {
         DisplayLockGuard lock(this);
+        /* 全屏提醒正挂着 ⇒ 本函数一步都不许动（2026-11-03）。
+         *
+         * 提醒最长挂 4 小时，这期间设备一直是待机、界面也不再变化，所以
+         * device_idle_ 与 60 秒静止这两道闸门都拦不住它，每 20 秒照常进来。
+         * 不在这里挡住会有两件事：
+         *   1) 把待机跑马灯重新拉起来。两张图是 screen 的直接子对象，建得比
+         *      reminder_overlay_ 晚就会画在卡片**上面** —— 老人看到"提醒卡片
+         *      上飘着两个表情"。StartIdleMarquee() 里也拦了，但那是最后一道，
+         *      挡不住下面那条静态兜底轮播；
+         *   2) 下面那条静态兜底每 20 秒给 emoji_image_ 换一次 src。它被卡片
+         *      完全盖住看不见，纯属白解一次 PNG（CONFIG_LV_CACHE_DEF_SIZE=0，
+         *      没有图片缓存，每次都是完整的 lodepng 解码）。4 小时 = 720 次。
+         *
+         * 判据用 overlay 的**可见性**，不用"有没有待处理的提醒"：这张卡片
+         * 的显隐只由 ShowReminder / HideReminder 改，两者都持同一把锁。 */
+        if (reminder_overlay_ != nullptr &&
+            !lv_obj_has_flag(reminder_overlay_, LV_OBJ_FLAG_HIDDEN)) {
+            return;
+        }
         if (idle_marquee_running_) {
             return;
         }
