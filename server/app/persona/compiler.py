@@ -336,12 +336,25 @@ class PromptCompiler:
 
 
 def effective_traits(spec: RoleSpec, profile: dict[str, Any] | None = None) -> dict[str, Any]:
-    """对外暴露的「生效 traits」= 声明被画像修正后的结果。
+    """「声明被画像修正后」的行为值：**只用于展示画像的影响，不是用户设置**。
 
-    给 GET /api/roles/{id} 的 ``traits_effective`` 与 eval 用。
-    画像里能修正的只有两个维度（它们本来就是数值型的）：
-    长度（映射到 verbosity 档）与幽默（映射到 humor 数值）。
-    其余 trait 是纯声明 —— 没有实测数据对应，硬要"修正"就是编造。
+    ⚠️ 不要拿它当 ``RoleOut.traits_effective`` 的来源（2026-11-03 修正）
+    ------------------------------------------------------------------
+    它会把画像里的布尔 humor 映射成 **0.1 / 0.7** 覆盖掉声明值，而这两个数
+    **不是任何档位的上界**（档位是 0.3/0.6/1.0）。用户端编辑弹窗曾经读这个
+    字段当"当前值"，于是每次打开都显示 0.1、提示"不在任何档位里"，保存后
+    再打开又被画像改回 0.1 —— 用户看到的是"保存没生效"。
+
+    用户能编辑的只有**声明**（``RoleSpec.traits_effective()``，母版+overlay），
+    画像对说话方式的影响由 prompt 的第 ④ 段（``_section_persona``）直接读
+    profile 表达。``routers/roles._role_out`` 因此改回用 ``spec.traits_effective()``。
+
+    保留本函数是给「画像把哪个 trait 改成了什么」这类调试/评估用的；
+    它的输出**不应写回、也不应展示为可编辑值**。
+
+    画像里能修正的只有两个维度（它们本来就是数值型的）：长度（映射到
+    verbosity 档）与幽默（映射到 humor 数值）。其余 trait 是纯声明 ——
+    没有实测数据对应，硬要"修正"就是编造。
     """
     merged = dict(spec.traits_effective())
     if not profile:

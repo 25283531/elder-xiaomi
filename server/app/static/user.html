@@ -1406,6 +1406,11 @@ createApp({
       rolePresets: [], myRoles: [], traitSpecs: [],
       deriveBox: null, deriveName: '',
       rEditBox: false, rEdit: null,
+      // 打开编辑弹窗时的两个快照（只在 saveRole 里用）：
+      //   rEditBase    —— 打开时的「母版+覆盖」值，用来判断这一项到底改了没有；
+      //   rEditOverlay —— 打开时角色自己已经覆盖了哪些维度。
+      // 派生角色的 traits 是 overlay，只该提交**真正改动过**的项（见 saveRole）。
+      rEditBase: {}, rEditOverlay: [],
       // 用量
       usageSummary: null, usageRows: [], usageFilter: '',
       // 交互统计（GET /api/stats/overview?device_pk=&days=）+ 首页聚合（GET /api/home/summary）
@@ -2277,11 +2282,17 @@ createApp({
       finally{ this.busy = false; }
     },
     editRole(r){
-      // 编辑态用 traits_effective 显示当前实际生效的性格；
-      // 保存时整体作为 overlay 提交（改哪项覆盖哪项）。
+      // 编辑态显示「母版声明 + 我的覆盖」（traits_effective）。
+      //
+      // ⚠️ 它**只能**是声明值，不能是画像修正后的值：画像是机器人实测出来的
+      // （humor 会被映射成 0.1/0.7 这种不属于任何档位的数），用户既没设过、
+      // 也改不动。2026-11-03 用户实报「保存了重新打开还是旧值」的根因就是
+      // 这里读了画像修正值 —— 保存写进去 0.6，再打开显示 0.1。
       this.rEdit = r ? JSON.parse(JSON.stringify(r)) : {
         name:'', description:'', system_prompt:'', tts_voice:'', traits:{} };
       this.rEdit.traits = Object.assign({}, this.rEdit.traits_effective || this.rEdit.traits || {});
+      this.rEditBase = Object.assign({}, this.rEdit.traits);
+      this.rEditOverlay = Object.keys((r && r.traits) || {});
       const old = this.rEdit.tts_voice || '';
       if (this.clampVoice(this.rEdit)){
         this.setFlash('原音色「' + old + '」已不在当前语音服务的清单里，'
@@ -2290,10 +2301,32 @@ createApp({
       this.rEditBox = true;
     },
     closeRole(){ this.rEditBox = false; this.rEdit = null; },
+    // 数值型档位的 value 是**区间上界**（0.3 / 0.6 / 1.0），不是"可选值本身"。
+    // 当前值落在哪一档必须按区间判：取第一个满足 value <= 上界 的档；都不满足
+    // 则取最后一档（最后一档上界就是 max，正常不会走到）。
+    //
+    // 2026-11-03 用户实报「每次打开都提示 0.1 不在任何档位里」：0.1 属于第一档
+    // （0.0~0.3），而旧代码做的是**精确相等**匹配（0.1 !== 0.3）⇒ 既报错，
+    // 三个按钮也全不亮（老人看到"一个都没选中"就以为没设置过）。
+    bandIndex(spec, value){
+      const opts = spec.options || [];
+      if (!opts.length) return -1;
+      const v = Number(value);
+      if (!isFinite(v)) return -1;
+      for (let i = 0; i < opts.length; i++){
+        if (v <= Number(opts[i].value)) return i;
+      }
+      return opts.length - 1;
+    },
     isBandOn(spec, value){
       const cur = this.rEdit ? this.rEdit.traits[spec.name] : undefined;
       if (spec.kind === 'multi'){
         return Array.isArray(cur) && cur.map(String).indexOf(String(value)) >= 0;
+      }
+      if (spec.kind === 'number'){
+        const opts = spec.options || [];
+        const i = this.bandIndex(spec, cur);
+        return i >= 0 && String(opts[i].value) === String(value);
       }
       return String(cur) === String(value);
     },
@@ -2332,6 +2365,16 @@ createApp({
           return hit ? (hit.effect || hit.label) : String(v);
         }).join(' ');
       }
+      if (spec.kind === 'number'){
+        const opts = spec.options || [];
+        const i = this.bandIndex(spec, value);
+        if (i < 0) return '⚠️ 还没有设置这一项，请选一个档位。';
+        const text = opts[i].effect || opts[i].label;
+        // 超出最高档上界时仍按最后一档说话（prompt 侧就是这么渲染的），
+        // 但**必须说出来** —— 静默按最高档显示等于让用户以为数值被保存成了上界。
+        return Number(value) > Number(opts[opts.length - 1].value)
+          ? text + '（当前数值超出最高档，按最高档处理）' : text;
+      }
       const hit = (spec.options||[]).filter(o => String(o.value) === String(value))[0];
       if (!hit) return '⚠️ 当前值 ' + String(value) + ' 不在任何档位里，请选一个档位。';
       return hit.effect || hit.label;
@@ -2347,9 +2390,24 @@ createApp({
       if (empty){ this.err = '「' + empty.label + '」至少要选一项'; return; }
       this.busy = true;
       try{
+        // 派生角色的 traits 列存的是 **overlay**（与母版的差集）：只提交这次
+        // 真的改动过的项。整体提交等于一次保存就把母版那 10 项全抄成自己的
+        // 覆盖，之后再改平台预设这个角色就跟不上了 —— 与页面上那句
+        // 「改哪项就只覆盖哪项」正好相反。
+        // 原创角色的 traits 本身就是完整声明，必须整体提交（后端是整体替换）。
+        let traits = this.rEdit.traits || {};
+        if (this.rEdit.parent_id){
+          const base = this.rEditBase || {};
+          const kept = {};
+          Object.keys(traits).forEach(k => {
+            if (this.rEditOverlay.indexOf(k) >= 0
+                || String(traits[k]) !== String(base[k])) kept[k] = traits[k];
+          });
+          traits = kept;
+        }
         const body = {name:this.rEdit.name, description:this.rEdit.description||'',
                       system_prompt:this.rEdit.system_prompt||'',
-                      tts_voice:this.rEdit.tts_voice||'', traits:this.rEdit.traits||{}};
+                      tts_voice:this.rEdit.tts_voice||'', traits:traits};
         if (this.rEdit.id){
           await this.api('/api/roles/'+this.rEdit.id, {method:'PATCH', body:JSON.stringify(body)});
         }else{

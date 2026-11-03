@@ -286,6 +286,17 @@ jobs:
       - name: 用户端音色清单冒烟（按生效厂商 + 失效回落默认）
         # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
         run: python tools/run_smoke.py logs/smoke_smoke_voice_options.log python tools/smoke_voice_options.py 8136
+      # 人格预设三条用户实报的回归（2026-11-03，端口 8139）：
+      #   ① 数值档位（爱开玩笑 0.3/0.6/1.0）前端做了精确相等匹配，0.1 落在
+      #      第一档却被报「不在任何档位里」⇒ 必须按**区间归属**；
+      #   ② 保存后重新打开还是旧值 —— 根因是 traits_effective 混进了画像修正
+      #      （humor 被映射成 0.1/0.7）⇒ 页面把"实测"当成"用户设置"；
+      #   ③ 角色音色从来没生效 —— 合成路径里配置行压过了角色。
+      # 前两条由本脚本的 A/B 组守（含 PATCH 0.55 → GET 0.55 的端到端断言），
+      # 第三条的合成行为断言在 smoke_tencent_voice 的 K7/K8。
+      - name: 人格预设回归冒烟（档位区间 + 保存生效 + 音色链路）
+        # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
+        run: python tools/run_smoke.py logs/smoke_role_traits_voice.log python tools/smoke_role_traits_voice.py 8139
       # ===================================================================
       # 补齐「只登记端口、从没接线」的十个冒烟（2026-10-30）
       #

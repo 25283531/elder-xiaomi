@@ -578,14 +578,20 @@ def asr(db: Any, pcm_16k: bytes) -> str:
 
 # ---------------------------------------------------------------- TTS
 def _row_voice(row: Any) -> str:
-    """配置行**自己**填的音色（空串 = 这行没指定，交给调用方偏好）。
+    """配置行**自己**填的音色（空串 = 这行没指定）。
 
-    为什么要单独取一次：``pick_voice()`` 的回落链是
-    「设备 agent → 角色 tts_voice → 形象 tts_voice → 配置行 params.voice」，
-    **整条链里没有 ``ai_providers.tts_voice``**。结果就是管理后台「TTS 配置」
-    弹窗里那个音色输入框填什么都不生效 —— 生产上表现为：腾讯云那行填了音色，
-    实际请求里塞的却是角色级的 ``zh-CN-XiaoxiaoNeural``（Edge 的音色名），
-    腾讯云回「VoiceType 必须是整数」，整句音频被跳过（老人侧就是"没有声音"）。
+    它是**兜底**，不是优先项（2026-11-03 修正）：音色是角色的属性
+    （``device_api.sync`` 只下发 ``role.tts_voice``，用户端也只让用户改角色的
+    音色），所以 ``tts()`` / ``tts_stream()`` 的判据是「角色音色 → 配置行音色
+    → 厂商默认」。配置行音色接手的两种情况：
+
+      1. 角色没指定（空串 = 跟随系统默认）；
+      2. 角色存的是**上一家厂商**的音色（形态不符，被 ``_shape_ok_voice`` 置空）。
+
+    为什么还要认这一列：``pick_voice()`` 的回落链
+    「设备 agent → 角色 tts_voice → 形象 tts_voice → 配置行 params.voice」里
+    **没有 ``ai_providers.tts_voice``**，管理后台「TTS 配置」弹窗填的音色曾经
+    完全不生效。现在它作为兜底仍然有效 —— 只是不再压过角色。
     """
     if row is None:
         return ""
@@ -613,15 +619,15 @@ _VOICE_SHAPES: Final[dict[str, "re.Pattern[str]"]] = {
 
 
 def _shape_ok_voice(style: str, voice: str) -> str:
-    """形态与目标厂商不符的音色 → 空串（用厂商默认），并留一条日志。"""
+    """形态与目标厂商不符的音色 → 空串，并留一条日志（调用方接着试兜底值）。"""
     voice = (voice or "").strip()
     if not voice:
         return ""
     pattern = _VOICE_SHAPES.get(style)
     if pattern is None or pattern.match(voice):
         return voice
-    log.warning("音色 %r 不适用于 %s（各厂商音色 ID 不通用）→ 改用该厂商默认音色",
-                voice, style)
+    log.warning("音色 %r 不适用于 %s（各厂商音色 ID 不通用）→ 忽略该值，"
+                "回落到配置行音色或该厂商默认音色", voice, style)
     return ""
 
 
@@ -709,10 +715,20 @@ def tts(db: Any, sentence: str, *, voice: str = "", speed: float = 1.0,
         raise VoiceConfigMissingError("tts")
 
     style = _tts_dispatch_style(row)
-    # 音色两级定：配置行自己填的 > 调用方（角色）偏好；再按厂商形态过滤。
-    # 顺序不能反 —— 角色音色对「所有」厂商都会流下来，只有配置行知道
-    # 自己这一家认什么。
-    voice = _shape_ok_voice(style, _row_voice(row) or voice)
+    # 音色两级定：**调用方（角色）偏好 > 配置行自己填的**，两边都过厂商形态过滤。
+    #
+    # ⚠️ 顺序不能反（2026-11-03 修正）
+    # ------------------------------
+    # 原写法是 ``_row_voice(row) or voice``：只要管理员在「TTS 配置」弹窗里选过
+    # 音色，**角色音色就永远被忽略**。而音色是角色的属性 ——
+    # ``device_api.sync`` 只下发 ``role.tts_voice``，用户端角色页也只让用户改角色
+    # 的音色。于是用户在角色页选了音色、设备心跳也报了它，实际合成却用配置行的
+    # 那一个，听感上就是「角色音色从来没生效过」（用户 2026-11-03 实报）。
+    #
+    # 配置行的音色仍然有用：角色没指定（空串 = 跟随系统默认）、或角色存的是
+    # 上一家厂商的旧音色（形态不符被置空）时由它接手。两条都过
+    # ``_shape_ok_voice``，所以跨厂商的旧值不会硬塞给厂商（那会整句没声音）。
+    voice = _shape_ok_voice(style, voice) or _shape_ok_voice(style, _row_voice(row))
     if style == "edge":
         from . import tts_edge
         try:
@@ -945,6 +961,11 @@ def tts_stream(db: Any, sentence: str, *, voice: str = "",
         # 也不假装流式。
         yield _tts_atomic_with_fallback(db, sentence, voice=voice, speed=speed)
         return
+
+    # 与 tts() 同一条音色解析链：**角色 > 配置行**，两边都过厂商形态过滤。
+    # 这条分支原先直接把调用方 voice 塞进请求体 —— 于是「配置行音色」在流式
+    # 路径上完全不生效、跨厂商的旧音色名也不会被挡住，与 tts() 判据不一致。
+    voice = _shape_ok_voice(_style, voice) or _shape_ok_voice(_style, _row_voice(row))
 
     timeout = _row_timeout(row, TTS_TIMEOUT_SEC)
     model = (getattr(row, "model", "") or "").strip() or "tts-1"

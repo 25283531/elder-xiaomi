@@ -163,6 +163,10 @@ DEFAULT_PORTS: dict[str, int] = {
     # 它会直连同一个库文件读 wifi_state 与 wifi_req_pwd（问接口等于让被测方自证），
     # 故独占一个端口。
     "smoke_wifi_change": 8138,
+    # 人格预设实报回归（2026-11-03）：数值档位区间匹配 / 保存真生效 /
+    # 角色音色在合成路径里的优先级。它走真实 HTTP 改同一个库文件，
+    # 且要读 user.html 源码，故独占一个端口。
+    "smoke_role_traits_voice": 8139,
 }
 
 

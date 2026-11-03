@@ -41,7 +41,7 @@ from ..memory.persona import (build_persona_prompt, copy_l2_manual, merge_profil
                               reset_persona)
 from ..persona import admin_audit, catalog, guardrails
 from ..persona import spec as spec_mod
-from ..persona.compiler import ProfileMerger, PromptCompiler, effective_traits
+from ..persona.compiler import ProfileMerger, PromptCompiler
 from ..persona.spec import TraitValueError, from_row
 from ..schemas import (
     GuardrailCardOut,
@@ -261,11 +261,30 @@ def _role_out(db: Session, row: models.AIProvider,
     traits 给 overlay 原样、traits_effective 给叠加母版后的生效值 ——
     两个都给，APP 才能既显示"你改了什么"又显示"实际是什么"。
 
+    ⚠️ ``traits_effective`` **只叠加母版，不叠加画像**（2026-11-03 修正）
+    ------------------------------------------------------------------
+    旧实现是 ``effective_traits(spec, profile)``，而 ``effective_traits``
+    会把画像里的布尔 humor 映射成 **0.1 / 0.7** 覆盖声明值（见
+    ``compiler.effective_traits``）。于是：
+
+      * 用户端角色编辑弹窗（``user.html`` 的 ``editRole``）把这个字段当成
+        "当前值"显示 ⇒ 页面永远显示 0.1，而 0.1 不是任何档位的上界
+        （档位是 0.3/0.6/1.0）⇒「当前值 0.1 不在任何档位里」；
+      * 保存后重新打开，画像又把刚存下的 0.6 覆盖回 0.1 ⇒ 用户看到的是
+        「保存根本没生效」，而库里其实一直是 0.6。
+
+    根因是**两个语义被塞进同一个字段**：用户编辑的是「我设的」（声明），
+    画像修正的是「实测出来的」（prompt 的第 ④ 段，由
+    ``_section_persona`` 直接读 profile）。把画像修正混进这个字段，
+    等于让实测值冒充用户的设置，且不可编辑、保存不回去。
+
+    ``schemas.RoleOut`` 里对它的定义本来就是「叠加母版之后的生效值」，
+    不含画像 —— 这里回到那个契约。
+
     :param for_listing: 列表路径传 True —— 脏 traits 降级而不是 400 整表挂。
         理由与降级细节见 :func:`_list_spec_of`。
     """
     spec = _list_spec_of(db, row) if for_listing else _spec_of(db, row)
-    profile = _effective_profile(db, row, for_listing=for_listing)
     ack_version = str(row.guardrail_ack_version or "")
     return RoleOut(
         id=row.id,
@@ -280,7 +299,7 @@ def _role_out(db: Session, row: models.AIProvider,
         parent_id=row.parent_id,
         traits=(guardrails.as_dict(row.traits, role_id=row.id, column="traits")
                 if for_listing else guardrails.as_dict(row.traits)),
-        traits_effective=effective_traits(spec, profile),
+        traits_effective=spec.traits_effective(),
         guardrail_version=catalog.GUARDRAIL_VERSION,
         guardrail_ack_at=row.guardrail_ack_at,
         # 红线版本一变就变回未确认：用户确认的是"某一个版本"，
