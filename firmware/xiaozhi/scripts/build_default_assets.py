@@ -304,7 +304,8 @@ def process_extra_files(extra_files_dir, assets_dir):
     return extra_files_list
 
 
-def generate_index_json(assets_dir, srmodels, text_font, emoji_collection, extra_files=None, multinet_model_info=None):
+def generate_index_json(assets_dir, srmodels, text_font, emoji_collection, extra_files=None,
+                        multinet_model_info=None, large_text_font=None):
     """Generate index.json file"""
     index_data = {
         "version": 1
@@ -315,6 +316,17 @@ def generate_index_json(assets_dir, srmodels, text_font, emoji_collection, extra
     
     if text_font:
         index_data["text_font"] = text_font
+
+    # 2026-11-03：对话区专用的大号字体（适老化）。
+    #
+    # 为什么要第二个字体而不是直接把 text_font 换大：状态栏只有 30px 高，
+    # 而 30px 字体的 line_height 是 38 —— 换上去状态栏的时钟/日期会被上下
+    # 各切掉 4px。所以两档并存：状态栏/提醒卡片沿用 text_font，只有左列
+    # 对话文字用 text_font_large。
+    #
+    # 设备端读取处：main/assets.cc 的 Assets::Apply()。
+    if large_text_font:
+        index_data["text_font_large"] = large_text_font
     
     if emoji_collection:
         index_data["emoji_collection"] = emoji_collection
@@ -746,7 +758,7 @@ def get_emoji_collection_path(default_emoji_collection, xiaozhi_fonts_path):
         return None
 
 
-def build_assets_integrated(wakenet_model_paths, multinet_model_paths, text_font_path, emoji_collection_path, extra_files_path, output_path, multinet_model_info=None):
+def build_assets_integrated(wakenet_model_paths, multinet_model_paths, text_font_path, emoji_collection_path, extra_files_path, output_path, multinet_model_info=None, large_text_font_path=None):
     """
     Build assets using integrated functions (no external dependencies)
     """
@@ -766,11 +778,13 @@ def build_assets_integrated(wakenet_model_paths, multinet_model_paths, text_font
         # Process each component
         srmodels = process_sr_models(wakenet_model_paths, multinet_model_paths, temp_build_dir, assets_dir) if (wakenet_model_paths or multinet_model_paths) else None
         text_font = process_text_font(text_font_path, assets_dir) if text_font_path else None
+        large_text_font = process_text_font(large_text_font_path, assets_dir) if large_text_font_path else None
         emoji_collection = process_emoji_collection(emoji_collection_path, assets_dir) if emoji_collection_path else None
         extra_files = process_extra_files(extra_files_path, assets_dir) if extra_files_path else None
         
         # Generate index.json
-        generate_index_json(assets_dir, srmodels, text_font, emoji_collection, extra_files, multinet_model_info)
+        generate_index_json(assets_dir, srmodels, text_font, emoji_collection, extra_files,
+                            multinet_model_info, large_text_font)
         
         # Generate config.json for packing
         config_path = generate_config_json(temp_build_dir, assets_dir)
@@ -811,6 +825,7 @@ def main():
     parser = argparse.ArgumentParser(description='Build default assets based on configuration')
     parser.add_argument('--sdkconfig', required=True, help='Path to sdkconfig file')
     parser.add_argument('--builtin_text_font', help='Builtin text font name (e.g., font_puhui_basic_16_4)')
+    parser.add_argument('--large_text_font', help='对话区专用大号字体名 (e.g., font_puhui_basic_30_4)；不传则只有一档字体')
     parser.add_argument('--emoji_collection', help='Default emoji collection name (e.g., emojis_32)')
     parser.add_argument('--output', required=True, help='Output path for assets.bin')
     parser.add_argument('--esp_sr_model_path', help='Path to ESP-SR model directory')
@@ -874,6 +889,7 @@ def main():
     
     # Get text font path if needed
     text_font_path = get_text_font_path(args.builtin_text_font, args.xiaozhi_fonts_path)
+    large_text_font_path = get_text_font_path(args.large_text_font, args.xiaozhi_fonts_path)
     
     # Get emoji collection path if needed
     emoji_collection_path = get_emoji_collection_path(args.emoji_collection, args.xiaozhi_fonts_path)
@@ -918,7 +934,8 @@ def main():
     
     # Build the assets
     success = build_assets_integrated(wakenet_model_paths, multinet_model_paths, text_font_path, emoji_collection_path, 
-                                     extra_files_path, args.output, multinet_model_info)
+                                     extra_files_path, args.output, multinet_model_info,
+                                     large_text_font_path)
     
     if not success:
         sys.exit(1)

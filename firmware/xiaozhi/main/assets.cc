@@ -252,6 +252,40 @@ bool Assets::Apply() {
         }
     }
 
+    /* 对话区专用大号字体（2026-11-03 适老化）。
+     *
+     * 为什么单独一份、不直接换 text_font：状态栏只有 30px 高，30px 字体的
+     * line_height 是 38，换上去时钟和日期会被上下各切掉 4px。
+     *
+     * 缺这个字段时**不是错误**：其他板子没配 DEFAULT_LARGE_TEXT_FONT，界面
+     * 应当原样可用。所以这里不报错，调用方靠 large_text_font() 返回 nullptr
+     * 回落到 text_font()（见 LcdDisplay::SetupUI 与 SetTheme）。 */
+    cJSON* large_font = cJSON_GetObjectItem(root, "text_font_large");
+    if (cJSON_IsString(large_font)) {
+        std::string large_file = large_font->valuestring;
+        void* lptr = nullptr;
+        size_t lsize = 0;
+        if (GetAssetData(large_file, lptr, lsize)) {
+            auto large_text_font = std::make_shared<LvglCBinFont>(lptr);
+            if (large_text_font->font() != nullptr) {
+                ESP_LOGI(TAG, "大号正文字体 %s line_height=%d", large_file.c_str(),
+                         (int)large_text_font->font()->line_height);
+                if (light_theme != nullptr) {
+                    light_theme->set_large_text_font(large_text_font);
+                }
+                if (dark_theme != nullptr) {
+                    dark_theme->set_large_text_font(large_text_font);
+                }
+            } else {
+                ESP_LOGE(TAG, "大号正文字体 %s 解析失败，对话区回落到常规字号",
+                         large_file.c_str());
+            }
+        } else {
+            ESP_LOGE(TAG, "index.json 声明了大号正文字体 %s，但 assets 里没有",
+                     large_file.c_str());
+        }
+    }
+
     cJSON* emoji_collection = cJSON_GetObjectItem(root, "emoji_collection");
     if (cJSON_IsArray(emoji_collection)) {
         auto custom_emoji_collection = std::make_shared<EmojiCollection>();

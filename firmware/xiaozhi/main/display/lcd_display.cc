@@ -905,6 +905,21 @@ void LcdDisplay::SetupUI() {
     auto icon_font = lvgl_theme->icon_font()->font();
     auto large_icon_font = lvgl_theme->large_icon_font()->font();
 
+    /* 对话区字号（2026-11-03 适老化：老人反馈左列文字太小）。
+     *
+     * 用 assets 里单独打包的大号字体（本板 30px，line_height 38），**不**直接
+     * 把 text_font 换大：状态栏只有 30px 高，30px 字体放进去上下各切 4px。
+     *
+     * 没打包 large 字体时（其他板子）回落到 text_font —— 这里绝不能假定
+     * large_text_font() 非空，否则换块板子就是空指针解引用。 */
+    auto chat_font = text_font;
+    if (lvgl_theme->large_text_font() != nullptr &&
+        lvgl_theme->large_text_font()->font() != nullptr) {
+        chat_font = lvgl_theme->large_text_font()->font();
+        ESP_LOGI(TAG, "对话区使用大号字体 line_height=%d（常规 %d）",
+                 (int)chat_font->line_height, (int)text_font->line_height);
+    }
+
     /* ---- 字幕不显示定因诊断（2026-10-22）----
      * 打印字体指针、line_height、以及用「待」字做一次真实 glyph 查表。
      * 如果 get_glyph_dsc 返回 false，就是字库/struct 布局问题；
@@ -935,6 +950,23 @@ void LcdDisplay::SetupUI() {
      * 同样只有 bg_color —— 一旦哪一层被设成半透明，底下的黑屏就会透上来，
      * 整屏发灰。两层都显式 COVER，结论不依赖默认值。 */
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+
+    /* screen 必须**不可滚动**（2026-11-03 真机反馈：待机跑马灯时屏幕底部
+     * 有一条小的左右滚动条）。
+     *
+     * 根因：跑马灯的两张 lv_image 是 screen 的**直接子对象**，x 从 LV_HOR_RES
+     * 一路走到 -img_w —— 它们的包围盒超出 screen 的内容区。LVGL 的 screen
+     * 默认带 LV_OBJ_FLAG_SCROLLABLE，一旦子对象超出范围就把自己变成可滚动
+     * 容器，并在底部画一条水平滚动条。
+     *
+     * 之前没暴露是因为跑马灯挂在 emoji_box_ 底下（那个对象自己清过
+     * SCROLLABLE）；2026-11-03 改成 screen 的直接子对象（为了跨全屏滚）之后
+     * 才冒出来。滚动条不在任何设计稿里，而且每滚一轮闪一次。
+     *
+     * ⚠️ 只清 SCROLLABLE 不够，还要把 scrollbar_mode 关掉：LVGL 在内容变化时
+     * 会按 mode 重新决定是否画条，MODE_OFF 才是"永远不画"。 */
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(screen, LV_SCROLLBAR_MODE_OFF);
 
     /* Container - used as background */
     container_ = lv_obj_create(screen);
@@ -1143,7 +1175,7 @@ void LcdDisplay::SetupUI() {
     lv_label_set_long_mode(chat_user_label_, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(chat_user_label_, LV_TEXT_ALIGN_LEFT, 0);
     lv_obj_set_style_text_color(chat_user_label_, lv_color_hex(kColorTextUser), 0);
-    lv_obj_set_style_text_font(chat_user_label_, text_font, 0);
+    lv_obj_set_style_text_font(chat_user_label_, chat_font, 0);
     lv_obj_set_style_text_line_space(chat_user_label_, LV_VER_RES * 4 / 240, 0);
     lv_label_set_text(chat_user_label_, "");
     lv_obj_add_flag(chat_user_label_, LV_OBJ_FLAG_HIDDEN);
@@ -1154,7 +1186,7 @@ void LcdDisplay::SetupUI() {
     lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_LEFT, 0);
     lv_obj_set_style_text_color(chat_message_label_, lvgl_theme->text_color(), 0);
-    lv_obj_set_style_text_font(chat_message_label_, text_font, 0);  /* 显式设，不靠继承 */
+    lv_obj_set_style_text_font(chat_message_label_, chat_font, 0);  /* 显式设，不靠继承 */
     lv_obj_set_style_text_line_space(chat_message_label_, LV_VER_RES * 4 / 240, 0);
     lv_label_set_text(chat_message_label_, "");
 
@@ -1299,12 +1331,39 @@ void LcdDisplay::SetStatusClock(const char* text) {
     if (date_label_ == nullptr) {
         return;
     }
+    /* WiFi 图标（2026-11-03 真机反馈：状态栏没有 WiFi 图标）。
+     *
+     * 基类 LvglDisplay::UpdateStatusBar() 里本来有一段 10 秒一次的刷新，走
+     * board.GetNetworkStateIcon() + network_icon_ 缓存。真机上图标是空的，
+     * 而那段逻辑在 SetupUI 之前就可能跑过（那时 network_label_ 还是 nullptr），
+     * 具体原因靠一次诊断日志定位。这里先保证**一定能显示**：与时钟同频
+     * （同样 10 秒）主动刷一次，判据只看"图标变了没"，不看 label 建没建。
+     *
+     * 为什么值得单独兜一层：状态栏的 WiFi 图标是老人判断"能不能联网"的
+     * 唯一依据。图标空着他只会觉得"设备坏了、连不上"。
+     *
+     * 取值放锁外：GetNetworkStateIcon() 会读 WiFi 驱动里的 RSSI，持着显示锁
+     * 调驱动不是好习惯。 */
+    const char* net_icon = Board::GetInstance().GetNetworkStateIcon();
+
     DisplayLockGuard lock(this);
     /* 把状态栏恢复成「时钟 34% + 图标日期」的设计稿比例 */
     if (status_bar_ != nullptr) {
         lv_obj_set_width(status_bar_, LV_HOR_RES * 34 / 100);
     }
     lv_obj_remove_flag(date_label_, LV_OBJ_FLAG_HIDDEN);
+
+    /* WiFi 图标落地（取值在锁外，见函数开头）。
+     *
+     * ⚠️ 必须放在下面那段「系统时间没同步就 return」**之前**：开机后头十几秒
+     * tm_year 还是 1970，那时正是老人看着状态栏问"怎么连不上"的时候 ——
+     * 把图标更新放在 return 后面，等于在最需要它的那段时间不显示。 */
+    if (network_label_ != nullptr && net_icon != nullptr &&
+        network_icon_ != net_icon) {
+        network_icon_ = net_icon;
+        lv_label_set_text(network_label_, net_icon);
+        ESP_LOGI(TAG, "状态栏 WiFi 图标已刷新（rssi 档位变化或首次设置）");
+    }
 
     time_t now = time(NULL);
     struct tm* tm = localtime(&now);
@@ -1972,6 +2031,17 @@ void LcdDisplay::SetTheme(Theme* theme) {
     auto icon_font = lvgl_theme->icon_font()->font();
     auto large_icon_font = lvgl_theme->large_icon_font()->font();
 
+    /* 对话区字号：与 SetupUI 同一判据（大号字体缺失时回落常规字号）。
+     * 这里**必须**重算一遍 —— SetTheme 是「开机首次 Apply」和「换主题」的
+     * 共同入口，而 SetupUI 跑在 Assets::Apply() 之前，那时 theme 里还是
+     * 编译进固件的小字库。漏了这一段，开机后对话区会一直是 20px，
+     * 只有手动换一次主题才变大。 */
+    auto chat_font = text_font;
+    if (lvgl_theme->large_text_font() != nullptr &&
+        lvgl_theme->large_text_font()->font() != nullptr) {
+        chat_font = lvgl_theme->large_text_font()->font();
+    }
+
     /* 2026-10-23 诊断：SetTheme 是把 theme 的字体刷到各 label 的唯一
      * 入口。打出来的指针/lh 与 Assets::Apply 创建字体时的快照对照：
      * 三个指针一致而 label 仍高 36 ⇒ 字体对象运行时被改写；
@@ -2015,7 +2085,7 @@ void LcdDisplay::SetTheme(Theme* theme) {
      * 热更新的统一入口，补在这里对「开机首次加载」和「后续换主题」两条路
      * 都成立，也不会打乱 SetupUI 与 LVGL 初始化的先后依赖。 */
     if (chat_message_label_ != nullptr) {
-        lv_obj_set_style_text_font(chat_message_label_, text_font, 0);
+        lv_obj_set_style_text_font(chat_message_label_, chat_font, 0);
     }
     if (status_label_ != nullptr) {
         lv_obj_set_style_text_font(status_label_, text_font, 0);
@@ -2048,7 +2118,7 @@ void LcdDisplay::SetTheme(Theme* theme) {
     }
     /* 2026-11-03 新增的两个对话/状态栏 label 同样必须补字体 */
     if (chat_user_label_ != nullptr) {
-        lv_obj_set_style_text_font(chat_user_label_, text_font, 0);
+        lv_obj_set_style_text_font(chat_user_label_, chat_font, 0);
     }
     if (date_label_ != nullptr) {
         lv_obj_set_style_text_font(date_label_, text_font, 0);

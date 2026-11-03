@@ -30,6 +30,9 @@ public:
     inline std::shared_ptr<LvglImage> background_image() const { return background_image_; }
     inline std::shared_ptr<EmojiCollection> emoji_collection() const { return emoji_collection_; }
     inline std::shared_ptr<LvglFont> text_font() const { return text_font_; }
+    /* 对话区专用的大号正文字体（2026-11-03 适老化）。
+     * 没打包 large 字体时返回 nullptr，调用方必须回落到 text_font()。 */
+    inline std::shared_ptr<LvglFont> large_text_font() const { return large_text_font_; }
     inline std::shared_ptr<LvglFont> icon_font() const { return icon_font_; }
     inline std::shared_ptr<LvglFont> large_icon_font() const { return large_icon_font_; }
     inline int spacing(int scale) const { return spacing_ * scale; }
@@ -46,6 +49,7 @@ public:
     inline void set_background_image(std::shared_ptr<LvglImage> background_image) { background_image_ = background_image; }
     inline void set_emoji_collection(std::shared_ptr<EmojiCollection> emoji_collection) { emoji_collection_ = emoji_collection; }
     inline void set_text_font(std::shared_ptr<LvglFont> text_font) { text_font_ = text_font; }
+    inline void set_large_text_font(std::shared_ptr<LvglFont> font) { large_text_font_ = font; }
     inline void set_icon_font(std::shared_ptr<LvglFont> icon_font) { icon_font_ = icon_font; }
     inline void set_large_icon_font(std::shared_ptr<LvglFont> large_icon_font) { large_icon_font_ = large_icon_font; }
 
@@ -68,6 +72,7 @@ private:
 
     // fonts
     std::shared_ptr<LvglFont> text_font_ = nullptr;
+    std::shared_ptr<LvglFont> large_text_font_ = nullptr;
     std::shared_ptr<LvglFont> icon_font_ = nullptr;
     std::shared_ptr<LvglFont> large_icon_font_ = nullptr;
 
