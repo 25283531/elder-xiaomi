@@ -606,9 +606,9 @@ def parse_when(text: str, now: datetime | None = None) -> ParsedWhen:
     repeat_word = ""
     if re.search(r"每天|每日|天天", s):
         kind, repeat_word = ScheduleKind.DAILY, "每天"
-    elif re.search(r"每周|每星期|星期[一二三四五六天末]|礼拜[一二三四五六天末]|周[一二三四五六天末]", s):
+    elif re.search(r"每周|每星期|星期[一二三四五六天末日]|礼拜[一二三四五六天末日]|周[一二三四五六天末日]", s):
         kind, repeat_word = ScheduleKind.WEEKLY, "每周"
-        for m in re.finditer(r"(?:星期|礼拜|周)([一二三四五六天末])", s):
+        for m in re.finditer(r"(?:星期|礼拜|周)([一二三四五六天末日])", s):
             weekdays.append(_WEEKDAY_WORDS[m.group(1)])
         weekdays = sorted(set(weekdays))
         if not weekdays:
@@ -774,7 +774,7 @@ def parse_when(text: str, now: datetime | None = None) -> ParsedWhen:
             return ParsedWhen(ok=False, reason="老人说的是过去的时间，无法创建提醒，"
                                                "请确认是不是明天的同一个时间")
         else:
-            wd = re.search(r"(?:星期|礼拜|周)([一二三四五六天末])", s)
+            wd = re.search(r"(?:星期|礼拜|周)([一二三四五六天末日])", s)
             if wd:
                 want = _WEEKDAY_WORDS[wd.group(1)]
                 delta = (want - today.isoweekday()) % 7
