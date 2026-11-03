@@ -57,6 +57,10 @@ _CLIP_FILES = {
     "ELDER_CLIP_ESCALATED": "elder_escalated.ogg",
     "ELDER_CLIP_SKIPPED": "elder_skipped.ogg",
     "ELDER_CLIP_NO_REMINDER": "elder_no_reminder.ogg",
+    # 2026-11-03 长按即时应答（用户需求）：日程确认完成 / 服药确认问句。
+    # 这两条不是"提醒播报"，而是**按键应答**，所以文本里没有时段、没有药名。
+    "ELDER_CLIP_SCHED_DONE": "elder_sched_done.ogg",
+    "ELDER_CLIP_MED_CONFIRM": "elder_med_confirm.ogg",
 }
 
 #: 硬约束：设备解码链路的采样率（boards/lichuang-dev/config.h + es8311 编解码器）

@@ -15,6 +15,7 @@
 #include <cstring>
 #include <cstdio>
 #include <ctime>
+#include <string>   // 字幕累积：std::string 拼上一句 + 这一句（SetChatMessage）
 
 #include "board.h"
 
@@ -1448,10 +1449,58 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     }
 
     const char* text = (content != nullptr) ? content : "";
-    lv_label_set_text(target, text);
+    /* ---- 字幕必须**累积**，不能每句覆盖（2026-11-03 用户实报）----
+     *
+     * 用户原话：「当前字幕还是一屏显示，显示不完整。不能自动换页显示或者
+     * 滚动向上。」
+     *
+     * 根因不是分页算法，而是**数据根本没留在屏上**：服务端每念一句就发一条
+     * `sentence_start`（application.cc:592-599），而这里每来一句都
+     * `lv_label_set_text` 覆盖掉上一句。于是一段 5 句的回答，屏上永远只有
+     * 最后一句 —— 分页自然永远不会触发（每句都只有一两行，装得下），
+     * 老人却漏掉了前面 4 句。这也解释了"能翻页却没翻"：没有内容可翻。
+     *
+     * 现在的语义：
+     *   · assistant：**追加**（换行分隔），整段回答留在屏上，由 ChatPageLayout
+     *     按页翻；
+     *   · user：覆盖（用户话只有一句，且它到达时本来就该清掉上一轮回答）；
+     *   · system：覆盖（升级/报错/请稍候是瞬时状态，累积会变成一屏乱码）。
+     *
+     * 重复保护：工具轮里服务端可能把同一句重发一次，追加前先看末尾是不是
+     * 已经就是这句 —— 是就不动，否则老人会看到同一句话两遍。
+     */
+    const bool is_system = (role != nullptr && strcmp(role, "system") == 0);
+    if (!is_user && !is_system && text[0] != '\0') {
+        const uint32_t now_tick = lv_tick_get();
+        /* 距上一句超过 20 秒 ⇒ 这是**新的一轮**（上一轮没有用户话可清），
+         * 覆盖而不是追加，否则两轮回答会拼成一段。 */
+        const bool new_round = (chat_assistant_tick_ == 0) ||
+                               ((uint32_t)(now_tick - chat_assistant_tick_) > 20000u);
+        chat_assistant_tick_ = now_tick;
+        const char* prev = new_round ? nullptr : lv_label_get_text(target);
+        if (prev != nullptr && prev[0] != '\0') {
+            const size_t prev_len = strlen(prev);
+            const size_t add_len = strlen(text);
+            const bool dup = (prev_len >= add_len) &&
+                             (strcmp(prev + prev_len - add_len, text) == 0);
+            if (!dup) {
+                std::string merged(prev);
+                merged += "\n";
+                merged += text;
+                lv_label_set_text(target, merged.c_str());
+            }
+        } else {
+            lv_label_set_text(target, text);
+        }
+    } else {
+        lv_label_set_text(target, text);
+    }
     /* 空串 ⇒ 隐藏：flex 跳过隐藏子对象，另一行会自动顶上去。
-     * 不隐藏的话会留一行空白，看着像"屏幕上多了一条横线"。 */
-    if (text[0] == '\0') {
+     * 不隐藏的话会留一行空白，看着像"屏幕上多了一条横线"。
+     * 判据看的是 **label 当前的内容**而不是本次入参：assistant 走追加分支时，
+     * 入参为空不代表屏上是空的。 */
+    const char* shown = lv_label_get_text(target);
+    if (shown == nullptr || shown[0] == '\0') {
         lv_obj_add_flag(target, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_remove_flag(target, LV_OBJ_FLAG_HIDDEN);
@@ -1460,7 +1509,6 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     lv_obj_t* other = is_user ? chat_message_label_ : chat_user_label_;
     if (other != nullptr && !is_user) {
         /* 只有 system 才清用户话；assistant 要留着（见上面注释）。 */
-        const bool is_system = (role != nullptr && strcmp(role, "system") == 0);
         if (is_system) {
             lv_label_set_text(other, "");
             lv_obj_add_flag(other, LV_OBJ_FLAG_HIDDEN);
@@ -2584,16 +2632,23 @@ void LcdDisplay::ShowReminder(const char* text) {
         lv_label_set_text(reminder_title_, "");
 
         /* ---- 明细：多行左对齐 ----
-         * 位置紧接标题行之下；行距 6px。最多 3 行（再多的提醒同一分钟
-         * 不会超过 3 条），超出的由 LONG_WRAP 自动换行、被下方提示语挡住。 */
+         * 2026-11-03 用户需求：「如果累积的有多条提醒，则同时显示在一屏上」。
+         * 原来是固定 88px 高、行距 4px ⇒ 30px 字体只能放 2 行，第 3 条起被裁掉；
+         * 而橙色提示语又从下面压上来（BOTTOM -52），实际只剩 1.7 行。
+         *
+         * 现在按**可用带宽**算行数：从标题下沿到橙色按钮上沿，行距归零。
+         * 320x240 上是 (166-52)/38 = 3 行 —— 正好覆盖"同分钟三条"这个真实场景
+         * （降压药 + 降糖药 + 喝水）。行数不写死，换字体/换屏自动跟着变。 */
         reminder_items_ = lv_label_create(reminder_overlay_);
-        lv_obj_set_pos(reminder_items_, col_x, LV_VER_RES * 46 / 240);
+        lv_obj_set_pos(reminder_items_, col_x, LV_VER_RES * 52 / 240);
         lv_obj_set_width(reminder_items_, col_w);
-        lv_obj_set_height(reminder_items_, LV_VER_RES * 88 / 240);
+        lv_obj_set_height(reminder_items_, LV_VER_RES * 88 / 240);   /* 创建时占位，下面按实测行高重设 */
         lv_label_set_long_mode(reminder_items_, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_align(reminder_items_, LV_TEXT_ALIGN_LEFT, 0);
         lv_obj_set_style_text_color(reminder_items_, lv_color_hex(kColorTextDark), 0);
-        lv_obj_set_style_text_line_space(reminder_items_, LV_VER_RES * 4 / 240, 0);
+        /* 行距 0：明细是"一行一件事"，靠换行分行，不需要额外留白；
+         * 留 4px 会让 3 行变成 126px，超出 114px 的可用带宽，第 3 行被切掉半截。 */
+        lv_obj_set_style_text_line_space(reminder_items_, 0, 0);
         if (text_font != nullptr) {
             lv_obj_set_style_text_font(reminder_items_, text_font, 0);
         }
@@ -2711,10 +2766,35 @@ void LcdDisplay::ShowReminder(const char* text) {
     } else {
         lv_obj_remove_flag(reminder_items_, LV_OBJ_FLAG_HIDDEN);
     }
-    if (hint_buf[0] == '\0') {
-        lv_obj_add_flag(reminder_hint_, LV_OBJ_FLAG_HIDDEN);
-    } else {
+    /* 明细行数 → 高度。**必须按行数设高**：label 默认高度是内容高，
+     * 内容超 3 行时会自己长到 4、5 行，把橙色按钮整块盖住（按钮是唯一
+     * 的行动指引，被盖住等于这台机器没法操作）。 */
+    int item_lines = 0;
+    if (items_buf[0] != '\0') {
+        item_lines = 1;
+        for (const char* q = items_buf; *q != '\0'; q++) {
+            if (*q == '\n') item_lines++;
+        }
+    }
+    const int item_line_h = (text_font != nullptr)
+                                ? (int)text_font->line_height
+                                : (LV_VER_RES * 38 / 240);
+    const int items_top = LV_VER_RES * 52 / 240;
+    const int items_bottom = card_h - LV_VER_RES * 44 / 240;   /* 橙色按钮上沿 */
+    int fit_lines = (item_line_h > 0) ? (items_bottom - items_top) / item_line_h : 1;
+    if (fit_lines < 1) fit_lines = 1;
+    if (item_lines > fit_lines) item_lines = fit_lines;         /* 兜底裁剪，防盖按钮 */
+    lv_obj_set_height(reminder_items_, item_lines * item_line_h);
+
+    /* 橙色提示语只在一行明细时出现（2026-11-03）：
+     * 它固定在 BOTTOM -52（y≈120），与 2 行以上的明细是**同一块**空间。
+     * 两条以上提醒时，明细比"请及时服用"重要得多 —— 让位给明细。
+     * 提示语的内容也没有丢：橙色按钮上就写着"长按…确认"。 */
+    const bool show_hint = (hint_buf[0] != '\0') && (item_lines <= 1);
+    if (show_hint) {
         lv_obj_remove_flag(reminder_hint_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(reminder_hint_, LV_OBJ_FLAG_HIDDEN);
     }
 
     /* 头像跟着当前表情走：emoji_image_ 的 src 就是"小安现在的脸"

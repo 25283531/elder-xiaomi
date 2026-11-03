@@ -642,7 +642,7 @@ static void tick(void)
             (now_us() - g.last_reshow_us) >= 5LL * 1000 * 1000) {
             int idx = elder_reminder_first_ringing();
             if (idx >= 0 && idx < ELDER_REMINDER_MAX) {
-                char screen_text[160];
+                char screen_text[256];
                 const elder_rmd_item_t *it = &g.table.items[idx];
                 elder_reminder_screen_text(it, screen_text, sizeof(screen_text));
                 elder_ui_show_reminder(screen_text);
@@ -1701,12 +1701,58 @@ void elder_reminder_screen_text(const elder_rmd_item_t *item, char *out, size_t 
      * 需求原话是「让老人知道不止一条」。N 只算**已触发**的，所以第一条
      * 触发时不会预支后面的条数（tick 在同一轮里会紧接着触发剩下的，
      * 屏幕会连着刷新到最终值，老人看到的是最后一次）。 */
-    uint8_t total = pending_same_minute(item->fired_due_at);
+    /* 「同一分钟里的其他条目」：2026-11-03 用户需求 ——
+     * 「如果累积的有多条提醒，则同时显示在一屏上」。
+     *
+     * 原来这里只写一句「（还有 N 条）」，老人知道"不止一条"却不知道是哪几条，
+     * 只能靠听（而同一分钟只播一条音）—— 等于后两条既没听到也没看到。
+     * 现在逐条列出来，一行一件，与标题/提示语的格式契约保持不变
+     * （见本函数顶部：第 1 行标题、以「请」开头的是提示语、其余是明细）。
+     *
+     * ⚠️ 屏上**只有 3 行**明细的空间（320x240 / 30px 字体，算式见
+     *    lcd_display.cc ShowReminder）：3 条以内全部列出；超过 3 条时只列前
+     *    2 条，第 3 行写「等 N 件」—— 把第 3 条挤掉换成"还有更多"，
+     *    比让第 3、4 条都被裁掉更诚实。
+     *
+     * ⚠️ 名字里可能带换行（家属可控输入）？label 在 sync.c 里已按
+     *    ELDER_REMINDER_LABEL 截断并只保留可见字符，换行会破坏"一行一件"的
+     *    契约 —— 这里再挡一次：遇到 \r \n 一律换成空格。 */
     const char *hint = (item->type == ELDER_RMD_TYPE_MEDICINE)
                            ? "请及时服用" : "请及时处理";
+    uint8_t total = pending_same_minute(item->fired_due_at);
     if (total > 1) {
-        snprintf(out, len, "%s\n（还有 %u 条）\n%s",
-                 head, (unsigned)(total - 1), hint);
+        char list[128];
+        size_t used = 0;
+        list[0] = '\0';
+        uint8_t listed = 0;
+        const uint8_t cap = (total > 3) ? 2 : 3;
+        const int64_t minute = item->fired_due_at / 60;
+        for (int i = 0; i < g.table.count && i < ELDER_REMINDER_MAX; i++) {
+            const elder_rmd_item_t *it = &g.table.items[i];
+            if (!it->enabled || it->fired_due_at <= 0) continue;
+            if (it->fired_due_at / 60 != minute) continue;
+            uint8_t st = g.state[i];
+            if (st != ELDER_RMD_PENDING && st != ELDER_RMD_CONFIRM_WIN &&
+                st != ELDER_RMD_ESCALATED && st != ELDER_RMD_HALF_CONFIRMED) {
+                continue;
+            }
+            if (listed >= cap) break;
+            char name[ELDER_REMINDER_LABEL + 1];
+            snprintf(name, sizeof(name), "%s", it->label);
+            for (char *p = name; *p != '\0'; p++) {
+                if (*p == '\r' || *p == '\n') *p = ' ';
+            }
+            int n = snprintf(list + used, sizeof(list) - used, "%s%s",
+                             used > 0 ? "\n" : "", name);
+            if (n <= 0 || (size_t)n >= sizeof(list) - used) break;
+            used += (size_t)n;
+            listed++;
+        }
+        if (listed < total) {
+            snprintf(list + used, sizeof(list) - used, "\n等 %u 件",
+                     (unsigned)(total - listed));
+        }
+        snprintf(out, len, "%s\n%s\n%s", head, list, hint);
     } else {
         snprintf(out, len, "%s\n%s", head, hint);
     }

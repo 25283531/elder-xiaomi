@@ -36,6 +36,13 @@ static const char *TAG = "elder.clip";
  *   skipped         34 帧 =  2040ms
  *   no_reminder     32 帧 =  1920ms
  *
+ * 2026-11-03 长按即时应答（2 条，同一编码参数）：
+ *   sched_done      63 帧 =  3780ms
+ *   med_confirm     45 帧 =  2700ms
+ * 这两条的时长**被当成计时器用**：长按后要先等它播完再 StartListening
+ * （见 elder_bridge.cc 的 ListenAfterClipTask）。抄错会让设备在句子还没说完
+ * 时就开始收音，或者说完之后干等 1 秒 —— 前者会把老人的回答切掉。
+ *
  * ⚠️ medicine/todo 的时长改过两次，两条都是**用户需求**，别"顺手改回去"：
  *    2026-11-03 第一次加长（7080 → 10560ms）：补上「请长按机身顶部凸起的
  *      橙色大按键确认」—— 屏幕早就写了这个动作，语音不说等于让不看屏的老人
@@ -54,6 +61,8 @@ static const uint32_t kClipMs[ELDER_CLIP_COUNT] = {
     2520,   /* ELDER_CLIP_ESCALATED */
     2040,   /* ELDER_CLIP_SKIPPED */
     1920,   /* ELDER_CLIP_NO_REMINDER */
+    3780,   /* ELDER_CLIP_SCHED_DONE */
+    2700,   /* ELDER_CLIP_MED_CONFIRM */
 };
 
 /*: 日志用的名字。写死而不是用 enum 名：C 里拿不到枚举的字符串形式，
@@ -61,6 +70,7 @@ static const uint32_t kClipMs[ELDER_CLIP_COUNT] = {
 static const char *const kClipName[ELDER_CLIP_COUNT] = {
     "medicine", "todo", "confirm_hint", "done",
     "escalated", "skipped", "no_reminder",
+    "sched_done", "med_confirm",
 };
 
 static bool clip_id_ok(int id)
