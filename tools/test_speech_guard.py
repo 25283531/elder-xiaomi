@@ -363,6 +363,168 @@ def t6_call_arity() -> None:
           "；".join(problems))
 
 
+# ================================================================ T8 思考体
+def t8_reasoning_trace() -> None:
+    print("\n── T8 思考过程（reasoning）不得念给老人，客服话术不得误杀 ──")
+    # 正例：模型口吻的第一人称思考。全部必须在**行首**命中。
+    block = [
+        "嗯，用户问的是平顶山的天气。",
+        "用户问的是明天几点提醒。",
+        "用户说想听一段戏。",
+        "让我想想，这个得查一下。",
+        "让我先看看今天几号。",
+        "让我确认一下时间。",
+        "我需要先查一下天气接口。",
+        "我先查一下日程。",
+        "先确认一下，您说的是八点吗？",
+        "分析一下：老人想知道明天天气。",
+        "思考：这个问题的答案是什么。",
+        "reasoning: the user asks about weather.",
+    ]
+    for text in block:
+        reason = _speech_block_reason(_speech_clean(text))
+        check(reason == "reasoning",
+              f"T8 应拦为 reasoning：{text!r}", reason or "未拦")
+
+    # 反例：这些是要念给老人听的人话，误杀一句就是"设备突然哑了"。
+    allow = [
+        "让我帮您看看天气预报。",                    # 客服话术，与思考体只差一个"帮"
+        "嗯，我帮您记一下，明天早上八点提醒您吃药。",
+        "我帮您记一下，明天早上八点提醒您吃药。",
+        "我查查啊，您稍等。",
+        "您问的是平顶山吗？",                        # "您问"不是"用户问"
+        "平顶山今天晴，最高十八度，出门不冷。",
+        "老人家用这个挺方便。",
+        "现在是下午三点二十。",
+        "外面风大，您把外套穿上。",
+    ]
+    for text in allow:
+        reason = _speech_block_reason(_speech_clean(text))
+        check(not reason, f"T8 应放：{text!r}", reason or "")
+
+
+# ================================================================ T9 协议层
+def t9_stream_reasoning() -> None:
+    print("\n── T9 协议层：思考段不得混进正文增量 ──")
+    import json
+    import logging
+    import time as _time
+    from types import SimpleNamespace
+
+    from app import llm_gateway as gw
+
+    class _FakeResp:
+        """按行读的假响应。
+
+        ⚠️ 必须**真的按 ``\\n`` 切行**：直接把整块 bytes 从 readline 返回，
+        相邻两条 SSE 事件会被拼进同一个 data 段，json.loads 失败后被静默
+        跳过 —— 断言看到的是"什么都没解析出来"，与"解析对了但被过滤"完全
+        分不清，这就是一条假断言。
+        """
+
+        def __init__(self, lines: list[bytes], ctype: str) -> None:
+            self.headers = {"Content-Type": ctype}
+            self._blob = b"".join(lines)
+            self._pos = 0
+
+        def readline(self) -> bytes:
+            if self._pos >= len(self._blob):
+                return b""
+            end = self._blob.find(b"\n", self._pos)
+            end = len(self._blob) if end < 0 else end + 1
+            out = self._blob[self._pos:end]
+            self._pos = end
+            return out
+
+        def close(self) -> None:
+            pass
+
+    def _sse(obj: dict) -> bytes:
+        # 事件之间必须有一个空行：_sse_lines 是按空行把多行 data 拼成一条的，
+        # 少这个空行会让相邻两条 data 粘成一个坏 JSON 被静默跳过（假红/假绿）。
+        return ("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode()
+
+    def _nd(obj: dict) -> bytes:
+        return (json.dumps(obj, ensure_ascii=False) + "\n").encode()
+
+    def _drain(gen):
+        out = []
+        try:
+            while True:
+                out.append(next(gen))
+        except StopIteration as exc:
+            return out, exc.value
+
+    row = SimpleNamespace(id=1, name="fake", model="fake-model")
+    orig = gw._open_stream
+
+    def _run(lines, ctype, fn, body):
+        # 只换掉建连这一步：被测的是"解析出来的增量"，与网络无关。
+        gw._open_stream = lambda *a, **k: _FakeResp(lines, ctype)
+        try:
+            return _drain(fn(row, "chat", "voice", body, 10.0, _time.monotonic()))
+        finally:
+            gw._open_stream = orig
+
+    # ---- Gemini：思考段与正文**共用 text 字段**，只靠 thought 标志区分 ----
+    got, res = _run(
+        [_sse({"candidates": [{"content": {"parts": [
+            {"text": "让我想想，用户问的是天气。", "thought": True}]}}]}),
+         _sse({"candidates": [{"content": {"parts": [
+            {"text": "平顶山今天晴。"}]}}]})],
+        "text/event-stream", gw._stream_gemini, {"model": "fake-model"})
+    texts = [t for _, t in got]
+    check(texts == ["平顶山今天晴。"], "T9 ★ Gemini 的 thought 段被跳过",
+          repr(texts))
+    check(res.text == "平顶山今天晴。", "T9 Gemini 正文只含正文", repr(res.text))
+
+    # ---- OpenAI 兼容：reasoning_content / reasoning 两种字段都要丢 ----
+    captured: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            captured.append(record.getMessage())
+
+    lg = logging.getLogger("elder.llm_gateway")
+    cap = _Capture()
+    lg.addHandler(cap)
+    old_level = lg.level
+    lg.setLevel(logging.INFO)
+    try:
+        got2, res2 = _run(
+            [_sse({"choices": [{"delta": {
+                "reasoning_content": "用户问的是天气，我先查一下。"}}]}),
+             _sse({"choices": [{"delta": {"reasoning": "再想一步。"}}]}),
+             _sse({"choices": [{"delta": {"content": "平顶山今天晴。"}}]}),
+             b"data: [DONE]\n\n"],
+            "text/event-stream", gw._stream_openai, {})
+    finally:
+        lg.removeHandler(cap)
+        lg.setLevel(old_level)
+    texts2 = [t for _, t in got2]
+    check(texts2 == ["平顶山今天晴。"],
+          "T9 ★ OpenAI 兼容的 reasoning_content/reasoning 都被丢弃",
+          repr(texts2))
+    check(res2.text == "平顶山今天晴。", "T9 OpenAI 正文只含正文", repr(res2.text))
+    think_logs = [m for m in captured if "思考段" in m]
+    check(len(think_logs) == 1,
+          "T9 思考段只记一次日志（连续两个分片不刷屏）", str(think_logs))
+    check(bool(think_logs) and "fake/fake-model" in think_logs[0],
+          "T9 日志带 provider/model，便于定位是哪家模型在思考",
+          think_logs[0] if think_logs else "")
+
+    # ---- Ollama：message.thinking ----
+    got3, res3 = _run(
+        [_nd({"message": {"thinking": "用户问的是天气。"}}),
+         _nd({"message": {"content": "平顶山今天晴。"}}),
+         _nd({"done": True})],
+        "application/x-ndjson", gw._stream_ollama, {})
+    texts3 = [t for _, t in got3]
+    check(texts3 == ["平顶山今天晴。"], "T9 ★ Ollama 的 thinking 被丢弃",
+          repr(texts3))
+    check(res3.text == "平顶山今天晴。", "T9 Ollama 正文只含正文", repr(res3.text))
+
+
 def main() -> int:
     print("=" * 64)
     print("可播性过滤 + 尾巴补播 + TTS 返回体格式 单元断言")
@@ -374,6 +536,8 @@ def main() -> int:
     t5_audio_sniff()
     t6_call_arity()
     t7_pacing_order()
+    t8_reasoning_trace()
+    t9_stream_reasoning()
     print("\n" + "=" * 64)
     print(f"通过 {_passed} 项，失败 {_failed} 项")
     if _failed:

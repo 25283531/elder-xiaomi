@@ -249,6 +249,29 @@ _SELF_PLAN: Final[re.Pattern[str]] = re.compile(
     r"老人[^。！？；]{0,24}(?:我要|我需要|我先|我来|让我)"
 )
 
+#: 模型口吻的**第一人称思考**（2026-11 用户实报「思考过程被念出来」）。
+#:
+#: 为什么必须单独一条：``_THIRD_PERSON`` 只认行首「老人」，``_SELF_PLAN``
+#: 要求「老人」与「我要」同句 —— 而思考体的典型开头是「嗯，用户问的是…」
+#: 「让我想想」「我需要先查一下」，一个「老人」都没有，两条都拦不住。
+#:
+#: 为什么可以偏严：这里判的是**模型要念给老人听的话**，不是老人说的话；
+#: 老人自己的第一人称根本不经过这个函数。但仍然只锚行首、且要求是
+#: 「陈述自己在思考」的句式 —— "让我帮您看看"这类客服话术必须放过去。
+_REASONING_TRACE: Final[re.Pattern[str]] = re.compile(
+    r"^\s*(?:"
+    r"嗯[，,]\s*用户"                                   # 嗯，用户问的是…
+    r"|用户(?:问|说|想|要|需要|希望)"                   # 用户问的是… / 用户说…
+    r"|让我(?:先)?(?:想想|想一想|看看|看一下|查|确认|分析|梳理|理一理)"
+    r"|我需要(?:先|再)?(?:查|确认|了解|分析|看看)"
+    r"|我先(?:查|确认|看看|看一下|了解|分析)"
+    r"|先(?:确认|检查|了解)一下"
+    r"|分析一下"
+    r"|(?:思考|推理|分析|reasoning|thinking)\s*[:：]"
+    r")",
+    re.IGNORECASE,     # 只为兜住 reasoning:/Reasoning: 的大小写
+)
+
 #: Markdown 强调符与行内代码。TTS 会把 ``**`` 念成"星号星号"。
 _MD_NOISE: Final[re.Pattern[str]] = re.compile(r"\*\*|__|`")
 _MD_HEADING: Final[re.Pattern[str]] = re.compile(r"^\s*#{1,6}\s*")
@@ -728,6 +751,11 @@ def _speech_block_reason(sentence: str) -> str:
         return "third_person"
     if _SELF_PLAN.search(sentence):
         return "self_plan"
+    if _REASONING_TRACE.search(sentence):
+        # 用户就是靠日志定位"思考被念出来"这件事的：只记一个标签，下次还得
+        # 让模型再跑一遍才知道它当时想了什么。截到 120 字，够定位又不刷屏。
+        log.warning("拦下疑似思考过程（reasoning），不播报：%r", sentence[:120])
+        return "reasoning"
     return ""
 
 
@@ -3331,7 +3359,7 @@ class _ReplySpeaker:
         if reason:
             self.dropped += 1
             self.dropped_reasons.append(reason)
-            log.warning("[%s] 丢弃不可播报的句子（%s）：%r",
+            log.warning("[%s] 丢弃不可播报的句子（reason=%s）：%r",
                         s.session_id, reason, sentence[:80])
             return
 

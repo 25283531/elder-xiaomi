@@ -1123,6 +1123,7 @@ def _stream_openai(row: models.AIProvider, kind: str, usage: str, body: dict,
         acc: dict[int, dict[str, str]] = {}
         usage_payload: dict[str, Any] = {}
         finish = ""
+        think_logged = False
         for data in _sse_lines(resp):
             if data.strip() == "[DONE]":
                 break
@@ -1141,6 +1142,16 @@ def _stream_openai(row: models.AIProvider, kind: str, usage: str, body: dict,
             if ch.get("finish_reason"):
                 finish = str(ch["finish_reason"])
             delta = ch.get("delta") or {}
+            # 思考段：DeepSeek-R1 / Qwen 这类模型放在 reasoning_content，
+            # 另一些网关放在 reasoning。**必须显式丢弃** —— 拼进 parts 就是
+            # 把模型的思考过程当正文念给老人。第一次收到时记一行日志：不记
+            # 的话「这家模型在思考」在日志里完全看不见，出事只能靠猜。
+            think = delta.get("reasoning_content") or delta.get("reasoning")
+            if think:
+                if not think_logged:
+                    think_logged = True
+                    log.info("[llm] %s/%s 返回思考段（reasoning），已丢弃 len=%d",
+                             row.name, row.model, len(str(think)))
             piece = delta.get("content")
             if piece:
                 parts.append(str(piece))
@@ -1189,6 +1200,7 @@ def _stream_ollama(row: models.AIProvider, kind: str, usage: str, body: dict,
         calls: list[dict[str, Any]] = []
         done_obj: dict[str, Any] = {}
         finish = ""
+        think_logged = False
         for line in _ndjson_lines(resp):
             try:
                 obj = json.loads(line)
@@ -1197,6 +1209,15 @@ def _stream_ollama(row: models.AIProvider, kind: str, usage: str, body: dict,
             if not isinstance(obj, dict):
                 continue
             msg = obj.get("message") or {}
+            # Ollama 思考模型把思考放在 message.thinking（部分模型还会塞进
+            # content 的 think 标签里，那一层由播报侧的 _speech_block_reason
+            # 兜底）。显式丢弃并记一次日志，理由同 _stream_openai。
+            think = msg.get("thinking")
+            if think:
+                if not think_logged:
+                    think_logged = True
+                    log.info("[llm] %s/%s 返回思考段（thinking），已丢弃 len=%d",
+                             row.name, row.model, len(str(think)))
             piece = msg.get("content")
             if piece:
                 parts.append(str(piece))
@@ -1321,6 +1342,11 @@ def _stream_gemini(row: models.AIProvider, kind: str, usage: str, body: dict,
                 finish = str(cand["finishReason"])
             for i, p in enumerate((cand.get("content") or {}).get("parts") or []):
                 if not isinstance(p, dict):
+                    continue
+                # Gemini 的思考段与正文**共用 text 字段**，唯一的区分就是
+                # thought=true（形如 {"text": "...", "thought": true}）。
+                # 不看这个标志，思考过程就会被当成正文切句、念给老人。
+                if p.get("thought"):
                     continue
                 if p.get("text"):
                     parts.append(str(p["text"]))
