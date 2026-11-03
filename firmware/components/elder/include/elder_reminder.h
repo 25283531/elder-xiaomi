@@ -389,6 +389,31 @@ esp_err_t elder_reminder_confirm_server(uint32_t server_id,
                                         uint8_t confirm_method);
 
 /**
+ * @brief 日程类提醒「播报即完成」——把本条直接置成 DONE，且**不产生任何副作用**。
+ *
+ * 用户口径（2026-11-03）：「日程类提醒只要进行提醒就算完成流程了」。
+ * 服药提醒必须老人确认（依从率 + 漏服告警全看状态），日程提醒没有这个概念 ——
+ * 播报出去流程就走完了。
+ *
+ * 为什么单独开一个入口、而不是复用 elder_reminder_confirm_ex()：那个走
+ * set_state()，尾部有三个副作用，对日程类全都是错的：
+ *   1. elder_rgb_med_done() —— 那是「药吃完了」的绿灯，给日程用是在撒谎；
+ *      更糟的是它内部先 nag_stop()，会把同一分钟里还没确认的**服药**提醒
+ *      的闪灯一起停掉（老人以为不用管了）；
+ *   2. 回调 g.cb(DONE) —— 会重入 OnReminder(DONE)，立刻 hide_reminder()，
+ *      老人刚听到播报、屏幕就没了；
+ *   3. sync 上报 CONFIRMED —— 不需要。服务端收到 PENDING 那条 FIRED 时
+ *      已按规则类型自行落成完成（见 device_api.report_event）。
+ *
+ * 但位图必须照样维护：done_today 置位是「今天不该再响」的唯一依据，
+ * fired_today 置位防止重启后二次触发（与 restore_daily_state 的口径一致）。
+ *
+ * @param id 本地下标
+ * @return ESP_OK / ESP_ERR_INVALID_ARG（下标越界）/ ESP_ERR_INVALID_STATE（已是 DONE）
+ */
+esp_err_t elder_reminder_auto_done(uint8_t id);
+
+/**
  * @brief 打开确认窗口（按键长按后由 input 事件驱动）
  */
 void elder_reminder_arm_confirm(uint8_t id);

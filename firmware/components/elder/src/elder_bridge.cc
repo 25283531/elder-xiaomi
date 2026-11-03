@@ -534,6 +534,32 @@ void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
         elder_reminder_screen_text(item, screen_text, sizeof(screen_text));
         elder_ui_show_reminder(screen_text);
 
+        /* ---- 日程类提醒：播报即完成（2026-11-03 用户需求）----
+         *
+         * 用户原话：「日程类提醒只要进行提醒就算完成流程了，可以在对话中向
+         * 用户询问。例如『您让我提醒您的今天要还信用卡，您已经完成了吗？』」。
+         *
+         * 也就是：日程类**不需要**老人按任何键或回一句话，播出来流程就走完了。
+         * 服药类不走这条 —— 它必须确认，依从率和漏服告警都看状态。
+         *
+         * 放在推屏**之后**、same_minute 提前返回**之前**：
+         *   · 之后：屏幕已经推上去了，完成状态不会把屏收掉（auto_done 刻意
+         *     不回调 OnReminder(DONE)，见 elder_reminder_auto_done 的注释）；
+         *   · 之前：同一分钟里的第 2、3 条也要完成，不能因为"这一分钟已经
+         *     播过音"就让它们永远挂着待办。
+         *
+         * 为什么不让服务端去做这件事：设备可能离线，而日程提醒是设备本地
+         * 时钟触发的，本地不落完成就会一直占着待办位、重启后还会二次响铃。
+         * 服务端那边也有一份（device_api.report_event 收到 FIRED 时落
+         * CONFIRMED/AUTO），两边各自闭环、互不依赖。 */
+        if (item->type != ELDER_RMD_TYPE_MEDICINE) {
+            esp_err_t rc = elder_reminder_auto_done(item->id);
+            if (rc != ESP_OK && rc != ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(TAG, "日程类自动完成失败（id=%u rc=%d），保持待办",
+                         (unsigned)item->id, (int)rc);
+            }
+        }
+
         if (same_minute) {
             ESP_LOGI(TAG, "同一分钟（%lld）已播报过，只推屏不出声：%s",
                      (long long)due_min, item->label);
