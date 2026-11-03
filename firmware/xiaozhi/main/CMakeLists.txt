@@ -148,6 +148,17 @@ elseif(CONFIG_BOARD_TYPE_LICHUANG_DEV_S3)
     set(BUILTIN_TEXT_FONT font_puhui_basic_20_4)
     set(BUILTIN_ICON_FONT font_awesome_20_4)
     set(DEFAULT_EMOJI_COLLECTION twemoji_64)
+    # 对话区专用大号字体（2026-11-03，适老化）。
+    #
+    # 本板是 320x240 的 3.5 寸屏，20px 汉字实测只有 2mm 高，老人看不清 ——
+    # 但**不能**直接把 BUILTIN_TEXT_FONT 换成 30px：状态栏只有 30px 高，
+    # 而 30px 字体的 line_height 是 38，时钟和日期会被上下各切掉 4px。
+    # 所以两档并存：状态栏/提醒卡片继续 20px，只有左列对话文字用 30px。
+    #
+    # 值走 get_text_font_path() 的 basic→common 替换，实际打包的是
+    # xiaozhi-fonts/cbin/font_puhui_common_30_4.bin（实测 6813 码点，
+    # 与 20px 版覆盖**完全一致**，界面用字无缺口）。
+    set(DEFAULT_LARGE_TEXT_FONT font_puhui_basic_30_4)
 elseif(CONFIG_BOARD_TYPE_LICHUANG_DEV_C3)
     set(BOARD_TYPE "lichuang-c3-dev")
     set(BUILTIN_TEXT_FONT font_puhui_basic_20_4)
@@ -839,6 +850,11 @@ function(build_default_assets_bin)
     # Add builtin text font if defined
     if(BUILTIN_TEXT_FONT)
         list(APPEND BUILD_ARGS "--builtin_text_font" "${BUILTIN_TEXT_FONT}")
+    endif()
+
+    # 对话区大号字体（2026-11-03）。没设就只打一档字体，其他板子行为不变。
+    if(DEFAULT_LARGE_TEXT_FONT)
+        list(APPEND BUILD_ARGS "--large_text_font" "${DEFAULT_LARGE_TEXT_FONT}")
     endif()
     
     # Add default emoji collection if defined
