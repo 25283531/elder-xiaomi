@@ -926,6 +926,96 @@ def _flush_tts_usage(db: Any, *, speaker: Any, dev: Any,
     calls.clear()
 
 
+def _pcm_stats(pcm: bytes) -> tuple[float, float]:
+    """粗略统计一段 16kHz/S16LE PCM 的 (RMS, 峰值)，都归一到 0~1。
+
+    **抽样子采样**（最多 4000 个点）：这段音频可能有 1MB，逐样本求和会在
+    事件循环上占几十毫秒；而这里只是打一行日志，够看量级就行。
+
+    为什么需要这两个数（2026-11-03 深夜）：ASR 返回空时日志只有
+    「累计语音 4680ms」，分不清是"音频太小"（rms 0.001 级）、"全是噪声"
+    （rms 0.02 但峰值很低）、还是"削波失真"（峰值贴着 1.0）。
+    """
+    import array
+
+    usable = len(pcm) - (len(pcm) % 2)
+    if usable <= 0:
+        return 0.0, 0.0
+    samples = array.array("h")
+    samples.frombytes(pcm[:usable])
+    if not samples:
+        return 0.0, 0.0
+    step = max(1, len(samples) // 4000)
+    total = 0.0
+    count = 0
+    peak = 0
+    for i in range(0, len(samples), step):
+        v = samples[i]
+        total += v * v
+        count += 1
+        av = v if v >= 0 else -v
+        if av > peak:
+            peak = av
+    if count == 0:
+        return 0.0, 0.0
+    return (total / count) ** 0.5 / 32768.0, peak / 32768.0
+
+
+def _asr_dump_dir() -> "Path | None":
+    """落盘目录：库文件所在目录（容器里就是 /data，与 elder.db 同一个卷）。
+
+    取不到（非 sqlite / 目录不存在）就返回 None，调用方跳过落盘 ——
+    诊断手段失效绝不能影响一轮对话。
+    """
+    from pathlib import Path
+
+    url = str(getattr(config, "DATABASE_URL", "") or "")
+    if not url.startswith("sqlite"):
+        return None
+    raw = url.split("///", 1)[-1]
+    if not raw or raw == ":memory:":
+        return None
+    parent = Path(raw).parent
+    return parent if parent.is_dir() else None
+
+
+def _dump_empty_asr(pcm: bytes, speech_ms: int, session_id: str) -> str:
+    """ASR 返回空时留证：落一个 wav + 返回一行可读的统计摘要。
+
+    只在「VAD 认为说了话（≥ ASR_DUMP_MIN_SPEECH_MS）且确实为空」时调用，
+    正常对话零开销。落盘失败一律吞掉（诊断不能影响对话）。
+    """
+    rms, peak = _pcm_stats(pcm)
+    summary = ("rms=%.4f peak=%.3f 时长=%.1fs 语音=%dms"
+               % (rms, peak, len(pcm) / 32000.0, speech_ms))
+    if not getattr(config, "ASR_DUMP", False):
+        return summary
+    if speech_ms < getattr(config, "ASR_DUMP_MIN_SPEECH_MS", 800):
+        return summary
+    try:
+        folder = _asr_dump_dir()
+        if folder is None:
+            return summary + "（无处落盘）"
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = folder / ("asr_empty_%s_%s.wav" % (stamp, session_id[:8]))
+        with open(path, "wb") as fh:
+            fh.write(asr_tts.wav_header_bytes(len(pcm), 16000))
+            fh.write(pcm)
+        # 只留最近 N 个：这是排障证据，不是录音档案。
+        olds = sorted(folder.glob("asr_empty_*.wav"))
+        keep = max(1, int(getattr(config, "ASR_DUMP_KEEP", 3)))
+        for stale in olds[:-keep]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+        return summary + " 已存 %s" % path.name
+    except Exception as exc:  # noqa: BLE001  落盘失败不影响对话
+        log.warning("ASR 空结果音频落盘失败：%s: %s",
+                    type(exc).__name__, exc)
+        return summary
+
+
 class VoiceSession:
     """一次 WS 连接的会话。**所有公开方法都是 async**，内部自行切线程池。"""
 
@@ -2524,6 +2614,14 @@ class VoiceSession:
             # 「服务端念没听清 → 设备回 Listening → 再空 ASR → 再念」这个
             # 环一旦启动就永不停止（设备端 listening 态没有超时，也不跑
             # 唤醒词）。处置全部收进 _handle_empty_asr，判据与理由见那里。
+            #
+            # 先留一行**音频指纹**（rms/峰值/时长）并按需落 wav：ASR 返回空
+            # 有三种完全不同的原因（音频太小 / 全是噪声 / 被切碎），而日志
+            # 里原先只有"累计语音 4680ms"这一个数字，分不出来。
+            # 2026-11-03 深夜就是靠这条才不用猜：三次 ASR 全是 ok=True，
+            # 说明服务本身好的，问题在送进去的音频。
+            log.info("[%s] ASR 返回空，音频指纹：%s", self.session_id,
+                     _dump_empty_asr(pcm_all, self._speech_ms, self.session_id))
             await self._handle_empty_asr(started)
             return ""
 

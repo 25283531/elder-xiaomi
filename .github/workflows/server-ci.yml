@@ -157,6 +157,21 @@ jobs:
       - name: 语音输入 / 待机 / 服药卡片冒烟（词头 pad、思考期丢帧、长按片段判据、药名剂量）
         run: python tools/run_smoke.py logs/smoke_smoke_voice_input_medcard.log python tools/smoke_voice_input_medcard.py
 
+      # 2026-11-03 深夜用户实报两条：①「生产容器出现大量 404 错误日志」；
+      # ②「唤醒之后再说话完全没识别，过一分钟说没听清」。
+      #
+      # ① 45 分钟 209 条 404，207 条来自同一个 IP 的凭据探测（/.git/config、
+      #   /.aws/credentials、/wp-config.php …），全部正确 404 —— 不是缺陷，
+      #   但把真正的 404 淹掉了。降噪判据必须钉住"自己的 404 不许吞"。
+      # ② 三次 ASR 全 ok=True、TTS→ASR 往返能逐字识别回来 ⇒ 问题在送进去的
+      #   音频，而日志只有一个"4680ms"，分不清太小/噪声/被切碎。补音频指纹
+      #   + 按需落 wav；落盘目录在测试里必须指到临时目录。
+      #
+      # 纯函数 + 真对象直调（真 LogRecord、真 _pcm_stats/_dump_empty_asr），
+      # 不起服务、不占端口，耗时约 2 秒。
+      - name: 扫描器 404 降噪 / ASR 空结果留证冒烟
+        run: python tools/run_smoke.py logs/smoke_smoke_prod_noise_asr.log python tools/smoke_prod_noise_asr.py
+
       # docs/DEPLOY.md §8.3 曾把 `NEW_COLUMNS` 的规模写死成「26 列 / 5 张表」，
       # 而 2026-10-30 加完提醒软删除三列后实际是「37 列 / 8 张表」。
       # §8.3 是升级前核对的唯一依据 —— 按它核对会得出「还缺 11 列」，
