@@ -13,6 +13,8 @@
 #include <esp_lvgl_port.h>
 #include <esp_psram.h>
 #include <cstring>
+#include <cstdio>
+#include <ctime>
 
 #include "board.h"
 
@@ -44,6 +46,43 @@ LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 LV_FONT_DECLARE(BUILTIN_ICON_FONT);
 LV_FONT_DECLARE(font_awesome_30_4);
 
+/* ===== 2026-11-03 设计稿还原：配色与尺寸的**唯一真源** =====
+ *
+ * 来源：deliverables/gstack/design/mock-{1-reminder,2-chat,3-idle}.png
+ * （三张都是 320x240，用 PIL 逐像素量出来的，不是目测）。
+ *
+ * 尺寸一律写成「按 240 高 / 320 宽折算」，不写死像素：LcdDisplay 同时被
+ * SPI / RGB / MIPI 三种屏继承，写死 320x240 的数值会在别的分辨率上错位。
+ */
+namespace {
+
+/* 配色（实测色值，不要改成"看起来差不多"的近色） */
+constexpr uint32_t kColorStatusBar = 0x2A365B;  /* 状态栏藏青 */
+constexpr uint32_t kColorMainBg    = 0xD3DBFC;  /* 主区浅蓝紫 */
+constexpr uint32_t kColorTextDark  = 0x232F54;  /* 正文深色 */
+constexpr uint32_t kColorTextUser  = 0x4982FC;  /* 用户话蓝色 */
+constexpr uint32_t kColorAccent    = 0xF5A623;  /* 橙色提示 / 按钮 */
+constexpr uint32_t kColorAvatar    = 0x7B93E8;  /* 头像圆底 */
+constexpr uint32_t kColorPillRed   = 0xDD2E44;  /* 药丸图标红 */
+
+/* 状态栏高 30px（320x240 实测 0..29） */
+inline int StatusBarH()  { return LV_VER_RES * 30 / 240; }
+/* 文字列左边距 18px */
+inline int MainPadX()    { return LV_HOR_RES * 18 / 320; }
+/* 头像直径 90px（实测包围盒 89x89，含抗锯齿按 90 算） */
+inline int AvatarSize()  { return LV_VER_RES * 90 / 240; }
+/* 头像右边距 21px（实测右边 299 ⇒ 320-299=21） */
+inline int AvatarRight() { return LV_HOR_RES * 21 / 320; }
+/* 头像顶边距状态栏底边 44px（实测头像包围盒顶边 y=74，状态栏底 30） */
+inline int AvatarTop()   { return StatusBarH() + LV_VER_RES * 44 / 240; }
+/* 左列文字顶边距状态栏底边 14px（实测首行文字 y≈44，比头像高 30px） */
+inline int TextTop()     { return StatusBarH() + LV_VER_RES * 14 / 240; }
+
+/* 待机跑马灯的表情直径 60px（mock-3 实测 60x60，纵向居中于主区） */
+inline int MarqueeSize() { return LV_VER_RES * 60 / 240; }
+
+}  // namespace
+
 void LcdDisplay::InitializeLcdThemes() {
     auto text_font = std::make_shared<LvglBuiltInFont>(&BUILTIN_TEXT_FONT);
     auto icon_font = std::make_shared<LvglBuiltInFont>(&BUILTIN_ICON_FONT);
@@ -51,9 +90,18 @@ void LcdDisplay::InitializeLcdThemes() {
 
     // light theme
     auto light_theme = new LvglTheme("light");
-    light_theme->set_background_color(lv_color_hex(0xFFFFFF));
-    light_theme->set_text_color(lv_color_hex(0x000000));
-    light_theme->set_chat_background_color(lv_color_hex(0xE0E0E0));
+    /* 2026-11-03 设计稿：主区底色 #D3DBFC、正文 #232F54。
+     *
+     * 原来这里是纯白底 + 纯黑字。改的是**主题色**而不是各对象的局部色：
+     * screen / container_ / bottom_bar_ / reminder_overlay_ 都读
+     * theme->background_color()，改一处全部跟上；反过来，只在 SetupUI 里
+     * 逐个设 bg_color 的话，SetTheme() 换主题时又会被刷回主题色。
+     *
+     * ⚠️ 只改 light：dark 主题是夜间/低光用的，改成浅蓝紫等于把夜间模式
+     * 废掉。本机 Settings 默认 theme="light"，实际生效的就是这一套。 */
+    light_theme->set_background_color(lv_color_hex(kColorMainBg));
+    light_theme->set_text_color(lv_color_hex(kColorTextDark));
+    light_theme->set_chat_background_color(lv_color_hex(kColorMainBg));
     light_theme->set_user_bubble_color(lv_color_hex(0x00FF00));
     light_theme->set_assistant_bubble_color(lv_color_hex(0xDDDDDD));
     light_theme->set_system_bubble_color(lv_color_hex(0xFFFFFF));
@@ -335,13 +383,26 @@ LcdDisplay::~LcdDisplay() {
     }
     /* >>> BEGIN elder-reminder-fullscreen >>> 懒创建的 overlay 也要在这里删：
      * 它挂在 screen 下，不随任何子对象一起释放；漏掉就是一块 320x240 的
-     * 不透明遮罩留在屏上（表现为"重启后屏幕全黑，只有状态栏")。 */
+     * 不透明遮罩留在屏上（表现为"重启后屏幕全黑，只有状态栏")。
+     *
+     * 2026-11-03 起卡片有 5 个子对象（标题/明细/提示/按钮/头像），全部挂在
+     * overlay 下面，lv_obj_del(overlay) 会连带删掉 —— 这里只需把**指针**
+     * 清空，否则析构后再进 ShowReminder 会对着已释放的内存设属性。 */
     if (reminder_overlay_ != nullptr) {
         lv_obj_del(reminder_overlay_);
         reminder_overlay_ = nullptr;
-        reminder_label_ = nullptr;
+        reminder_title_ = nullptr;
+        reminder_items_ = nullptr;
+        reminder_hint_ = nullptr;
+        reminder_button_ = nullptr;
+        reminder_button_label_ = nullptr;
+        reminder_avatar_ = nullptr;
     }
     /* <<< END elder-reminder-fullscreen <<< */
+    if (chat_user_label_ != nullptr) {
+        lv_obj_del(chat_user_label_);
+        chat_user_label_ = nullptr;
+    }
     if (chat_message_label_ != nullptr) {
         lv_obj_del(chat_message_label_);
     }
@@ -862,6 +923,11 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_font(screen, text_font, 0);
     lv_obj_set_style_text_color(screen, lvgl_theme->text_color(), 0);
     lv_obj_set_style_bg_color(screen, lvgl_theme->background_color(), 0);
+    /* 主区底色必须**不透明**：设计稿的 #D3DBFC 是实底。只设 bg_color 不设
+     * bg_opa 时，screen 用的是 LVGL 默认的不透明度，而 container_ 铺在上面
+     * 同样只有 bg_color —— 一旦哪一层被设成半透明，底下的黑屏就会透上来，
+     * 整屏发灰。两层都显式 COVER，结论不依赖默认值。 */
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
 
     /* Container - used as background */
     container_ = lv_obj_create(screen);
@@ -870,80 +936,122 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_pad_all(container_, 0, 0);
     lv_obj_set_style_border_width(container_, 0, 0);
     lv_obj_set_style_bg_color(container_, lvgl_theme->background_color(), 0);
+    lv_obj_set_style_bg_opa(container_, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(container_, lvgl_theme->border_color(), 0);
+    lv_obj_clear_flag(container_, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* Center layer: emoji_box_ - 屏幕中央大图区（42% x 46%，2026-10-20 横屏布局）
+    /* Center layer: emoji_box_ - 右侧头像圆（2026-11-03 设计稿）
      *
-     * 为什么从「右下角 30%x30%」改成「正中大图」：
-     * 老人坐在 1-2 米外看这块屏，右下角 30% 的图形只有 ~72px，
-     * 实际观感是「看不清、像是屏保」。放大到中央之后，
-     * 「小安在听你说话 / 小安在回答」这件事才看得出来。
+     * 布局来源：mock-2-chat / mock-1-reminder 里右侧那个 90x90 的蓝紫圆
+     * （实测包围盒 (210,74)-(298,162)，圆心 (254,118)）。
      *
-     * 布局按**横屏 320x240** 算（config.h 已把 swap_xy/mirror 关掉）：
-     *   top_bar_   顶部状态栏 ≈ 28
-     *   emoji_box_ 320*42%=134 宽 × 240*46%=110 高，居中 y=-8 ⇒ 范围 59..169
-     *   bottom_bar_ 贴底 240*28%=67 高 ⇒ 从 173 起
-     * 两者留 3px 间隙，不重叠。
-     */
+     * 与 2026-10-20 那版「屏幕正中 42%x46% 大图区」的区别：
+     *   · 位置从正中挪到右侧 —— 设计稿的左边整列要留给对话文字；
+     *   · 尺寸从 134x110 缩到 90x90 —— 它是"头像"不是"脸占满半屏"；
+     *   · 圆角改成 LV_RADIUS_CIRCLE + 圆底 #7B93E8，表情图裁在圆内。
+     *
+     * ⚠️ 待机跑马灯**不再**挂在这个对象下面（见 StartIdleMarquee）：
+     * 跑马灯要横跨整屏，而这个圆只有 90px 宽，挂在里面就只能在圆内滚 ——
+     * 这正是 2026-11-03 用户实报「没有从全屏右侧进入、左侧出」的成因。 */
+    const int avatar_sz = AvatarSize();
     emoji_box_ = lv_obj_create(screen);
-    lv_obj_set_size(emoji_box_, lv_pct(42), lv_pct(46));
-    lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_TRANSP, 0);
+    lv_obj_set_size(emoji_box_, avatar_sz, avatar_sz);
+    lv_obj_set_style_radius(emoji_box_, LV_RADIUS_CIRCLE, 0);
+    /* clip_corner：让子对象（表情图）被圆的轮廓裁掉。不加这一条，表情的
+     * 四个角会露出圆外，看着像"方块上贴了个圆"。 */
+    lv_obj_set_style_clip_corner(emoji_box_, true, 0);
+    lv_obj_set_style_bg_color(emoji_box_, lv_color_hex(kColorAvatar), 0);
+    lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(emoji_box_, 0, 0);
     lv_obj_set_style_border_width(emoji_box_, 0, 0);
-    /* 待机跑马灯会把这个盒子的子对象挪到边界之外（滚出左边缘），盒子的
-     * 可滚动标志必须关掉：否则 LVGL 会把越界部分算成"可滚动内容"，
-     * 触摸拖动时整块图片区会跟着手指偏移，看起来像界面错位。 */
     lv_obj_clear_flag(emoji_box_, LV_OBJ_FLAG_SCROLLABLE);
-    // 偏移量与 preview_image_ 必须逐字一致（两者是同一块区域，只是内容不同）
-    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, -lvgl_theme->spacing(4));
+    lv_obj_align(emoji_box_, LV_ALIGN_TOP_RIGHT, -AvatarRight(), AvatarTop());
 
     emoji_label_ = lv_label_create(emoji_box_);
     lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
     lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
     lv_label_set_text(emoji_label_, FONT_AWESOME_MICROCHIP_AI);
-    // 盒子改为固定尺寸后必须显式居中（原来是 LV_SIZE_CONTENT 自适应）
     lv_obj_center(emoji_label_);
 
     emoji_image_ = lv_img_create(emoji_box_);
-    // 表情图（twemoji_64 等）尺寸随主题而定：铺满图片区 + CONTAIN 等比缩放，
-    // 再大的原图也只会缩小不会溢出（lv_image 的 SIZE_CHANGED 会自动重算）
+    // 表情图（fluent3d cbin）铺满头像圆 + CONTAIN 等比缩放
     lv_obj_set_size(emoji_image_, lv_pct(100), lv_pct(100));
     lv_image_set_inner_align(emoji_image_, LV_IMAGE_ALIGN_CONTAIN);
     lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
 
-    /* Middle layer: preview_image_ - 与 emoji_box_ 同一块正中大图区 */
+    /* Middle layer: preview_image_ - 与头像圆同一块区域（预览图顶替头像） */
     preview_image_ = lv_image_create(screen);
-    lv_obj_set_size(preview_image_, lv_pct(42), lv_pct(46));
-    // CONTAIN：LVGL 自动按图片区等比缩放（替代原先手算 128*width_/w 的公式，
-    // 那个公式按半屏宽算，在固定图片区下会把图放出界）
+    lv_obj_set_size(preview_image_, avatar_sz, avatar_sz);
     lv_image_set_inner_align(preview_image_, LV_IMAGE_ALIGN_CONTAIN);
-    lv_obj_align(preview_image_, LV_ALIGN_CENTER, 0, -lvgl_theme->spacing(4));
+    lv_obj_align(preview_image_, LV_ALIGN_TOP_RIGHT, -AvatarRight(), AvatarTop());
     lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
 
-    /* Layer 1: Top bar - for status icons */
+    /* Layer 1: Top bar —— 藏青状态栏（2026-11-03 设计稿）
+     *
+     * 实测规格：y 0..29（高 30px）、整宽、底色 #2A365B；
+     * 左边「上午 08:30」，右边「wifi 图标 + 10月29日 周三」，两组各贴一侧。
+     *
+     * 与旧版的三处区别（旧版是 LV_OPA_50 半透明 + 时钟居中）：
+     *   · 底色从"主区色 50% 透明"改成**实心藏青** —— 设计稿里状态栏与主区
+     *     是两个分明的色块；半透明会让 #2A365B 和 #D3DBFC 混成一片灰蓝。
+     *   · 高度**固定** 30px，不再是 LV_SIZE_CONTENT —— 内容一多就长高，
+     *     会把下面的主区整体往下挤。
+     *   · 时钟从左对齐（设计稿在左侧），不再居中。
+     */
     top_bar_ = lv_obj_create(screen);
-    lv_obj_set_size(top_bar_, LV_HOR_RES, LV_SIZE_CONTENT);
+    lv_obj_set_size(top_bar_, LV_HOR_RES, StatusBarH());
     lv_obj_set_style_radius(top_bar_, 0, 0);
-    lv_obj_set_style_bg_opa(top_bar_, LV_OPA_50, 0);  // 50% opacity background
-    lv_obj_set_style_bg_color(top_bar_, lvgl_theme->background_color(), 0);
+    lv_obj_set_style_bg_color(top_bar_, lv_color_hex(kColorStatusBar), 0);
+    lv_obj_set_style_bg_opa(top_bar_, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(top_bar_, 0, 0);
     lv_obj_set_style_pad_all(top_bar_, 0, 0);
-    lv_obj_set_style_pad_top(top_bar_, lvgl_theme->spacing(2), 0);
-    lv_obj_set_style_pad_bottom(top_bar_, lvgl_theme->spacing(2), 0);
-    lv_obj_set_style_pad_left(top_bar_, lvgl_theme->spacing(4), 0);
-    lv_obj_set_style_pad_right(top_bar_, lvgl_theme->spacing(4), 0);
+    lv_obj_set_style_pad_left(top_bar_, LV_HOR_RES * 8 / 320, 0);
+    lv_obj_set_style_pad_right(top_bar_, LV_HOR_RES * 8 / 320, 0);
     lv_obj_set_flex_flow(top_bar_, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(top_bar_, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_scrollbar_mode(top_bar_, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(top_bar_, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_align(top_bar_, LV_ALIGN_TOP_MID, 0, 0);
 
-    // Left icon
-    network_label_ = lv_label_create(top_bar_);
-    lv_label_set_text(network_label_, "");
-    lv_obj_set_style_text_font(network_label_, icon_font, 0);
-    lv_obj_set_style_text_color(network_label_, lvgl_theme->text_color(), 0);
+    /* 左组：时钟（status_label_）+ 临时状态文案（notification_label_）。
+     *
+     * 复用 status_bar_ 这个成员当"左组容器"：它原本就是装这两个 label 的，
+     * 只是以前铺满整屏、绝对定位、背景全透明。现在改成 flex 行里的一个
+     * 自适应小盒子 —— 不用 LV_LAYOUT_NONE + 绝对定位，是因为那样两个 label
+     * 会叠在同一位置，宽度还得各算一遍。 */
+    status_bar_ = lv_obj_create(top_bar_);
+    lv_obj_set_size(status_bar_, LV_HOR_RES * 34 / 100, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(status_bar_, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(status_bar_, 0, 0);
+    lv_obj_set_style_pad_all(status_bar_, 0, 0);
+    lv_obj_set_style_layout(status_bar_, LV_LAYOUT_NONE, 0);
+    lv_obj_set_scrollbar_mode(status_bar_, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(status_bar_, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Right icons container
+    /* 时钟：左对齐、白字、超长打点（"上午 08:30" 实测约 95px，134px 的框
+     * 足够；但状态文案可能很长，所以必须给个明确的截断模式，否则会撑破）。 */
+    status_label_ = lv_label_create(status_bar_);
+    lv_obj_set_width(status_label_, lv_pct(100));
+    lv_label_set_long_mode(status_label_, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_set_style_text_color(status_label_, lv_color_white(), 0);
+    lv_obj_set_style_text_font(status_label_, text_font, 0);  /* 显式设，不靠继承 */
+    lv_label_set_text(status_label_, Lang::Strings::INITIALIZING);
+    lv_obj_align(status_label_, LV_ALIGN_LEFT_MID, 0, 0);
+
+    /* 临时状态文案：与时钟**同位置**、同时只显示一个（ShowNotification 会把
+     * status_label_ 藏起来，SetStatus 会把它放回来）。 */
+    notification_label_ = lv_label_create(status_bar_);
+    lv_obj_set_width(notification_label_, lv_pct(100));
+    lv_label_set_long_mode(notification_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_style_text_align(notification_label_, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_set_style_text_color(notification_label_, lv_color_white(), 0);
+    lv_obj_set_style_text_font(notification_label_, text_font, 0);
+    lv_label_set_text(notification_label_, "");
+    lv_obj_align(notification_label_, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
+
+    /* 右组：wifi / 静音 / 电量 / 日期（顺序即设计稿：图标在前、日期在后） */
     lv_obj_t* right_icons = lv_obj_create(top_bar_);
     lv_obj_set_size(right_icons, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(right_icons, LV_OPA_TRANSP, 0);
@@ -951,83 +1059,97 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_pad_all(right_icons, 0, 0);
     lv_obj_set_flex_flow(right_icons, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(right_icons, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(right_icons, LV_OBJ_FLAG_SCROLLABLE);
+
+    network_label_ = lv_label_create(right_icons);
+    lv_label_set_text(network_label_, "");
+    lv_obj_set_style_text_font(network_label_, icon_font, 0);
+    lv_obj_set_style_text_color(network_label_, lv_color_white(), 0);
 
     mute_label_ = lv_label_create(right_icons);
     lv_label_set_text(mute_label_, "");
     lv_obj_set_style_text_font(mute_label_, icon_font, 0);
-    lv_obj_set_style_text_color(mute_label_, lvgl_theme->text_color(), 0);
+    lv_obj_set_style_text_color(mute_label_, lv_color_white(), 0);
+    lv_obj_set_style_margin_left(mute_label_, lvgl_theme->spacing(2), 0);
 
     battery_label_ = lv_label_create(right_icons);
     lv_label_set_text(battery_label_, "");
     lv_obj_set_style_text_font(battery_label_, icon_font, 0);
-    lv_obj_set_style_text_color(battery_label_, lvgl_theme->text_color(), 0);
+    lv_obj_set_style_text_color(battery_label_, lv_color_white(), 0);
     lv_obj_set_style_margin_left(battery_label_, lvgl_theme->spacing(2), 0);
 
-    /* Layer 2: Status bar - for center text labels */
-    status_bar_ = lv_obj_create(screen);
-    lv_obj_set_size(status_bar_, LV_HOR_RES, LV_SIZE_CONTENT);
-    lv_obj_set_style_radius(status_bar_, 0, 0);
-    lv_obj_set_style_bg_opa(status_bar_, LV_OPA_TRANSP, 0);  // Transparent background
-    lv_obj_set_style_border_width(status_bar_, 0, 0);
-    lv_obj_set_style_pad_all(status_bar_, 0, 0);
-    lv_obj_set_style_pad_top(status_bar_, lvgl_theme->spacing(2), 0);
-    lv_obj_set_style_pad_bottom(status_bar_, lvgl_theme->spacing(2), 0);
-    lv_obj_set_scrollbar_mode(status_bar_, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_set_style_layout(status_bar_, LV_LAYOUT_NONE, 0);  // Use absolute positioning
-    lv_obj_align(status_bar_, LV_ALIGN_TOP_MID, 0, 0);  // Overlap with top_bar_
+    /* 日期：「10月29日 周三」。文案由 SetStatusClock() 与时钟一起刷，
+     * 这里只负责排版。宽度**必须**给死 —— 右侧组是 SIZE_CONTENT，
+     * 日期又最长，不给宽度会让整条状态栏在"静音图标出现"时挤爆右边缘。 */
+    date_label_ = lv_label_create(right_icons);
+    lv_label_set_text(date_label_, "");
+    lv_obj_set_width(date_label_, LV_HOR_RES * 40 / 100);
+    lv_label_set_long_mode(date_label_, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(date_label_, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_style_text_color(date_label_, lv_color_white(), 0);
+    lv_obj_set_style_text_font(date_label_, text_font, 0);
+    lv_obj_set_style_margin_left(date_label_, lvgl_theme->spacing(2), 0);
 
-    notification_label_ = lv_label_create(status_bar_);
-    lv_obj_set_width(notification_label_, LV_HOR_RES * 0.75);
-    lv_obj_set_style_text_align(notification_label_, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(notification_label_, lvgl_theme->text_color(), 0);
-    lv_label_set_text(notification_label_, "");
-    lv_obj_align(notification_label_, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
-
-    status_label_ = lv_label_create(status_bar_);
-    lv_obj_set_width(status_label_, LV_HOR_RES * 0.75);
-    lv_label_set_long_mode(status_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(status_label_, lvgl_theme->text_color(), 0);
-    lv_obj_set_style_text_font(status_label_, text_font, 0);  /* 显式设，不靠继承 */
-    lv_label_set_text(status_label_, Lang::Strings::INITIALIZING);
-    lv_obj_align(status_label_, LV_ALIGN_CENTER, 0, 0);
-
-    /* Top layer: Bottom bar - 字幕区（2026-10-20 横屏布局：贴屏幕底部，高度 28%）
+    /* Layer 3: bottom_bar_ —— 左列对话区（2026-11-03 设计稿）
      *
-     * 与 2026-10-19 的「紧贴状态栏、占 70%」相比，这一版把字幕压到底部固定一条，
-     * 把屏幕中央让给放大的表情区（见上面 emoji_box_ 的注释）。
-     * 老人看屏幕的顺序因此变成：先看中间「小安的脸」，再低头看底部「她说了什么」。
+     * 设计稿的聆听/对话态是「左边一列文字 + 右边一个头像圆」的**左右分栏**：
+     *   左列  x 18 起，宽到头像左边再留 8px（320 屏上是 183px）
+     *   上行  用户刚说的话，蓝色 #4982FC
+     *   下行  小安的回答，深色 #232F54
+     *
+     * 与 2026-10-20 那版「贴底 28% 高的居中字幕条」的区别：
+     *   · 位置：贴底 → 主区左上（设计稿首行 y≈44）
+     *   · 对齐：居中 → 左对齐（老人的视线从左往右扫，居中会让他找不到
+     *     "从哪儿开始读"，而且每换一句起点都变）
+     *   · 宽度：整屏 → 183px（右侧让给头像圆）
+     *
+     * 成员名仍叫 bottom_bar_（基类清理逻辑与 SetHideSubtitle 都按这个名字
+     * 引用），语义已变成「左列容器」。
      */
+    const int col_x = MainPadX();
+    const int col_w = LV_HOR_RES - AvatarRight() - AvatarSize() - col_x
+                      - LV_HOR_RES * 8 / 320;
     bottom_bar_ = lv_obj_create(screen);
-    lv_obj_set_width(bottom_bar_, LV_HOR_RES);
-    // 高度 = 屏幕 28%；下限 60 保底（横屏 240 高时 28%≈67，约三行中文）。
-    int subtitle_height = LV_VER_RES * 28 / 100;
-    if (subtitle_height < 60) {
-        subtitle_height = 60;
-    }
-    lv_obj_set_height(bottom_bar_, subtitle_height);
-    lv_obj_set_style_min_height(bottom_bar_, 60, 0);
+    lv_obj_set_pos(bottom_bar_, col_x, TextTop());
+    lv_obj_set_size(bottom_bar_, col_w, LV_VER_RES - TextTop() - LV_VER_RES * 8 / 240);
     lv_obj_set_style_radius(bottom_bar_, 0, 0);
-    lv_obj_set_style_bg_color(bottom_bar_, lvgl_theme->background_color(), 0);
+    /* 透明底：主区底色 #D3DBFC 由 screen/container_ 提供。这里再刷一层
+     * 同色不透明底会和圆角/边框叠出接缝，而且 SetTheme 里那段 50% 透明度
+     * 的老逻辑会让整列发灰。 */
+    lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_TRANSP, 0);
     lv_obj_set_style_text_color(bottom_bar_, lvgl_theme->text_color(), 0);
-    lv_obj_set_style_pad_top(bottom_bar_, lvgl_theme->spacing(2), 0);
-    lv_obj_set_style_pad_bottom(bottom_bar_, lvgl_theme->spacing(2), 0);
-    lv_obj_set_style_pad_left(bottom_bar_, lvgl_theme->spacing(4), 0);
-    lv_obj_set_style_pad_right(bottom_bar_, lvgl_theme->spacing(4), 0);
+    lv_obj_set_style_pad_all(bottom_bar_, 0, 0);
     lv_obj_set_style_border_width(bottom_bar_, 0, 0);
-    // 贴屏幕底部（中央让给放大的表情区）
-    lv_obj_align(bottom_bar_, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_clear_flag(bottom_bar_, LV_OBJ_FLAG_SCROLLABLE);
+    /* 纵向 flex：用户话在上、回答在下，行高由内容决定，不写死 y。
+     * 两行文字的起点必须跟着上一行的高度走 —— 用户说了 1 句还是 2 句，
+     * 回答的起始 y 是不一样的，绝对定位做不到。 */
+    lv_obj_set_flex_flow(bottom_bar_, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(bottom_bar_, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_row(bottom_bar_, LV_VER_RES * 6 / 240, 0);
 
-    /* chat_message_label_ placed in bottom_bar_ and vertically centered */
+    /* 用户话（蓝）。空串时**隐藏**而不是留空 label：flex 会跳过隐藏子对象，
+     * 这样"只有回答"时文字自然顶到列首，不会凭空多出一行空白。 */
+    chat_user_label_ = lv_label_create(bottom_bar_);
+    lv_obj_set_width(chat_user_label_, lv_pct(100));
+    lv_label_set_long_mode(chat_user_label_, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(chat_user_label_, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_set_style_text_color(chat_user_label_, lv_color_hex(kColorTextUser), 0);
+    lv_obj_set_style_text_font(chat_user_label_, text_font, 0);
+    lv_obj_set_style_text_line_space(chat_user_label_, LV_VER_RES * 4 / 240, 0);
+    lv_label_set_text(chat_user_label_, "");
+    lv_obj_add_flag(chat_user_label_, LV_OBJ_FLAG_HIDDEN);
+
+    /* 小安的回答（深色）。SetChatMessage 的 assistant / system 都写这里。 */
     chat_message_label_ = lv_label_create(bottom_bar_);
-    lv_label_set_text(chat_message_label_, "");
-    lv_obj_set_width(chat_message_label_, LV_HOR_RES - lvgl_theme->spacing(8)); // Subtract left and right padding
-    lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_WRAP); // Auto wrap mode
-    lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0); // Center text alignment
+    lv_obj_set_width(chat_message_label_, lv_pct(100));
+    lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_LEFT, 0);
     lv_obj_set_style_text_color(chat_message_label_, lvgl_theme->text_color(), 0);
     lv_obj_set_style_text_font(chat_message_label_, text_font, 0);  /* 显式设，不靠继承 */
-    lv_obj_align(chat_message_label_, LV_ALIGN_CENTER, 0, 0); // Vertically and horizontally centered in bottom_bar_
+    lv_obj_set_style_text_line_space(chat_message_label_, LV_VER_RES * 4 / 240, 0);
+    lv_label_set_text(chat_message_label_, "");
 
     low_battery_popup_ = lv_obj_create(screen);
     lv_obj_set_scrollbar_mode(low_battery_popup_, LV_SCROLLBAR_MODE_OFF);
@@ -1089,38 +1211,108 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
         ESP_LOGW("FontDiag", "SetChatMessage: chat_message_label_ is NULL!");
         return;
     }
-    ESP_LOGW("FontDiag", "SetChatMessage role=%s content_len=%d label=%p w=%d h=%d",
-             role ? role : "(null)",
-             content ? (int)strlen(content) : -1,
-             (void*)chat_message_label_,
-             (int)lv_obj_get_width(chat_message_label_),
-             (int)lv_obj_get_height(chat_message_label_));
-    /* 2026-10-23 诊断：h=36 之谜。文件里 line_height=25，而这里 h=36，
-     * 数学上只可能是 label 实际字体的 line_height 运行时读出来不是 25
-     * （或 ls≠0 / 有 padding）。把 label 的**解析后**字体与排版参数
-     * 全部打出来 —— 注意打的是 label 自己，不是 theme 里的字体。 */
-    {
-        const lv_font_t* label_font = lv_obj_get_style_text_font(chat_message_label_, LV_PART_MAIN);
-        ESP_LOGW("FontDiag", "chat label font=%p lh=%d bl=%d ls=%d les=%d long=%d pad=%d,%d style_h=%d",
-                 (const void*)label_font,
-                 label_font ? label_font->line_height : -1,
-                 label_font ? label_font->base_line : -1,
-                 (int)lv_obj_get_style_text_line_space(chat_message_label_, LV_PART_MAIN),
-                 (int)lv_obj_get_style_text_letter_space(chat_message_label_, LV_PART_MAIN),
-                 (int)lv_label_get_long_mode(chat_message_label_),
-                 (int)lv_obj_get_style_pad_top(chat_message_label_, LV_PART_MAIN),
-                 (int)lv_obj_get_style_pad_bottom(chat_message_label_, LV_PART_MAIN),
-                 (int)lv_obj_get_style_height(chat_message_label_, LV_PART_MAIN));
+    /* 2026-11-03 设计稿：对话态是「上行用户话（蓝）+ 下行回答（深色）」。
+     *
+     * 分工（见 lcd_display.h 的成员注释）：
+     *   role == "user"  → chat_user_label_（蓝），并把上一轮回答清掉
+     *   其余（assistant / system）→ chat_message_label_（深色），并清掉用户话
+     *
+     * 为什么 user 分支要清回答、回答分支要清用户话：
+     *   · 用户刚问完、回答还没来 —— 屏上留着上一轮的回答，老人会以为
+     *     那是这次的答案（"我问了头疼，它说该吃药了"）；
+     *   · 回答来了、用户话还留着 —— 正好是设计稿那一幕，**保留**。
+     *   所以只有 user 分支清回答，回答分支**不清**用户话。
+     *
+     * system 分支（PLEASE_WAIT / 报错 / 升级提示）与对话无关，两条都清，
+     * 否则会出现「系统升级中 + 三分钟前那句无关的提问」同时挂着。 */
+    const bool is_user = (role != nullptr && strcmp(role, "user") == 0);
+    lv_obj_t* target = is_user ? chat_user_label_ : chat_message_label_;
+    if (target == nullptr) {
+        ESP_LOGW("FontDiag", "SetChatMessage: target label is NULL (role=%s)!",
+                 role ? role : "(null)");
+        return;
     }
-    lv_label_set_text(chat_message_label_, content);
-    /* 同步跑一次布局，打「这段文字 + 当前字体」的真实高度：与函数开头
-     * 打的上一次高度对照，才能把 25→36 的跳变钉死在哪一侧。 */
+
+    const char* text = (content != nullptr) ? content : "";
+    lv_label_set_text(target, text);
+    /* 空串 ⇒ 隐藏：flex 跳过隐藏子对象，另一行会自动顶上去。
+     * 不隐藏的话会留一行空白，看着像"屏幕上多了一条横线"。 */
+    if (text[0] == '\0') {
+        lv_obj_add_flag(target, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_remove_flag(target, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    lv_obj_t* other = is_user ? chat_message_label_ : chat_user_label_;
+    if (other != nullptr && !is_user) {
+        /* 只有 system 才清用户话；assistant 要留着（见上面注释）。 */
+        const bool is_system = (role != nullptr && strcmp(role, "system") == 0);
+        if (is_system) {
+            lv_label_set_text(other, "");
+            lv_obj_add_flag(other, LV_OBJ_FLAG_HIDDEN);
+        }
+    } else if (other != nullptr) {
+        /* user 分支：清掉上一轮回答 */
+        lv_label_set_text(other, "");
+        lv_obj_add_flag(other, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    ESP_LOGI(TAG, "SetChatMessage role=%s len=%d", role ? role : "(null)",
+             (int)strlen(text));
     lv_obj_update_layout(chat_message_label_);
-    ESP_LOGW("FontDiag", "after set_text+layout: w=%d h=%d",
-             (int)lv_obj_get_width(chat_message_label_),
-             (int)lv_obj_get_height(chat_message_label_));
 }
-#endif
+#endif  /* CONFIG_USE_WECHAT_MESSAGE_STYLE —— 以下两个函数两个分支都要有 */
+
+/* 普通状态文案：让出整条状态栏（临时藏日期、左段放宽），见 lcd_display.h 的说明。 */
+void LcdDisplay::SetStatus(const char* status) {
+    LvglDisplay::SetStatus(status);
+    DisplayLockGuard lock(this);
+    if (status_bar_ != nullptr) {
+        lv_obj_set_width(status_bar_, LV_HOR_RES * 78 / 100);
+    }
+    if (date_label_ != nullptr) {
+        lv_obj_add_flag(date_label_, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* 状态栏时钟 + 日期（2026-11-03 设计稿：左「上午 08:30」右「wifi 10月29日 周三」）。
+ *
+ * 为什么日期不放在 LvglDisplay::UpdateStatusBar 里一起刷：那个函数在
+ * lvgl_display.cc，属于所有板卡共用的显示层，它不认识本类的 date_label_。
+ * 而时钟本来就要经过一次虚函数调用（SetStatusClock），顺手把日期在这里
+ * 刷掉，比再挂一个 1 秒定时器省一个 timer、也省掉"两个定时器不同步导致
+ * 23:59 显示 00:00 却还是昨天日期"这类边界问题。 */
+void LcdDisplay::SetStatusClock(const char* text) {
+    /* 先走**基类**：写 status_label_、藏 notification_label_、更新
+     * last_status_update_time_ —— 这三件事与 2026-11-03 之前逐字一致，
+     * 不在本函数里重写一遍（否则时间戳会有两份口径）。
+     * ⚠️ 这里刻意**不**调 LcdDisplay::SetStatus —— 那会把日期藏起来。 */
+    LvglDisplay::SetStatus(text);
+
+    if (date_label_ == nullptr) {
+        return;
+    }
+    DisplayLockGuard lock(this);
+    /* 把状态栏恢复成「时钟 34% + 图标日期」的设计稿比例 */
+    if (status_bar_ != nullptr) {
+        lv_obj_set_width(status_bar_, LV_HOR_RES * 34 / 100);
+    }
+    lv_obj_remove_flag(date_label_, LV_OBJ_FLAG_HIDDEN);
+
+    time_t now = time(NULL);
+    struct tm* tm = localtime(&now);
+    if (tm == nullptr || tm->tm_year < 2025 - 1900) {
+        return;   /* 系统时间还没同步：宁可留空，也不显示 1970 年 */
+    }
+    static const char* kWeek[] = {"周日", "周一", "周二", "周三", "周四", "周五", "周六"};
+    int wd = tm->tm_wday;
+    if (wd < 0 || wd > 6) {
+        wd = 0;
+    }
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d月%d日 %s", tm->tm_mon + 1, tm->tm_mday, kWeek[wd]);
+    lv_label_set_text(date_label_, buf);
+}
 
 void LcdDisplay::SetEmotion(const char* emotion) {
     /* 任何主动表情切换都算"界面有变化" ⇒ 重置防烧屏的空闲计时。
@@ -1382,15 +1574,18 @@ constexpr const char* kIdleMarqueeEmoji[] = {
     "neutral", "relaxed", "happy", "loving", "winking", "cool", "sleepy",
 };
 
-/* 滚动速度 35 px/s。
+/* 滚动速度 55 px/s（2026-11-03 轨道改成整屏后从 35 上调）。
  *
- * 上限由「看得清」定：图片区宽 134px，图 110px，一张划过约 7 秒；再快
- * （>50px/s）老人只看到一团颜色在动，认不出是什么表情。
- * 下限由「别以为卡住」定：慢于 ~25px/s 时相邻两帧位移不到 1px，
- * 观感接近静止，起不到「设备活着」的信号作用。
- * 取中间值 35 ⇒ 单张过屏 (134+110)/35 ≈ 7.0 秒，7 张一轮约 49 秒，
- * 与防烧屏的 60 秒量级一致（一轮下来整块图片区的像素全换过）。 */
-constexpr int32_t kIdleMarqueeSpeedPxPerSec = 35;
+ * 上限由「看得清」定：一张图从屏幕右缘外到左缘外要走 320+60=380px，
+ * 再快（>75px/s）老人只看到一团颜色在动，认不出是什么表情。
+ * 下限由「别以为卡住」定：慢于 ~40px/s 时全程要 9 秒以上，屏上大部分时间
+ * 是空的，观感接近静止，起不到「设备活着」的信号作用。
+ * 取 55 ⇒ 单张过屏 380/55 ≈ 6.9 秒，7 张一轮约 48 秒，与防烧屏的 60 秒
+ * 量级一致（一轮下来整块主区的像素全换过）。
+ *
+ * ⚠️ 旧值 35 是按「图片区 134px 宽」算的（单张 7 秒）；轨道变成 320px 之后
+ * 沿用 35 会让单张走 10.9 秒，屏上空窗期太长。 */
+constexpr int32_t kIdleMarqueeSpeedPxPerSec = 55;
 
 }  // namespace
 
@@ -1470,28 +1665,35 @@ bool LcdDisplay::StartIdleMarquee() {
         return false;
     }
 
-    /* 尺寸：表情源是 128x128 方图，图片区 134x110 ⇒ 按**盒子高度**取正方形，
-     * CONTAIN 等比缩到 110x110，正好铺满高度、宽度也留出左右各 12px 的
-     * 进出空间（滚出/滚入时不会突然整块跳出来）。 */
-    lv_obj_update_layout(emoji_box_);
-    const int32_t box_w = lv_obj_get_width(emoji_box_);
-    const int32_t box_h = lv_obj_get_height(emoji_box_);
-    if (box_w <= 0 || box_h <= 0) {
-        ESP_LOGW(TAG, "待机跑马灯：图片区尺寸异常（%dx%d），不启动",
-                 (int)box_w, (int)box_h);
+    /* 尺寸与轨道（2026-11-03 设计稿）：表情直径 60px（mock-3 实测 60x60），
+     * 轨道是**整屏宽度**，纵向居中于主区（状态栏以下）。
+     *
+     * ⚠️ 这里正是 2026-11-03 用户实报「没有从全屏右侧进入、左侧出」的正解：
+     * 旧代码把轨道取成 emoji_box_ 的宽（320x240 上是 134px），图片又挂在
+     * emoji_box_ 底下，所以只在屏幕中央那个小方块里滚 —— 观感是"中间有张
+     * 图在滑"，而不是"表情从右边进来、从左边出去"。
+     * 现在父对象是 screen、轨道是 LV_HOR_RES。 */
+    const int32_t img_sz = MarqueeSize();
+    if (img_sz <= 0) {
+        ESP_LOGW(TAG, "待机跑马灯：屏幕尺寸异常（%dx%d），不启动",
+                 (int)LV_HOR_RES, (int)LV_VER_RES);
         return false;
     }
+    const int32_t main_h = LV_VER_RES - StatusBarH();
+    const int32_t img_y = StatusBarH() + (main_h - img_sz) / 2;
 
     if (idle_marquee_image_ == nullptr) {
-        idle_marquee_image_ = lv_image_create(emoji_box_);
+        /* 父对象是 screen 而不是 emoji_box_：轨道要跨整屏。
+         * 只建一次，之后靠显隐复用：LVGL 对象创建在 PSRAM 碎片化时可能失败，
+         * 而这块是待机态反复要用的东西。 */
+        idle_marquee_image_ = lv_image_create(lv_screen_active());
         lv_obj_set_style_pad_all(idle_marquee_image_, 0, 0);
         lv_obj_set_style_border_width(idle_marquee_image_, 0, 0);
         lv_image_set_inner_align(idle_marquee_image_, LV_IMAGE_ALIGN_CONTAIN);
-        /* 只建一次，之后靠显隐复用：LVGL 对象创建在 PSRAM 碎片化时可能失败，
-         * 而这块是待机态反复要用的东西。 */
         lv_obj_add_flag(idle_marquee_image_, LV_OBJ_FLAG_HIDDEN);
     }
-    lv_obj_set_size(idle_marquee_image_, box_h, box_h);
+    lv_obj_set_size(idle_marquee_image_, img_sz, img_sz);
+    lv_obj_set_y(idle_marquee_image_, img_y);
 
     idle_marquee_next_ = 0;
     const LvglImage* first = collection->GetEmojiImage(idle_marquee_ready_[0]);
@@ -1509,9 +1711,15 @@ bool LcdDisplay::StartIdleMarquee() {
     if (emoji_label_ != nullptr) {
         lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
     }
+    /* 头像圆整块藏起来：设计稿的待机态没有那个蓝紫圆，只有滚过的表情。
+     * 不藏的话右边缘会常驻一个空心的蓝色圆 —— 老人会以为"屏幕坏了、
+     * 头像变空白了"。 */
+    if (emoji_box_ != nullptr) {
+        lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+    }
     lv_obj_remove_flag(idle_marquee_image_, LV_OBJ_FLAG_HIDDEN);
 
-    /* x 从图片区右边缘外开始（对象左边缘 = box_w ⇒ 整张在图区之外），
+    /* x 从屏幕右缘之外开始（对象左边缘 = LV_HOR_RES ⇒ 整张在屏外），
      * 匀速左移到 -img_w（对象右边缘 = 0 ⇒ 整张移出左边缘）。一条 lv_anim
      * 用 repeat 无限循环，每轮回起点时 x 由动画自己复位。
      *
@@ -1519,20 +1727,21 @@ bool LcdDisplay::StartIdleMarquee() {
      * 下一张下标），而 lv_anim 的 exec_cb 只给一个 void*。顺带获得一个好处：
      * lv_anim_start 会 remove_concurrent_anims（同 var + 同 exec_cb），
      * 所以本函数被重入也不会同时跑两条动画。 */
-    const int32_t img_w = box_h;
+    const int32_t img_w = img_sz;
+    const int32_t track = LV_HOR_RES + img_w;   /* 右缘外 → 左缘外，全程 */
     const uint32_t duration_ms =
-        (uint32_t)((box_w + img_w) * 1000 / kIdleMarqueeSpeedPxPerSec);
+        (uint32_t)((int64_t)track * 1000 / kIdleMarqueeSpeedPxPerSec);
 
     /* early_apply 默认开 ⇒ lv_anim_start 会立刻用 start_value 调一次回调。
      * 所以 last_x_ 必须在 start **之前**置成起点，否则首次回调会被当成
      * 「x 变大」而白白换掉一张图。 */
-    idle_marquee_last_x_ = box_w;
+    idle_marquee_last_x_ = LV_HOR_RES;
 
     lv_anim_t anim;
     lv_anim_init(&anim);
     lv_anim_set_var(&anim, this);
     lv_anim_set_exec_cb(&anim, IdleMarqueeExecCb);
-    lv_anim_set_values(&anim, box_w, -img_w);
+    lv_anim_set_values(&anim, LV_HOR_RES, -img_w);
     lv_anim_set_duration(&anim, duration_ms);
     lv_anim_set_path_cb(&anim, lv_anim_path_linear);
     lv_anim_set_repeat_count(&anim, LV_ANIM_REPEAT_INFINITE);
@@ -1564,6 +1773,16 @@ void LcdDisplay::StopIdleMarquee() {
      * 之后图片区会一直空着，直到下一次 SetEmotion（老人看到的是"屏幕坏了"）。 */
     if (emoji_image_ != nullptr && lv_image_get_src(emoji_image_) != nullptr) {
         lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+    }
+    /* 头像圆（emoji_box_）在 StartIdleMarquee 里被整块藏起来了，这里放回来。
+     * 但**预览图正在显示**时不能放 —— SetPreviewImage 是「藏头像、显预览」，
+     * 这时候把头像放回来会盖住刚设的预览图（那 5 秒里老人看到的仍是旧表情）。 */
+    if (emoji_box_ != nullptr) {
+        const bool preview_visible = (preview_image_ != nullptr) &&
+                                     !lv_obj_has_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
+        if (!preview_visible) {
+            lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+        }
     }
     idle_marquee_last_x_ = 0;
     idle_marquee_next_ = 0;
@@ -1689,13 +1908,35 @@ void LcdDisplay::SetTheme(Theme* theme) {
     if (notification_label_ != nullptr) {
         lv_obj_set_style_text_font(notification_label_, text_font, 0);
     }
-    /* 全屏提醒的 label 是**运行时懒创建**的：换主题时它可能已经存在
+    /* 全屏提醒的卡片是**运行时懒创建**的：换主题时它可能已经存在
      * （提醒挂着、用户又切了主题），也可能还没建（下次 ShowReminder 会用
      * 新主题的字体新建）。两条路都要覆盖，否则就是上一段注释里那种
-     * 「改了字体但屏上不变」。 */
-    if (reminder_label_ != nullptr) {
-        lv_obj_set_style_text_font(reminder_label_, text_font, 0);
-        lv_obj_set_style_text_color(reminder_label_, lvgl_theme->text_color(), 0);
+     * 「改了字体但屏上不变」—— 提醒卡片恰恰是最不能缺字的地方。
+     *
+     * ⚠️ 2026-11-03 起提醒不再是单个 reminder_label_，而是
+     * 标题 / 明细 / 提示 / 按钮白字 四个 label，**四个都要补**。
+     * 漏掉哪个，那一行就退回只有 788 字形的编译期内置字库，
+     * 屏上表现是"这一行大部分汉字不见了"。 */
+    if (reminder_title_ != nullptr) {
+        lv_obj_set_style_text_font(reminder_title_, text_font, 0);
+        lv_obj_set_style_text_color(reminder_title_, lv_color_hex(kColorTextDark), 0);
+    }
+    if (reminder_items_ != nullptr) {
+        lv_obj_set_style_text_font(reminder_items_, text_font, 0);
+        lv_obj_set_style_text_color(reminder_items_, lv_color_hex(kColorTextDark), 0);
+    }
+    if (reminder_hint_ != nullptr) {
+        lv_obj_set_style_text_font(reminder_hint_, text_font, 0);
+    }
+    if (reminder_button_label_ != nullptr) {
+        lv_obj_set_style_text_font(reminder_button_label_, text_font, 0);
+    }
+    /* 2026-11-03 新增的两个对话/状态栏 label 同样必须补字体 */
+    if (chat_user_label_ != nullptr) {
+        lv_obj_set_style_text_font(chat_user_label_, text_font, 0);
+    }
+    if (date_label_ != nullptr) {
+        lv_obj_set_style_text_font(date_label_, text_font, 0);
     }
     if (reminder_overlay_ != nullptr) {
         lv_obj_set_style_bg_color(reminder_overlay_,
@@ -1710,18 +1951,27 @@ void LcdDisplay::SetTheme(Theme* theme) {
         lv_obj_set_style_bg_color(container_, lvgl_theme->background_color(), 0);
     }
     
-    // Update top bar background color with 50% opacity
+    /* 状态栏底色（2026-11-03 设计稿）：实心藏青。
+     *
+     * 旧代码这里是「主题底色 + 50% 不透明度」。改主题色之后如果不动这里，
+     * 换一次主题就会把藏青状态栏刷成半透明的 #D3DBFC —— 与主区混成一片，
+     * 设计稿里那条分界线就没了。 */
     if (top_bar_ != nullptr) {
-        lv_obj_set_style_bg_opa(top_bar_, LV_OPA_50, 0);
-        lv_obj_set_style_bg_color(top_bar_, lvgl_theme->background_color(), 0);
+        lv_obj_set_style_bg_opa(top_bar_, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(top_bar_, lv_color_hex(kColorStatusBar), 0);
     }
-    
-    // Update status bar elements
-    lv_obj_set_style_text_color(network_label_, lvgl_theme->text_color(), 0);
-    lv_obj_set_style_text_color(status_label_, lvgl_theme->text_color(), 0);
-    lv_obj_set_style_text_color(notification_label_, lvgl_theme->text_color(), 0);
-    lv_obj_set_style_text_color(mute_label_, lvgl_theme->text_color(), 0);
-    lv_obj_set_style_text_color(battery_label_, lvgl_theme->text_color(), 0);
+
+    /* 状态栏里的文字/图标一律白色（藏青底上深色字看不清）。
+     * 2026-11-03 之前这里刷的是 theme->text_color()（现在是 #232F54），
+     * 在藏青底上等于"黑字黑底"，屏上只剩几个模糊的轮廓。 */
+    lv_obj_set_style_text_color(network_label_, lv_color_white(), 0);
+    lv_obj_set_style_text_color(status_label_, lv_color_white(), 0);
+    lv_obj_set_style_text_color(notification_label_, lv_color_white(), 0);
+    lv_obj_set_style_text_color(mute_label_, lv_color_white(), 0);
+    lv_obj_set_style_text_color(battery_label_, lv_color_white(), 0);
+    if (date_label_ != nullptr) {
+        lv_obj_set_style_text_color(date_label_, lv_color_white(), 0);
+    }
     lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
 
     // If we have the chat message style, update all message bubbles
@@ -1798,15 +2048,20 @@ void LcdDisplay::SetTheme(Theme* theme) {
     if (chat_message_label_ != nullptr) {
         lv_obj_set_style_text_color(chat_message_label_, lvgl_theme->text_color(), 0);
     }
+    if (chat_user_label_ != nullptr) {
+        lv_obj_set_style_text_color(chat_user_label_, lv_color_hex(kColorTextUser), 0);
+    }
     
     if (emoji_label_ != nullptr) {
         lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
     }
     
-    // Update bottom bar background color with 50% opacity
+    /* 左列对话区（bottom_bar_）保持**全透明**：主区底色由 screen/container_
+     * 提供。旧代码这里是「主题底色 + 50% 不透明度」，换到 #D3DBFC 之后
+     * 会变成一层灰蓝色的半透明块盖在同样颜色的底上，视觉上是"文字背后
+     * 有一块更深的方框"—— 设计稿里没有这个框。 */
     if (bottom_bar_ != nullptr) {
-        lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_50, 0);
-        lv_obj_set_style_bg_color(bottom_bar_, lvgl_theme->background_color(), 0);
+        lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_TRANSP, 0);
     }
 #endif
     
@@ -1832,16 +2087,31 @@ void LcdDisplay::SetHideSubtitle(bool hide) {
 }
 
 // >>> BEGIN elder-reminder-fullscreen (2026-10-22 需求 8) >>>
-/* 全屏大字提醒。
+/* 全屏提醒 —— 2026-11-03 按设计稿改成**结构化卡片**。
  *
- * 为什么覆盖整屏、且**必须不透明**：用户原话是「屏幕的图片不再显示」——
- * 半透明会让中间那张表情图透出来，看起来像"提醒叠在屏保上"，
- * 老人第一反应是"设备坏了"，而不是"有事要做"。
+ * 设计稿（deliverables/gstack/design/mock-1-reminder.png）实测：
+ *   状态栏保留在顶部（藏青，左时钟右日期），卡片只占状态栏以下的 210px；
+ *   左列：红色药丸图标 + 标题「该吃药了」 / 明细行 / 橙色提示「请及时服用」
+ *         底部橙色圆角按钮「长按机身顶部大按键确认」
+ *   右侧：90x90 头像圆（与对话态同一位置、同一尺寸）
+ *
+ * 为什么**必须不透明**：用户原话是「屏幕的图片不再显示」—— 半透明会让
+ * 底下的表情图透出来，看起来像"提醒叠在屏保上"，老人第一反应是
+ * "设备坏了"，而不是"有事要做"。
  *
  * ⚠️ 字号：2026-10-22 第一版用 transform_scale 把 20px 放大 2 倍，真机
- * **整屏纯白、一个字都没有**（详见下面 label 创建处的注释）。现在退回
- * 原生 20px 全宽排版。要真正的大字，正确做法是往 assets 分区加一套
- * 30px 的 cbin 字库（分区 8MB、已用 1.59MB，余量充足），而不是缩放。
+ * **整屏纯白、一个字都没有**（详见下面 label 创建处的注释）。现在仍是
+ * 原生 20px。要真正的大字，正确做法是往 assets 分区加一套 30px 的 cbin
+ * 字库（分区 8MB、已用 2.57MB，余量充足），而不是缩放。
+ *
+ * ⚠️ 文案契约（与 reminder.c 的 elder_reminder_screen_text() 一一对应）：
+ *     第 0 行（第一个非空行）  标题
+ *     以「请」开头的行          橙色提示语
+ *     其余行                    明细，逐行列出（最多 3 行，多的截断）
+ *   解析放在显示层、而不是让 reminder.c 传结构体：elder_ui_hooks_t 只能在
+ *   末尾追加，改签名要同时动 elder 组件、xiaozhi 的 merge 副本和两处调用点；
+ *   而这段文案本来就是"给人看的一小段话"，按行拆是最小改动。
+ *   改一边必须改另一边 —— 只改一边的表现是"提示语跑到明细里去了"。
  */
 void LcdDisplay::ShowReminder(const char* text) {
     DisplayLockGuard lock(this);
@@ -1856,61 +2126,237 @@ void LcdDisplay::ShowReminder(const char* text) {
         return;
     }
 
+    const int bar_h = StatusBarH();
+    const int card_h = LV_VER_RES - bar_h;
+    const int col_x = MainPadX();
+    const int col_w = LV_HOR_RES - AvatarRight() - AvatarSize() - col_x
+                      - LV_HOR_RES * 8 / 320;
+    const auto text_font = lvgl_theme->text_font() != nullptr
+                               ? lvgl_theme->text_font()->font()
+                               : nullptr;
+
     if (reminder_overlay_ == nullptr) {
+        /* 卡片只占状态栏以下：设计稿里状态栏（时钟/日期）是**保留**的，
+         * 老人正看着提醒时仍然需要知道现在几点。盖住整屏会让时钟消失，
+         * 而这条提醒最长会挂 4 小时。 */
         reminder_overlay_ = lv_obj_create(screen);
-        lv_obj_set_size(reminder_overlay_, LV_HOR_RES, LV_VER_RES);
-        lv_obj_align(reminder_overlay_, LV_ALIGN_TOP_LEFT, 0, 0);
+        lv_obj_set_size(reminder_overlay_, LV_HOR_RES, card_h);
+        lv_obj_set_pos(reminder_overlay_, 0, bar_h);
         lv_obj_set_style_radius(reminder_overlay_, 0, 0);
         lv_obj_set_style_border_width(reminder_overlay_, 0, 0);
         lv_obj_set_style_pad_all(reminder_overlay_, 0, 0);
-        lv_obj_set_style_bg_color(reminder_overlay_, lvgl_theme->background_color(), 0);
+        lv_obj_set_style_bg_color(reminder_overlay_, lv_color_hex(kColorMainBg), 0);
         lv_obj_set_style_bg_opa(reminder_overlay_, LV_OPA_COVER, 0);
-        /* 放大后的字要能画出 overlay 之外 → 不裁剪子对象 */
-        lv_obj_add_flag(reminder_overlay_, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
         lv_obj_clear_flag(reminder_overlay_, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_style_layout(reminder_overlay_, LV_LAYOUT_NONE, 0);
 
-        reminder_label_ = lv_label_create(reminder_overlay_);
-        /* ⚠️ 2026-10-22 真机事故：这里原本用 transform_scale 放大 2 倍
-         * （半屏宽排版 + 512 缩放）。真机表现是**整屏纯白、一个字都没有**
-         * ——覆盖层画出来了，label 却没画出来，日志里连一条 LVGL 警告都没有。
-         *
-         * 缩放走的是 lv_refr.c 的 LV_LAYER_TYPE_TRANSFORM 分支：先
-         * layer_get_area() 求变换后区域，求不出就 `return` **静默跳过整个对象**
-         * （lv_refr.c:1218 那个 res != LV_RESULT_OK 的 return）。
-         * 本工程 LV_USE_MATRIX / LV_DRAW_TRANSFORM_USE_MATRIX 都是 n，
-         * 走的是老的逐像素变换路径 —— 这条路在本仓从未被验证过（全工程
-         * 只有这一处用 transform_scale）。
-         *
-         * 结论：**先用确定能显示的原生字库把字画出来**，字小可以改，
-         * 白屏等于老人什么都看不见。字号问题另案处理（assets 分区还有
-         * 6.4MB 空余，可以放一套 30px 的 cbin 字库，不受 app 分区限制）。
-         *
-         * 布局取全宽而不是半宽：不缩放之后半宽排版会让每行只剩 8 个字，
-         * 4 行字挤在中间，反而不如全宽两行好读。 */
-        lv_obj_set_size(reminder_label_, LV_HOR_RES - 16, LV_VER_RES - 16);
-        lv_label_set_long_mode(reminder_label_, LV_LABEL_LONG_WRAP);
-        lv_obj_set_style_text_align(reminder_label_, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_color(reminder_label_, lvgl_theme->text_color(), 0);
-        /* 行距放宽：20px 字在 240 高的屏上只占 4 行，加行距更好认 */
-        lv_obj_set_style_text_line_space(reminder_label_, 8, 0);
-        /* 字体**显式设**，不靠从 screen 继承 —— 与 status_label_/chat_message_label_
-         * 同一条纪律（见 SetTheme 里 2026-10-22 字幕缺字的注释）。
-         * 全屏提醒恰恰是最不能缺字的地方：老人只看到「该吃 了」这种残句，
-         * 比什么都不显示更糟 —— 他可能按错事去办。 */
-        if (lvgl_theme->text_font() != nullptr) {
-            lv_obj_set_style_text_font(reminder_label_,
-                                       lvgl_theme->text_font()->font(), 0);
+        /* ---- 标题行：红色药丸图标 + 标题 ----
+         * 药丸用 lv_obj 画（12x22 圆角矩形），不用 FontAwesome：
+         * font_awesome_20_4 里**没有**药丸/胶囊字形（只有 bell /
+         * triangle_exclamation 这类），拿感叹号当药丸只会更让人看不懂。 */
+        lv_obj_t* title_row = lv_obj_create(reminder_overlay_);
+        lv_obj_set_pos(title_row, col_x, LV_VER_RES * 12 / 240);
+        lv_obj_set_size(title_row, col_w, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(title_row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(title_row, 0, 0);
+        lv_obj_set_style_pad_all(title_row, 0, 0);
+        lv_obj_set_style_pad_column(title_row, LV_HOR_RES * 6 / 320, 0);
+        lv_obj_set_flex_flow(title_row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(title_row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* pill = lv_obj_create(title_row);
+        lv_obj_set_size(pill, LV_HOR_RES * 12 / 320, LV_VER_RES * 22 / 240);
+        lv_obj_set_style_radius(pill, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(pill, lv_color_hex(kColorPillRed), 0);
+        lv_obj_set_style_bg_opa(pill, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(pill, 0, 0);
+        lv_obj_set_style_pad_all(pill, 0, 0);
+        lv_obj_clear_flag(pill, LV_OBJ_FLAG_SCROLLABLE);
+
+        reminder_title_ = lv_label_create(title_row);
+        lv_obj_set_width(reminder_title_, col_w - LV_HOR_RES * 18 / 320);
+        lv_label_set_long_mode(reminder_title_, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_align(reminder_title_, LV_TEXT_ALIGN_LEFT, 0);
+        lv_obj_set_style_text_color(reminder_title_, lv_color_hex(kColorTextDark), 0);
+        if (text_font != nullptr) {
+            lv_obj_set_style_text_font(reminder_title_, text_font, 0);
         }
-        lv_obj_center(reminder_label_);
+        lv_label_set_text(reminder_title_, "");
+
+        /* ---- 明细：多行左对齐 ----
+         * 位置紧接标题行之下；行距 6px。最多 3 行（再多的提醒同一分钟
+         * 不会超过 3 条），超出的由 LONG_WRAP 自动换行、被下方提示语挡住。 */
+        reminder_items_ = lv_label_create(reminder_overlay_);
+        lv_obj_set_pos(reminder_items_, col_x, LV_VER_RES * 46 / 240);
+        lv_obj_set_width(reminder_items_, col_w);
+        lv_obj_set_height(reminder_items_, LV_VER_RES * 88 / 240);
+        lv_label_set_long_mode(reminder_items_, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(reminder_items_, LV_TEXT_ALIGN_LEFT, 0);
+        lv_obj_set_style_text_color(reminder_items_, lv_color_hex(kColorTextDark), 0);
+        lv_obj_set_style_text_line_space(reminder_items_, LV_VER_RES * 4 / 240, 0);
+        if (text_font != nullptr) {
+            lv_obj_set_style_text_font(reminder_items_, text_font, 0);
+        }
+        lv_label_set_text(reminder_items_, "");
+
+        /* ---- 橙色提示语（贴底往上数第三个） ---- */
+        reminder_hint_ = lv_label_create(reminder_overlay_);
+        lv_obj_set_width(reminder_hint_, col_w);
+        lv_label_set_long_mode(reminder_hint_, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_align(reminder_hint_, LV_TEXT_ALIGN_LEFT, 0);
+        lv_obj_set_style_text_color(reminder_hint_, lv_color_hex(kColorAccent), 0);
+        if (text_font != nullptr) {
+            lv_obj_set_style_text_font(reminder_hint_, text_font, 0);
+        }
+        lv_label_set_text(reminder_hint_, "");
+        lv_obj_align(reminder_hint_, LV_ALIGN_BOTTOM_LEFT, col_x, -LV_VER_RES * 52 / 240);
+
+        /* ---- 橙色圆角按钮 ----
+         * 文案是**界面常量**不是数据：设计稿这一行说的是"怎么操作这台机器"，
+         * 与具体是哪条提醒无关，所以写在显示层，不由 reminder.c 下发。
+         * 与 2026-10-29 定下的口径一致（主行动必须是"长按按钮"，
+         * 不能写"说一句"—— 待机态不上传音频，说话不会有反应）。 */
+        reminder_button_ = lv_obj_create(reminder_overlay_);
+        lv_obj_set_size(reminder_button_, LV_HOR_RES - LV_HOR_RES * 84 / 320,
+                        LV_VER_RES * 28 / 240);
+        lv_obj_align(reminder_button_, LV_ALIGN_BOTTOM_MID, 0, -LV_VER_RES * 16 / 240);
+        lv_obj_set_style_radius(reminder_button_, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(reminder_button_, lv_color_hex(kColorAccent), 0);
+        lv_obj_set_style_bg_opa(reminder_button_, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(reminder_button_, 0, 0);
+        lv_obj_set_style_pad_all(reminder_button_, 0, 0);
+        lv_obj_clear_flag(reminder_button_, LV_OBJ_FLAG_SCROLLABLE);
+
+        reminder_button_label_ = lv_label_create(reminder_button_);
+        lv_label_set_text(reminder_button_label_, "长按机身顶部大按键确认");
+        lv_obj_set_width(reminder_button_label_, lv_pct(100));
+        lv_label_set_long_mode(reminder_button_label_, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_align(reminder_button_label_, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(reminder_button_label_, lv_color_white(), 0);
+        if (text_font != nullptr) {
+            lv_obj_set_style_text_font(reminder_button_label_, text_font, 0);
+        }
+        lv_obj_center(reminder_button_label_);
+
+        /* ---- 右侧头像圆：与对话态同一位置、同一尺寸 ---- */
+        reminder_avatar_ = lv_obj_create(reminder_overlay_);
+        lv_obj_set_size(reminder_avatar_, AvatarSize(), AvatarSize());
+        lv_obj_set_pos(reminder_avatar_, LV_HOR_RES - AvatarRight() - AvatarSize(),
+                       AvatarTop() - bar_h);
+        lv_obj_set_style_radius(reminder_avatar_, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_clip_corner(reminder_avatar_, true, 0);
+        lv_obj_set_style_bg_color(reminder_avatar_, lv_color_hex(kColorAvatar), 0);
+        lv_obj_set_style_bg_opa(reminder_avatar_, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(reminder_avatar_, 0, 0);
+        lv_obj_set_style_pad_all(reminder_avatar_, 0, 0);
+        lv_obj_clear_flag(reminder_avatar_, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* avatar_img = lv_image_create(reminder_avatar_);
+        lv_obj_set_size(avatar_img, lv_pct(100), lv_pct(100));
+        lv_image_set_inner_align(avatar_img, LV_IMAGE_ALIGN_CONTAIN);
+        /* 头像内容跟随当前表情（提醒态是 SetEmotion("shocked") 设的），
+         * 每次 ShowReminder 都会重新同步一次 src —— 见函数末尾。 */
+        lv_image_set_src(avatar_img, nullptr);
     }
 
-    lv_label_set_text(reminder_label_, (text != nullptr) ? text : "");
+    /* ---- 拆行 ---- */
+    char title_buf[96] = {0};
+    char items_buf[256] = {0};
+    char hint_buf[96] = {0};
+    const char* p = (text != nullptr) ? text : "";
+    int line_no = 0;
+    while (*p != '\0') {
+        const char* nl = strchr(p, '\n');
+        size_t len = (nl != nullptr) ? (size_t)(nl - p) : strlen(p);
+        char line[96];
+        if (len >= sizeof(line)) {
+            len = sizeof(line) - 1;
+        }
+        memcpy(line, p, len);
+        line[len] = '\0';
+        /* 去掉行尾的 \r / 空格（文案来自固件，但仍可能带 Windows 换行） */
+        while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == ' ')) {
+            line[--len] = '\0';
+        }
+        if (len > 0) {
+            if (line_no == 0) {
+                snprintf(title_buf, sizeof(title_buf), "%s", line);
+            } else if (strncmp(line, "请", strlen("请")) == 0) {
+                /* ⚠️ 这里必须用 strncmp 而不是 `line[0] == '请'`：
+                 * 汉字在 UTF-8 里占 3 字节，`line[0]` 只是首字节 0xE8，
+                 * 而 '请' 是多字节字符常量（值实现定义）。写成后者永远不会
+                 * 成立 —— 表现是"橙色提示语跑到明细行里去了"，而明细行
+                 * 用的是深色，屏上看起来就是"提示语颜色不对"，
+                 * 一眼看不出是判断写错。 */
+                snprintf(hint_buf, sizeof(hint_buf), "%s", line);
+            } else if (items_buf[0] == '\0') {
+                snprintf(items_buf, sizeof(items_buf), "%s", line);
+            } else if (strlen(items_buf) + len + 2 <= sizeof(items_buf)) {
+                strncat(items_buf, "\n", sizeof(items_buf) - strlen(items_buf) - 1);
+                strncat(items_buf, line, sizeof(items_buf) - strlen(items_buf) - 1);
+            }
+            line_no++;
+        }
+        if (nl == nullptr) {
+            break;
+        }
+        p = nl + 1;
+    }
+
+    lv_label_set_text(reminder_title_, title_buf);
+    lv_label_set_text(reminder_items_, items_buf);
+    lv_label_set_text(reminder_hint_, hint_buf);
+    if (items_buf[0] == '\0') {
+        lv_obj_add_flag(reminder_items_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_remove_flag(reminder_items_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (hint_buf[0] == '\0') {
+        lv_obj_add_flag(reminder_hint_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_remove_flag(reminder_hint_, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    /* 头像跟着当前表情走：emoji_image_ 的 src 就是"小安现在的脸"
+     * （提醒态由 elder_bridge 设成 shocked）。直接拷 src 而不是再查一次
+     * 表情集合 —— 查一次要判空、要处理主题换过的情况，而这里只要"和
+     * 头像圆上那张一样"就够了。
+     *
+     * 兜底：emoji_image_ 还没有 src（比如开机后第一条提醒来得比 SetEmotion
+     * 早）时按名字取 shocked。不留这一步的话，卡片右侧会是一个**空白的蓝圆**，
+     * 老人看到的是"小安的脸没了"，比没有头像更吓人。 */
+    if (reminder_avatar_ != nullptr) {
+        lv_obj_t* avatar_img = lv_obj_get_child(reminder_avatar_, 0);
+        if (avatar_img != nullptr) {
+            const void* src = (emoji_image_ != nullptr)
+                                  ? lv_image_get_src(emoji_image_)
+                                  : nullptr;
+            if (src == nullptr) {
+                auto* th = static_cast<LvglTheme*>(current_theme_);
+                /* emoji_collection() 返回 shared_ptr（按值），不能写 auto* —— 
+                 * 那是「从三元表达式推导指针」，会报 unable to deduce。 */
+                auto col = (th != nullptr) ? th->emoji_collection() : nullptr;
+                const LvglImage* fb = (col != nullptr)
+                                          ? col->GetEmojiImage("shocked")
+                                          : nullptr;
+                if (fb != nullptr) {
+                    src = fb->image_dsc();
+                }
+            }
+            if (src != nullptr) {
+                lv_image_set_src(avatar_img, src);
+            }
+        }
+    }
+
     lv_obj_remove_flag(reminder_overlay_, LV_OBJ_FLAG_HIDDEN);
     /* 每次都要提到最前：期间可能新建了别的对象（通知、预览图），
      * 后建的对象会盖在 overlay 上面，表现是"字被吃掉一半"。 */
     lv_obj_move_foreground(reminder_overlay_);
-    ESP_LOGI(TAG, "全屏提醒：%s", (text != nullptr) ? text : "");
+    ESP_LOGI(TAG, "全屏提醒卡片：标题=%s 明细=%d 行 提示=%s",
+             title_buf, line_no - 1, hint_buf);
 }
 
 void LcdDisplay::HideReminder() {

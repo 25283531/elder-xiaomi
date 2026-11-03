@@ -122,14 +122,35 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
     // Update time
     if (app.GetDeviceState() == kDeviceStateIdle) {
         if (last_status_update_time_ + std::chrono::seconds(10) < std::chrono::system_clock::now()) {
-            // Set status to clock "HH:MM"
             time_t now = time(NULL);
             struct tm* tm = localtime(&now);
             // Check if the we have already set the time
             if (tm->tm_year >= 2025 - 1900) {
-                char time_str[16];
-                strftime(time_str, sizeof(time_str), "%H:%M", tm);
-                SetStatus(time_str);
+                /* 2026-11-03 设计稿还原：状态栏左侧显示「上午 08:30」。
+                 *
+                 * 为什么不继续用 strftime("%H:%M")：
+                 *   · 设计稿是**12 小时制 + 时段前缀**，24 小时制直接对不上；
+                 *   · strftime 的时段前缀依赖 locale（本工程 locale 是 "C"），
+                 *     写 "%p" 只会得到 "AM"，所以前缀自己拼。
+                 *
+                 * 走 SetStatusClock() 而不是 SetStatus()：后者是「临时状态
+                 * 文案」通道（正在连接 / 已连上 / 配网中），两条信息挤同一个
+                 * label 会互相顶掉，详见 display.h 的说明。 */
+                static const char* kPeriod[] = {"凌晨", "上午", "中午", "下午", "晚上"};
+                int hh = tm->tm_hour;
+                const char* period = (hh < 6)   ? kPeriod[0]
+                                   : (hh < 12)  ? kPeriod[1]
+                                   : (hh < 13)  ? kPeriod[2]
+                                   : (hh < 18)  ? kPeriod[3]
+                                                : kPeriod[4];
+                int h12 = hh % 12;
+                if (h12 == 0) {
+                    h12 = 12;
+                }
+                char time_str[32];
+                snprintf(time_str, sizeof(time_str), "%s %02d:%02d",
+                         period, h12, tm->tm_min);
+                SetStatusClock(time_str);
             } else {
                 ESP_LOGW(TAG, "System time is not set, tm_year: %d", tm->tm_year);
             }

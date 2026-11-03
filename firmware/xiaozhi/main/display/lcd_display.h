@@ -55,6 +55,17 @@ protected:
     std::unique_ptr<LvglGif> gif_controller_ = nullptr;
     lv_obj_t* emoji_box_ = nullptr;
     lv_obj_t* chat_message_label_ = nullptr;
+    /* 左列第二行：用户刚说的话（设计稿里是蓝色 #4982FC 那一行）。
+     *
+     * 为什么需要第二个 label：设计稿的对话态是「上面一行用户问话（蓝）+
+     * 下面一段小安回答（深色）」。而 SetChatMessage(role, content) 每来一条
+     * 就把 label 整段覆盖，只留一个 label 的话，回答一出现用户的话就没了。
+     * 两块 label 分工：user → chat_user_label_，assistant/system →
+     * chat_message_label_，互不覆盖。 */
+    lv_obj_t* chat_user_label_ = nullptr;
+    /* 状态栏右上角的日期「10月29日 周三」。时钟走 SetStatusClock()，
+     * 日期跟它一起刷（同一个入口，避免两处各算一遍时间）。 */
+    lv_obj_t* date_label_ = nullptr;
     esp_timer_handle_t preview_timer_ = nullptr;
     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
     bool hide_subtitle_ = false;  // Control whether to hide chat messages/subtitles
@@ -129,6 +140,20 @@ public:
     virtual void SetChatMessage(const char* role, const char* content) override; 
     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image) override;
 
+    /* 状态栏时钟入口（2026-11-03 设计稿还原）。
+     * 基类 Display 的默认实现是「当普通状态文案处理」，这里覆盖成
+     * 「写左上的时钟 label + 顺手刷新右上角日期」。 */
+    virtual void SetStatusClock(const char* text) override;
+
+    /* 普通状态文案（正在连接 / 已连上 / 配网中……）。
+     *
+     * 为什么要覆盖：设计稿把状态栏切成了「左时钟 34% + 右图标日期」两段，
+     * 时钟只占 34%（108px）。而状态文案动辄十几个字，塞进 108px 会被
+     * LONG_DOT 截成「正在连…」—— 老人看到半句话，比什么都不显示更慌。
+     * 所以走这条通道时临时把日期藏起来、把左段放宽到 78%，时钟恢复时
+     * （SetStatusClock）再收回去。 */
+    virtual void SetStatus(const char* status) override;
+
     // Add theme switching function
     virtual void SetTheme(Theme* theme) override;
     
@@ -149,8 +174,29 @@ public:
      */
     void ShowReminder(const char* text);
     void HideReminder();
-    lv_obj_t* reminder_overlay_ = nullptr;   /* 懒创建，全屏不透明 */
-    lv_obj_t* reminder_label_ = nullptr;
+    lv_obj_t* reminder_overlay_ = nullptr;   /* 懒创建，不透明，只占状态栏以下 */
+
+    /* ---- 2026-11-03：按设计稿改造成结构化卡片 ----
+     *
+     * 设计稿（deliverables/gstack/design/mock-1-reminder.png）是：
+     *   左列  药丸图标 + 标题「该吃药了」
+     *         药品逐条（药名在左、剂量在右）
+     *         橙色提示「请及时服用」
+     *         橙色圆角按钮「长按机身顶部大按键确认」
+     *   右侧  90x90 头像圆
+     *
+     * 文案仍然只有一个来源：ShowReminder(text) 收到的字符串。约定是
+     * **一行一件事**（见 reminder.c 的 elder_reminder_screen_text）：
+     *   第 0 行 标题
+     *   第 1..n 行 明细（每行一条；超过 4 行截断，屏上放不下）
+     *   最后一行若以「请」开头 ⇒ 当橙色提示语，不当明细
+     * 这个约定写在两边的注释里 —— 改一边必须改另一边。 */
+    lv_obj_t* reminder_title_ = nullptr;     /* 标题行（带红色药丸图标） */
+    lv_obj_t* reminder_items_ = nullptr;     /* 明细列表（多行） */
+    lv_obj_t* reminder_hint_ = nullptr;      /* 橙色提示，可为空 */
+    lv_obj_t* reminder_button_ = nullptr;    /* 橙色圆角按钮（UI 常量文案） */
+    lv_obj_t* reminder_button_label_ = nullptr; /* 按钮上的白字，SetTheme 要补字体 */
+    lv_obj_t* reminder_avatar_ = nullptr;    /* 右侧头像圆 */
     // <<< END elder-reminder-fullscreen <<<
 
     // >>> BEGIN elder-idle-marquee (2026-11-03：待机指示灯 = 跑马灯) >>>

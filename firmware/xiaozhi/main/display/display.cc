@@ -24,6 +24,12 @@ void Display::SetStatus(const char* status) {
     ESP_LOGW(TAG, "SetStatus: %s", status);
 }
 
+/* 默认退化：没有独立状态栏的显示实现（OLED 等）拿时钟当普通状态文案处理，
+ * 与 2026-11-03 之前的行为逐字一致。 */
+void Display::SetStatusClock(const char* text) {
+    SetStatus(text);
+}
+
 void Display::ShowNotification(const std::string &notification, int duration_ms) {
     ShowNotification(notification.c_str(), duration_ms);
 }
