@@ -197,6 +197,49 @@ def main() -> int:
         else:
             check("对刚上报的 id 能回传回执（语音确认 method=1）", False, "没有可用的 reminder_id")
 
+        # ---------------------------------------------- 7. 全置信合并（VOICE+BUTTON=5）
+        #
+        # 用户 2026-11-03 定义：「先按了服药提醒按键进行确认，再通过追问的方式
+        # 确认服用的哪一种药，那就属于语音+按键的全置信」。机制在
+        # routers/device_api.report_event：**库里是 VOICE** 且**这次回执是
+        # BUTTON** 且 state=CONFIRMED ⇒ 落 VOICE_AND_BUTTON(5)。
+        #
+        # 这条规则此前**没有任何测试覆盖**（全仓 grep VOICE_AND_BUTTON 在
+        # tools/ 下零命中）—— 而它一旦坏掉是完全静默的：家属端只是永远显示
+        # 「按键确认」，依从率统计也照常算已确认，没人会发现"全置信"没了。
+        #
+        # 这里从**回执侧**直接验证，不经过语音链路（那需要真设备）。
+        rid = acks[0]["reminder_id"] if acks else 0
+        if rid:
+            due1 = "2026-10-17T09:00:00+08:00"
+            req("POST", "/api/device/events",
+                {"reminder_id": rid, "due_at": due1, "state": 2,
+                 "confirm_method": 1}, dev_token)
+            req("POST", "/api/device/events",
+                {"reminder_id": rid, "due_at": due1, "state": 2,
+                 "confirm_method": 2}, dev_token)
+            code, evs = req("GET", f"/api/devices/{dev_pk}/events?limit=200", None, tok)
+            hit = [e for e in (evs or []) if "T09:00" in str(e.get("due_at", ""))]
+            check("先 VOICE 后 BUTTON ⇒ 合并成全置信(5)",
+                  bool(hit) and hit[0].get("confirm_method") == 5,
+                  json.dumps(hit[:1], ensure_ascii=False))
+
+            # 反向用例（更重要）：库里是 NONE（纯按键，没走过任何对话）时
+            # 报 BUTTON **不许**变成 5 —— 那会把"老人自己按的"记成
+            # "语音也确认过"，是替老人编造依从记录。
+            due2 = "2026-10-17T10:00:00+08:00"
+            req("POST", "/api/device/events",
+                {"reminder_id": rid, "due_at": due2, "state": 2,
+                 "confirm_method": 2}, dev_token)
+            code, evs = req("GET", f"/api/devices/{dev_pk}/events?limit=200", None, tok)
+            hit2 = [e for e in (evs or []) if "T10:00" in str(e.get("due_at", ""))]
+            check("库里是 NONE 时纯按键回执仍是按键(2)，不冒充全置信",
+                  bool(hit2) and hit2[0].get("confirm_method") == 2,
+                  json.dumps(hit2[:1], ensure_ascii=False))
+        else:
+            check("先 VOICE 后 BUTTON ⇒ 合并成全置信(5)", False, "没有可用的 reminder_id")
+            check("库里是 NONE 时纯按键回执仍是按键(2)，不冒充全置信", False, "同上")
+
     finally:
         proc.terminate()
         try:

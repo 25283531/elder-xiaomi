@@ -1106,17 +1106,97 @@ def execute_tool(db: Any, device_pk: int, name: str,
         return {"ok": False, "message": "操作没成功，请老人稍后再试"}
 
 
-def _confirm_device_pending(device_call: Any) -> dict[str, Any]:
-    """改造前的行为：不带 ``server_id``，让设备确认**它自己挂着的那条**。
+#: 「正在响」的实例往回看多久。超过这个窗口还挂在 PENDING/FIRED 的，是
+#: 历史残留（设备离线、回执丢了），不该参与"到底在确认哪一条"的判定。
+_CONFIRM_LOOKBACK_HOURS = 4
 
-    现在只剩一个用途：没有待确认的**服药**提醒时，把喝水 / 日程 / 运动这类
-    提醒交还给设备处理 —— 它们没有"哪一味药"的问题，按药名逐味确认那一套
-    套不上去。固件 a85f21f 起 ``server_id`` 缺省（=0）就是"确认当前正在响铃
-    的那条"，与本函数逐字等价，所以这段老代码继续有效。
 
-    失败语义（LLM 拿到的话术不同）：
-      - 设备明确答 false → 没有待确认的提醒，正常回应，**不要说失败**；
-      - 超时 / 通道不可用 → 让老人改按设备上的按键。
+def _sole_confirmable_event(db: Any, device_pk: int) -> Any:
+    """该设备**恰好一条**「已到点、未确认」的实例；0 条或多条都返回 None。
+
+    这条路径拿不到 ``server_id``，只能按"此刻正在响的那条"反推。而反推的
+    代价是**猜错就把 A 的确认记到 B 头上**（见 ``_confirm_reminder`` 里
+    "设备时区不一致"那段），所以判据必须是"恰好一条"：两条同时挂着时宁可
+    退回改造前的行为（只记语音），也不替老人编造一次确认。
+
+    为什么不分 rtype：服药路径已经在 ``pending_medicine_events`` 里判过了，
+    走到这里说明**服药候选是空的**，此刻还挂着的多半是喝水/运动/日程。
+    日程类已经"播报即完成"（``device_api.report_event`` 落 AUTO），所以
+    真正落到这里的通常只剩喝水/运动 —— 它们同样适用"按键 + 语音"的定义。
+    """
+    now = local_now()
+    floor = now - timedelta(hours=_CONFIRM_LOOKBACK_HOURS)
+    ceil = now + timedelta(minutes=_CONFIRM_WINDOW_BEFORE_MIN)
+    rows = db.execute(
+        select(models.ReminderEvent)
+        .where(
+            models.ReminderEvent.device_id == device_pk,
+            models.ReminderEvent.state.in_([int(models.EventState.PENDING),
+                                            int(models.EventState.FIRED)]),
+        )
+        .order_by(models.ReminderEvent.due_at.desc())
+    ).scalars().all()
+
+    alive = []
+    for ev in rows:
+        try:
+            due = event_due_utc(ev)
+        except Exception:  # noqa: BLE001  脏 tz 不该让整条确认链断掉
+            continue
+        if floor <= due <= ceil:
+            alive.append(ev)
+            if len(alive) > 1:
+                return None      # 多于一条就不猜，直接放弃
+    return alive[0] if alive else None
+
+
+def _arm_voice(db: Any, ev: Any) -> int | None:
+    """把这条实例的确认方式**先**写成 VOICE，返回原值（供回滚）。
+
+    这是「旧路径也能算全置信」的**唯一**前提，与服药路径同一个机制：
+    ``device_api.report_event`` 只在「库里的 VOICE + 回执的 BUTTON」同时成立时
+    才合并成 ``VOICE_AND_BUTTON(5)``。旧路径原来不写库，所以即使老人按了键
+    （设备回执 BUTTON），库里还是 NONE ⇒ 永远合并不成，家属端只看到"按键确认"。
+
+    必须**在 device_call 之前**写：设备的回执是异步的，可能在工具返回之前
+    就到了；写到后面等于永远读不到 VOICE。
+
+    已经是更高置信的方式（BUTTON / VOICE_AND_BUTTON / APP）就不覆盖 ——
+    按键确认本身就是"人在场"的证据，不该被一次语音降级。
+    """
+    prev = int(getattr(ev, "confirm_method", 0) or 0)
+    if prev in (int(models.ConfirmMethod.BUTTON),
+                int(models.ConfirmMethod.VOICE_AND_BUTTON),
+                int(models.ConfirmMethod.APP)):
+        return None
+    ev.confirm_method = int(models.ConfirmMethod.VOICE)
+    db.commit()
+    return prev
+
+
+def _disarm_voice(db: Any, ev: Any, prev: int | None) -> None:
+    """设备答 false / 出错时把 ``_arm_voice`` 的预写恢复回去。
+
+    为什么必须回滚：预写发生在"还不知道设备认不认"的时候。若设备说"没有
+    待确认的提醒"，这次对话其实什么也没确认，留着 VOICE 会让家属端看到
+    「语音确认」而老人根本没确认过 —— 这是替老人编造依从记录。
+    """
+    if ev is None or prev is None:
+        return
+    try:
+        ev.confirm_method = int(prev)
+        db.commit()
+    except Exception as exc:  # noqa: BLE001  回滚失败不该盖掉真正的错误
+        db.rollback()
+        log.warning("confirm_reminder：恢复确认方式失败 %s: %s",
+                    type(exc).__name__, exc)
+
+
+def _device_pending_call(device_call: Any) -> dict[str, Any]:
+    """不带 ``server_id`` 让设备确认**它自己挂着的那条** —— 真正的下发与解析。
+
+    单独一层是为了让 ``_confirm_device_pending`` 能在**下发之前**预写确认方式、
+    在下发之后按结果回滚，而这段"怎么判成功"的逻辑一个字都不用动。
     """
     if device_call is None:
         log.warning("confirm_reminder：没有设备通道（device_call=None）")
@@ -1162,15 +1242,65 @@ def _confirm_device_pending(device_call: Any) -> dict[str, Any]:
                 "message": "现在没有等着确认的提醒，用一句话自然回应老人即可，不要说失败"}
 
     log.info("confirm_reminder：设备已确认（非服药提醒，走旧路径）")
-    # 语音确认只算**半置信**（2026-10-27 用户定义）：设备端进的是
-    # HALF_CONFIRMED，闪灯不停、屏幕不退 —— 必须再按一次按钮才算完成。
+    # ⚠️ 话术必须**带条件**，不能像改造前那样一律让老人"再长按 3 秒"：
+    # 这条路径现在有两种结局 ——
+    #   · 老人按过键（命中按键发起标记）⇒ 设备直落 DONE，屏幕已经收了。
+    #     此时再说"请长按按钮 3 秒钟"，老人会对着黑屏按半天；
+    #   · 老人只是说了句"吃过了" ⇒ 设备落 HALF_CONFIRMED，屏幕还亮着，
+    #     确实需要补一次按键（2026-10-27 用户定义：语音确认只算半置信）。
+    # 服务端拿不到"到底是哪种"，所以把判据交给老人自己的眼睛。
     return {"ok": True, "confirmed": True,
             "message": (
-                "已记下（语音确认只算半置信，还没算完成）。"
-                "请用一句话让老人照着做，只说这一遍、不要解释原因、不要多说别的："
-                "「为了防止识别错误，请长按亮着橙色指示灯的按钮 3 秒钟，"
+                "已记下。请用一句话告诉老人，只说这一遍、不要解释原因、"
+                "不要多说别的："
+                "「记好了。要是屏幕上那条提醒还亮着，就长按按钮 3 秒钟，"
                 "等按钮闪蓝色三次再松手。」"
             )}
+
+
+def _confirm_device_pending(db: Any, device_pk: int,
+                            device_call: Any) -> dict[str, Any]:
+    """改造前的行为：不带 ``server_id``，让设备确认**它自己挂着的那条**。
+
+    现在只剩一个用途：没有待确认的**服药**提醒时，把喝水 / 日程 / 运动这类
+    提醒交还给设备处理 —— 它们没有"哪一味药"的问题，按药名逐味确认那一套
+    套不上去。固件 a85f21f 起 ``server_id`` 缺省（=0）就是"确认当前正在响铃
+    的那条"，与本函数逐字等价，所以这段老代码继续有效。
+
+    **2026-11-03 起也吃「按键发起」标记**（用户明确要求）：老人长按了确认键，
+    但服务端没找到服药候选（规则被停用/已删、时间窗对不上）时会退到这里；
+    固件认标记、回执报 BUTTON，服务端这边则要先**预写 VOICE**，两者凑齐才
+    合得成 ``VOICE_AND_BUTTON(5)``。见 ``_arm_voice`` 的说明。
+
+    失败语义（LLM 拿到的话术不同）：
+      - 设备明确答 false → 没有待确认的提醒，正常回应，**不要说失败**；
+      - 超时 / 通道不可用 → 让老人改按设备上的按键。
+    """
+    ev = None
+    prev: int | None = None
+    if db is not None:
+        try:
+            ev = _sole_confirmable_event(db, device_pk)
+            if ev is not None:
+                prev = _arm_voice(db, ev)
+                if prev is not None:
+                    log.info("confirm_reminder：旧路径预写 VOICE（ev=%s，原值=%s）",
+                             getattr(ev, "id", "?"), prev)
+        except Exception as exc:  # noqa: BLE001  预写失败不该让确认本身失败
+            log.warning("confirm_reminder：预写确认方式失败 %s: %s",
+                        type(exc).__name__, exc)
+            ev, prev = None, None
+
+    out = _device_pending_call(device_call)
+
+    # 只有设备**明确说确认了**才留着那个 VOICE；其余一切结局（答 false、
+    # 超时、报错、看不懂）都说明这次对话没有落地任何确认，必须恢复原值 ——
+    # 否则家属端会看到一条老人根本没做过的"语音确认"。
+    if not out.get("confirmed"):
+        _disarm_voice(db, ev, prev)
+
+    return out
+
 
 
 def _confirm_reminder(db: Any, device_pk: int, device_call: Any,
@@ -1198,7 +1328,7 @@ def _confirm_reminder(db: Any, device_pk: int, device_call: Any,
     # —— 没有库就没有药名清单，任何"匹配"都是瞎编。
     if db is None:
         log.warning("confirm_reminder：没有 db 会话，退回设备侧整条确认")
-        return _confirm_device_pending(device_call)
+        return _confirm_device_pending(db, device_pk, device_call)
 
     try:
         cands = pending_medicine_events(db, device_pk)
@@ -1212,7 +1342,7 @@ def _confirm_reminder(db: Any, device_pk: int, device_call: Any,
         # 它们没有"哪一味药"的问题）。见 ``_confirm_device_pending`` 的注释。
         log.info("confirm_reminder：没有待确认的服药提醒（device_pk=%s），走设备旧路径",
                  device_pk)
-        return _confirm_device_pending(device_call)
+        return _confirm_device_pending(db, device_pk, device_call)
 
     # 药名清单算一次就够：下面既要拿它做匹配，又要拿它判「是不是全确认了」。
     items = [(ev, rule, medicine_names(rule)) for ev, rule in cands]
