@@ -34,9 +34,8 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
         models = models_list;
     }
 
-    char* ns_model_name = esp_srmodel_filter(models, ESP_NSNET_PREFIX, NULL);
     char* vad_model_name = esp_srmodel_filter(models, ESP_VADN_PREFIX, NULL);
-    
+
     afe_config_t* afe_config = afe_config_init(input_format.c_str(), NULL, AFE_TYPE_VC, AFE_MODE_HIGH_PERF);
     afe_config->aec_mode = AEC_MODE_VOIP_HIGH_PERF;
     afe_config->vad_mode = VAD_MODE_0;
@@ -45,56 +44,86 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
         afe_config->vad_model_name = vad_model_name;
     }
 
-    if (ns_model_name != nullptr) {
-        afe_config->ns_init = true;
-        afe_config->ns_model_name = ns_model_name;
-        afe_config->afe_ns_mode = AFE_NS_MODE_NET;
-    } else {
-        /* ⚠️⚠️ 2026-11-04 事故：这里一度改成"没有模型就走 WebRTC 降噪"
-         * （ns_init=true + ns_model_name="WEBRTC" + AFE_NS_MODE_WEBRTC），
-         * 结果**唤醒后设备必重启**（用户连试三次，三次都重启）。
-         *
-         * 现场证据：本文件创建的 AFE 是**第二条**管线（第一条是 WakeNet 自己
-         * 建的 `|AEC(SR_HIGH_PERF)| -> ... -> |WakeNet(...)|`）。回滚版开机
-         * 14.5s 会打出第二条 `|AEC(VOIP_HIGH_PERF)| -> [output]`；
-         * 而事故版抓了 20 秒，**第二条始终没出现** —— 说明 create_from_config
-         * 这一步就没回来。
-         *
-         * 原因：本机分区表没有 `model` 分区（`esp_srmodel_init("model")` 拿到
-         * 的是空列表），而 WebRTC NS 这条要求 ns_model_name 能在模型列表里
-         * 解析出来。列表是空的时候给它一个伪模型名 "WEBRTC"，等于让它在空表里
-         * 找东西 —— 空指针解引用。
-         *
-         * ⇒ **没有 model 分区就老老实实关掉降噪**。真要在本机开降噪，先得有
-         * 一个 model 分区（要动分区表，红线 C14），不是改两行配置能解决的。
-         * 别再把 ns_init 打开。 */
-        afe_config->ns_init = false;
-    }
-
-    /* 2026-11-04：AGC 从「关」改成「开」。这是本轮唯一有实测证据支撑的改动。
+    /* ══════════════════════════════════════════════════════════════════════
+     * 降噪：只用算法（WebRTC NS）。NSNet2 / 模型相关的代码已全部删除。
+     * ══════════════════════════════════════════════════════════════════════
+     * 2026-11-04 定调：把 NSNet2 相关代码删掉，只用算法降噪。
      *
+     * 为什么是"删"而不是"留着当备选"：NSNet2 在本机**永远不可能生效**。
+     * 分区表 partitions/v2/16m.csv 只有 nvs / otadata / phy_init / ota_0 /
+     * ota_1 / assets，**没有 model 分区** ⇒ esp_srmodel_init("model") 拿到
+     * 空列表 ⇒ esp_srmodel_filter(models, ESP_NSNET_PREFIX, NULL) 恒为
+     * nullptr。10-31 到 11-04 这两个星期里"降噪"一帧都没做、而构建与 CI
+     * 全绿，就是这条走不到的死分支造成的。留着它只会让人以为"支持 NSNet2"。
+     *
+     * WebRTC NS 是纯算法（webrtc_create / webrtc_process），不读任何模型
+     * 数据，与 model 分区无关。三件事必须同时成立：
+     *   1) ns_init       = true
+     *   2) afe_ns_mode   = AFE_NS_MODE_WEBRTC
+     *   3) ns_model_name = nullptr        ← **不是** "WEBRTC"
+     *
+     * ⚠️⚠️ 第 3 条是 2026-11-04 那次「唤醒后设备必重启」的根因（用户连试
+     * 三次三次重启，Guru Meditation: LoadProhibited，EXCVADDR=0）。
+     * esp_afe_config.h 里那句
+     *     AFE_NS_MODE_WEBRTC = 0, // please use model name of NS, SSP: "WEBRTC"
+     * 误导了我，我照着写 ns_model_name = "WEBRTC" —— 而 AFE 只要看到
+     * ns_model_name 非空，就会走 libnsnet.a 的 esp_nsnet_handle_from_name()
+     * 按"模型名"去加载，在空模型列表里解析 "WEBRTC" ⇒ 空指针解引用。
+     *
+     * 崩溃点是**用 map 解析 backtrace 得到的，不是猜的**（2026-11-04 补测）：
+     *   0x4205d86a  esp_afe_handle_from_config +0x1f92
+     *   0x4205dc65  esp_afe_handle_from_config +0x238d
+     *   0x42025f46  AfeAudioProcessor::Initialize +0xe6
+     *   0x4200a59e  AudioService::EnableVoiceProcessing +0x22
+     *   0x420188ee  Application::SetDeviceState +0x192
+     *   ...         Application::OnWakeWordDetected ← MainEventLoop
+     * 也就是说：唤醒 → 建 AFE → 死在 esp_afe_handle_from_config 里面，
+     * 所以开机日志里**第二条** AFE 管线从来没出现过。
+     *
+     * WebRTC 是算法、不挂模型名，所以这里必须是 nullptr。
+     */
+    afe_config->ns_init = true;
+    afe_config->afe_ns_mode = AFE_NS_MODE_WEBRTC;
+    afe_config->ns_model_name = nullptr;
+
+    /* ══════════════════════════════════════════════════════════════════════
+     * AGC：上行（ASR 听到的那一路）自动增益
+     * ══════════════════════════════════════════════════════════════════════
      * 证据（生产留证 wav `asr_empty_20261104-004208_bb05dae5.wav`，6.6 秒）：
      *   峰值 0.036（-29 dBFS）、rms 0.0026；而正常说话峰值该在 -6~-12 dBFS。
-     *   同一时刻底噪只有 0.0003 ⇒ **SNR ≈ 37 dB，噪声根本不是问题，电平才是**。
+     *   同一时刻底噪只有 0.0003 ⇒ **SNR ≈ 37 dB：噪声根本不是问题，电平才是**。
      * 表现：老人说「你刚才没有说内容吗？」，ASR 只返回「当当。你刚才没有说。」
      *   —— 开头「当当」是上一句 TTS 的 AEC 残留，尾巴「内容吗」整段丢失。
      *   轻声的句尾字在被压低 25 dB 的信号里，识别器直接当成了噪声。
      *
-     * 为什么是 AGC 而不是单纯乘一个固定增益：固定增益会把近处说话推到削波，
-     * 而 AGC 对远场（轻声）多给、对近场（大声）少给 —— 正是"远距离也能识别"
-     * 需要的特性。目标电平取 -6 dBFS（不是 WebRTC 默认的 -3）留 6 dB 余量，
-     * 避免老人凑近说话时削顶（削顶对 ASR 的伤害比小声更大）。
+     * 为什么是 AGC 而不是乘一个固定增益：固定增益会把近处说话推到削波，
+     * 而 AGC 对远场（轻声）多给、对近场（大声）少给 —— 正是"远距离也能
+     * 识别"需要的特性。
      *
-     * ⚠️ AGC 作用在 **AFE 输出（上行，ASR 听到的那一路）**，与播放通路
-     * 完全无关 —— 不违反"声音已正常、不许再修出破音/卡顿"的硬约束。
+     * 四个参数是互相配合的，改一个要看另外三个：
+     *   agc_mode = WEBRTC         本管线里没有 WakeNet，WAKENET 模式不适用
+     *                             （esp-sr 会打印 "wakenet is activated,
+     *                             disable WebRTC AGC." 并直接关掉 AGC）
+     *   compression_gain_db = 15  最大可补 15 dB。默认 9 只够补一半：实测差距
+     *                             约 20~25 dB，只补 9 dB 补完仍然偏轻
+     *   target_level_dbfs = 6     目标 -6 dBFS。**不用** WebRTC 默认的 -3：
+     *                             老人凑近说话时 -3 会削顶，而削顶对 ASR 的
+     *                             伤害比小声更大
+     *   afe_linear_gain = 1.0f    固定线性增益保持 1.0。AGC 已经负责动态范围，
+     *                             再叠一个固定增益只会把近场推爆
      *
-     * ⚠️ 验证方法：开机日志里**第二条** AFE 管线（本文件创建的那条，特征是有
-     * `AEC(VOIP_HIGH_PERF)`）必须出现 `|AGC(WebRTC)|`。只 grep 第一条
-     * （WakeNet 那条）会得出"没生效"的错误结论 —— 踩过。 */
+     * ⚠️ AGC 作用在 **AFE 输出（上行）**，与播放通路完全无关 —— 不违反
+     * "声音已正常、不许再修出破音/卡顿"的硬约束。
+     *
+     * ⚠️ 验证方法：开机日志里**第二条** AFE 管线（本文件创建的那条，特征是
+     * 有 `AEC(VOIP_HIGH_PERF)`）必须出现 `|NS(WebRTC)|` 和 `|AGC(WebRTC)|`。
+     * 只 grep 第一条（WakeNet 那条）会得出"没生效"的错误结论 —— 踩过。
+     */
     afe_config->agc_init = true;
     afe_config->agc_mode = AFE_AGC_MODE_WEBRTC;
-    afe_config->agc_compression_gain_db = 9;
+    afe_config->agc_compression_gain_db = 15;
     afe_config->agc_target_level_dbfs = 6;
+    afe_config->afe_linear_gain = 1.0f;
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
 
 #ifdef CONFIG_USE_DEVICE_AEC

@@ -194,7 +194,7 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/16m.csv"
 # 离线命令词（elder_cmd/elder_mn/custom_wake_word）已删除，NVS 离线提醒
 # 引擎（reminder.c 到点播报）保留。
 #
-# --- 降噪：本机开不了，保持关闭（2026-11-04 两次尝试都失败）---
+# --- 降噪：只用算法（WebRTC NS），不加载任何模型（2026-11-04）---
 #
 # 事实链（每一环都有真机证据，别再重走）：
 #
@@ -202,22 +202,25 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/16m.csv"
 #    不成立：本机分区表（partitions/v2/16m.csv）只有
 #    nvs/otadata/phy_init/ota_0/ota_1/assets，**没有 `model` 分区** ⇒
 #    `esp_srmodel_init("model")` 拿到空列表 ⇒ `esp_srmodel_filter` 恒为
-#    nullptr ⇒ `ns_init=false` 是唯一结局。这两个星期**一帧降噪都没做**。
+#    nullptr ⇒ 那条分支永远走不到。这两个星期**一帧降噪都没做**。
 #
-# 2. 11-04 改选 SR_NSN_WEBRTC，并在代码里"没有模型就走 WebRTC 伪模型名"。
-#    结果**唤醒后设备必重启**（用户连试三次三次重启）。证据：本文件创建的
-#    是**第二条** AFE 管线，回滚版开机 14.5s 会打出
-#    `|AEC(VOIP_HIGH_PERF)| -> [output]`，事故版抓了 20 秒**第二条始终没出现**
-#    ⇒ create_from_config 没回来。空模型列表 + 伪模型名 = 空指针。
+# 2. 11-04 上午改选 SR_NSN_WEBRTC，并在代码里把 ns_model_name 写成伪模型名
+#    "WEBRTC"（照着 esp_afe_config.h 里那句 `please use model name of NS,
+#    SSP: "WEBRTC"` 抄的）⇒ **唤醒后设备必重启**（用户连试三次三次重启，
+#    Guru Meditation: LoadProhibited）。根因不是"没有 model 分区就不能开
+#    降噪"，而是 **ns_model_name 必须为 nullptr**：AFE 看到它非空就去
+#    libnsnet.a 的 esp_nsnet_handle_from_name() 按"模型名"加载，空模型列表里
+#    解析 "WEBRTC" ⇒ 空指针解引用 ⇒ create_from_config 不返回。
 #
-# ⇒ 本机要开降噪，前提是**先有 model 分区**（要动分区表，红线 C14），
-#   不是改两行配置能解决的。所以这里保持 NSNET2（等价于关闭：加载不到），
-#   让 `ns_init` 走 false，与"能正常跑"的那一版完全一致。
+# ⇒ 现在代码里是 ns_init=true + AFE_NS_MODE_WEBRTC + ns_model_name=nullptr，
+#   NSNet2 相关代码（esp_srmodel_filter / AFE_NS_MODE_NET）已全部删除。
+#   这里跟着选 SR_NSN_WEBRTC，与代码语义一致（代码已不再 #ifdef 这个符号，
+#   但它代表"降噪走哪条算法"，写错会让下一个读代码的人误解）。
 #
-# ⚠️ 判据只能看开机日志里**第二条** AFE 管线（特征是有 `AEC(VOIP_HIGH_PERF)`）。
-#    第一条是 WakeNet 自己建的，与这里的配置无关 —— 只看第一条会得出
-#    "降噪没生效"或"AGC 没生效"的错误结论（踩过）。
-CONFIG_SR_NSN_NSNET2=y
+# ⚠️ 判据只能看开机日志里**第二条** AFE 管线（特征是有 `AEC(VOIP_HIGH_PERF)`），
+#    它必须打出 `|NS(WebRTC)|` 和 `|AGC(WebRTC)|`。第一条是 WakeNet 自己建的，
+#    与这里的配置无关 —— 只看第一条会得出"降噪/AGC 没生效"的错误结论（踩过）。
+CONFIG_SR_NSN_WEBRTC=y
 # 业务后端地址（2026-10-18 起 IP 直连：域名未备案被厂商按 SNI 阻断，
 # 连 IP 不带 SNI 可绕过；服务端配 IP 证书后可开证书校验，见 Kconfig 帮助）
 CONFIG_ELDER_SERVER_URL="https://152.136.230.132"
