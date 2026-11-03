@@ -1512,6 +1512,18 @@ esp_err_t elder_reminder_auto_done(uint8_t id)
     g.pending_since_us[id] = 0;
     g.half_since_us[id] = 0;
     g.dirty = true;
+
+    /* #1 按键指示灯必须跟着熄掉（2026-11-03 用户实报"长按 3 秒仍闪错误灯"
+     * 的同一条链上的第二个坑）。
+     *
+     * 本函数**故意不调 set_state()**（那会重入 OnReminder(DONE) 把刚推上去的
+     * 屏幕立刻收掉、还会多报一条 CONFIRMED，见头文件），而 set_state() 正是
+     * 唯一会调 elder_rgb_button_pending() 的地方。于是日程类 auto_done 之后：
+     *   · btn_pending 还停在 true ⇒ #1 一直橙色呼吸，催老人去按一个
+     *     first_ringing() 永远选不中的键；
+     *   · 老人真按下去 ⇒ 渐变走满 ⇒ 松开时"未出结果" ⇒ 深粉红闪 5 次（报错）。
+     * 这里补上同一次状态同步。判据用 has_pending_confirm()，不另算一套。 */
+    elder_rgb_button_pending(has_pending_confirm());
     return ESP_OK;
 }
 

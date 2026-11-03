@@ -295,6 +295,20 @@ void elder_rgb_button_release(void);
 /** 确认完成 ⇒ 深蓝绿闪 3 次 */
 void elder_rgb_button_confirmed(void);
 
+/** 按压**已受理、但还没有结果** ⇒ 清掉渐变、回到橙色呼吸，不闪任何结果色。
+ *
+ *  为什么必须有这个第三态（2026-11-03 用户实报「长按服药键一直是错误状态，
+ *  闪烁错误事件灯，但我的操作是正确的长按 3 秒以上」）：
+ *    多药/单味药提醒的长按不再直接确认，而是先问一句「您吃的是哪种药？」
+ *    再进对话（见 elder_bridge.cc 的 ELDER_KEY_EV_LONG_HOLD）。那一刻老人
+ *    确实按够了 3 秒，但**一个字都还没确认**。如果什么都不调，
+ *    elder_rgb_button_release() 会走"渐变未出结果"分支 ⇒ 深粉红闪 5 次
+ *    （= 你失败了），老人看到的是"我明明按够了，它说我错了"。
+ *    而调 confirmed() 是另一种撒谎：闪成功 = 已经记上了，他会转身走开。
+ *  ⇒ 只能有"受理了、还没成"这个中间态。灯回到橙色呼吸，语义是
+ *    「这件事还在等你」，与屏幕上的追问一致。 */
+void elder_rgb_button_acknowledged(void);
+
 /** 是否存在待确认的提醒 ⇒ #1 橙色呼吸 / 熄灭。
  *  由 reminder.c 在提醒状态集合变化时调用，是"吸引注意"态的唯一真源。 */
 void elder_rgb_button_pending(bool pending);

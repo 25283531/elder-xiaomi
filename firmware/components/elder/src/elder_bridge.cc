@@ -781,6 +781,34 @@ void ConfirmMedicine(int idx, uint8_t method)
     s_arming_id = -1;
 }
 
+/* 老人回应过之后，把"已经没有下文"的全屏提醒收掉。
+ *
+ * 判据只有一个：引擎里真的没有待确认项（`elder_reminder_has_pending_confirm()`，
+ * 与 reminder.c 的 has_pending_confirm() 同一口径）。还有别的在等就**不动屏**
+ * —— 那条才是此刻该看的。这是 D71 那条纪律的又一次落地：屏幕与引擎必须同源，
+ * 不许用屏幕自己记的文案/时长做判断。
+ *
+ * 为什么需要它（2026-11-03 用户实报「我用语音确认喝水完成了，但是界面一直
+ * 停留在提醒页面」）：
+ *   日程类（喝水/运动/待办）在 OnReminder(PENDING) 里"播报即完成" ——
+ *   elder_reminder_auto_done() **刻意不回调** OnReminder(DONE)，所以它从来
+ *   走不到上面 case ELDER_RMD_DONE 那条收屏路径。而屏幕的显示时长是 elder_ui
+ *   自己的 4 小时，于是老人说完「我喝完了」、设备也应了声，屏上那张卡片还能
+ *   再挂 4 小时；按键同样选不中它（first_ringing() = -1）。
+ *   ⇒ 屏幕上挂着一个按不动、也赶不走的操作 —— 正是 2026-10-29 修过的那个形态，
+ *     这次是从"日程类自动完成"这个新口子漏回来的。
+ *
+ * 为什么不在 auto_done 里直接收屏：auto_done 紧跟 show_reminder 之后执行，
+ * 那样卡片**刚推上去就消失**，老人根本来不及看。收屏的时机是"老人回应了"，
+ * 不是"引擎记完了"。 */
+static void HideReminderIfResolved(const char *why)
+{
+    if (!elder_ui_reminder_showing()) return;
+    if (elder_reminder_has_pending_confirm()) return;
+    elder_ui_hide_reminder();
+    ESP_LOGW(TAG, "%s：引擎里已无待确认项 ⇒ 收掉全屏提醒", why);
+}
+
 /* 「先说一句、再进对话」的专用任务（2026-11-03，多药提醒）。
  *
  * 为什么顺序必须是「先说 → 等说完 → 再听」，三条都是 application.cc 的硬约束：
@@ -952,12 +980,22 @@ void OnKey(elder_key_event_t ev, void *ctx)
              *
              * 不发声、不闪屏：没有提醒可确认时，「安静地没反应」比
              * 「莫名其妙开始说话/静音」安全得多。按下的即时反馈由
-             * #1 指示灯给（input.c 调 elder_rgb_button_press/release）。 */
+             * #1 指示灯给（input.c 调 elder_rgb_button_press/release）。
+             *
+             * ⚠️ 2026-11-03：这里的"选不中目标"不再一律当成脱节。日程类提醒
+             * 在播报时就 auto_done 了（喝水/运动/待办不需要确认），屏却还挂着
+             * 4 小时 —— 那不是 bug，是新语义；老人此刻按一下的意图仍然是
+             * "这件事我处理了"，所以**收屏**而不是报错。真脱节（屏上还有服药
+             * 提醒在等）仍会由 HideReminderIfResolved 的第二个判据挡下并留下
+             * 下面那条 ERROR。 */
+            HideReminderIfResolved("短按：当前无待确认项");
             if (elder_ui_reminder_showing()) {
                 ESP_LOGE(TAG, "⚠️ 全屏提醒还挂着，但引擎里没有待确认项 —— "
                               "短按无效。screen 与引擎状态已脱节");
+            } else {
+                ESP_LOGI(TAG, "短按：当前没有待确认的提醒 —— 本按键只做确认，"
+                              "不做对话开关");
             }
-            ESP_LOGI(TAG, "短按：当前没有待确认的提醒 —— 本按键只做确认，不做对话开关");
         }
         break;
     }
@@ -1049,7 +1087,15 @@ void OnKey(elder_key_event_t ev, void *ctx)
              *     这一步什么都没确认，#1 的待确认呼吸灯本来就还亮着；
              *   · 在线时问题本身 1 秒内就会开口，再加一声 POPUP 只会占住
              *     解码队列、把问题推后；离线时 elder_ui_speak 自己会播一声
-             *     POPUP 兜底，这里再播一次就是连响两声。 */
+             *     POPUP 兜底，这里再播一次就是连响两声。
+             *
+             * ⚠️ 但**必须**告诉指示灯"这一轮已经受理"（2026-11-03 用户实报
+             *    「长按服药键一直是错误状态，闪烁错误事件灯，但我的操作是
+             *    正确的长按 3 秒以上」）。不调的话，input.c 松开时会走
+             *    elder_rgb_button_release() 的"渐变未出结果"分支 ⇒ 深粉红闪
+             *    5 次（= 你没按够），而老人按得完全正确。见
+             *    elder_rgb_button_acknowledged() 的说明。 */
+            elder_rgb_button_acknowledged();
             auto *payload = new std::string(prompt);
             /* 栈 5120 与 kAnnounceTaskStack 对齐：两者都走
              * elder_ui_speak → OnSpeak → std::string 拼 JSON + ESP_LOG，
@@ -1066,13 +1112,20 @@ void OnKey(elder_key_event_t ev, void *ctx)
             /* 诊断：这是 2026-10-29「屏幕挂着提醒但按什么都没反应」的现场
              * 特征 —— 屏幕（elder_ui，4 小时独立计时）说要做，引擎里却
              * 没有待确认项（已判 SKIPPED / 被 replace_all 重置成 IDLE）。
-             * 打出来是为了下次一眼能看出来，不用再靠猜。 */
+             * 打出来是为了下次一眼能看出来，不用再靠猜。
+             *
+             * 2026-11-03 追加：日程类"播报即完成"也会落到这里（喝水/运动/
+             * 待办 auto_done 之后引擎里就没有待确认项了）。老人长按的意思
+             * 仍然是"这件事我做了"，所以先收屏，再决定这条日志是 ERROR
+             * 还是 INFO —— 收不掉才说明真脱节。 */
+            HideReminderIfResolved("长按：当前无待确认项");
             if (elder_ui_reminder_showing()) {
                 ESP_LOGE(TAG, "⚠️ 全屏提醒还挂着，但引擎里没有待确认项 —— "
                               "长按无效。screen 与引擎状态已脱节，"
                               "请把这条日志连同开机日志一起反馈");
+            } else {
+                ESP_LOGI(TAG, "长按 3 秒：当前没有待确认的提醒，不确认");
             }
-            ESP_LOGI(TAG, "长按 3 秒：当前没有待确认的提醒，不确认");
         }
         break;
     }
@@ -1206,6 +1259,10 @@ extern "C" int elder_confirm_pending_medicine(void)
 {
     int idx = FirstUndoneReminder();
     if (idx < 0) {
+        /* 引擎里没有待确认项，但老人**明确回应了**（他刚才说的就是"我喝完了"
+         * 这一类）。日程类早已 auto_done，屏却还挂着 —— 这里收掉。
+         * 不收的话用户的感受就是"我说了、它也答应了，屏幕一直赶不走"。 */
+        HideReminderIfResolved("语音确认：当前无待确认项");
         ESP_LOGW(TAG, "语音确认请求：当前没有待确认的服药提醒，忽略");
         return -1;
     }
@@ -1300,6 +1357,8 @@ extern "C" int elder_confirm_reminder_by_server_id(uint32_t server_id)
          * 见本函数 docstring 里 server_id == 0 那一段。 */
         const int idx = FirstUndoneReminder();
         if (idx < 0) {
+            /* 同上：老人回应了，日程类已 auto_done，屏得收掉。 */
+            HideReminderIfResolved("语音确认（无 server_id）：当前无待确认项");
             ESP_LOGW(TAG, "语音确认请求（无 server_id）：当前没有待确认的提醒，忽略");
             return -1;
         }
@@ -1346,6 +1405,12 @@ extern "C" int elder_confirm_reminder_by_server_id(uint32_t server_id)
     if (rc != ESP_OK) {
         ESP_LOGW(TAG, "定向语音确认失败（server_id=%lu, method=%u, rc=%d）",
                  (unsigned long)server_id, (unsigned)method, (int)rc);
+        /* 定向确认失败有两种原因，对屏幕的处理完全相反：
+         *   · 本地没有这条 / 状态已经不是"待确认"（典型：日程类 auto_done）
+         *     ⇒ 引擎里确实没有下文，屏必须收掉；
+         *   · 还有别的提醒在等 ⇒ HideReminderIfResolved 自己会跳过。
+         * 放在这里而不是只在 return 前，是因为这条路径也是"老人回应了"。 */
+        HideReminderIfResolved("定向语音确认未命中待确认项");
         return -1;
     }
 

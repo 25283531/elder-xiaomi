@@ -1090,9 +1090,27 @@ void LcdDisplay::SetupUI() {
     lv_obj_align(notification_label_, LV_ALIGN_LEFT_MID, 0, 0);
     lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
 
-    /* 右组：wifi / 静音 / 电量 / 日期（顺序即设计稿：图标在前、日期在后） */
+    /* 右组：wifi / 静音 / 电量 / 日期（顺序即设计稿：图标在前、日期在后）
+     *
+     * ⚠️ 宽度**必须**是 flex_grow，不能是 LV_SIZE_CONTENT（2026-11-03 真机
+     * 实测定案）。真机诊断日志：
+     *     net_text=非空 net_w=25 net_h=23 right_w=0 right_x=304 bar_w=320
+     * WiFi 图标文本设上了、label 本身也有 25x23，但它所在的 right_icons
+     * 宽度是 **0** —— 整组被挤成一条线贴在右边缘，屏上什么都看不见。
+     *
+     * 根因：top_bar_ 是 LV_FLEX_ALIGN_SPACE_BETWEEN 的**行**，只有两个子对象
+     * （左组 status_bar_ 定宽 34% + 右组 SIZE_CONTENT）。SIZE_CONTENT 的嵌套
+     * flex 容器要等自己的子对象布局完才能算出宽度，而 SPACE_BETWEEN 在
+     * 这一轮就要分配剩余空间 —— 量到 0 就按 0 分。而它内部子对象的总宽
+     * （wifi 25 + 电量 29 + 日期 40%≈128 + 边距）其实远超 0。
+     *
+     * 用 flex_grow=1 而不是写死一个百分比：右组的宽度是"父内容宽 - 左组宽"
+     * 这个确定值，与屏幕分辨率、左组 34% 的取值都不再耦合；LVGL 算 grow
+     * 只做减法，不依赖子对象自己量出来的尺寸，所以不会重蹈 SIZE_CONTENT 的坑。
+     * 组内仍是 LV_FLEX_ALIGN_END —— 图标贴着右边缘排。 */
     lv_obj_t* right_icons = lv_obj_create(top_bar_);
     lv_obj_set_size(right_icons, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(right_icons, 1);
     lv_obj_set_style_bg_opa(right_icons, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(right_icons, 0, 0);
     lv_obj_set_style_pad_all(right_icons, 0, 0);
@@ -1159,10 +1177,27 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_color(bottom_bar_, lvgl_theme->text_color(), 0);
     lv_obj_set_style_pad_all(bottom_bar_, 0, 0);
     lv_obj_set_style_border_width(bottom_bar_, 0, 0);
-    lv_obj_clear_flag(bottom_bar_, LV_OBJ_FLAG_SCROLLABLE);
+    /* 可**纵向**滚动：一页放不下时由 ChatPageStep() 按页滚（2026-11-03
+     * 用户需求「一屏显示不完全就自动翻页」）。
+     *
+     * 三件事缺一不可，缺哪一件的表现都不一样：
+     *   · SCROLLABLE 不清（以前这里是 clear_flag）—— 清掉就根本滚不动；
+     *   · 滚动方向限死纵向 —— 不限的话长句子横向也能拖，老人会以为界面乱了；
+     *   · scrollbar 必须 OFF —— 屏只有 320x240，右侧那条 4px 的滚动条会压掉
+     *     半个汉字，而且老人不认识"滚动条"这个东西。
+     * 注意这与 screen 那一层是**两回事**：screen 上禁滚动是为了待机跑马灯的
+     * 两张图（它们的包围盒故意超出屏幕），见 SetupUI 开头的说明。 */
+    lv_obj_set_scroll_dir(bottom_bar_, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(bottom_bar_, LV_SCROLLBAR_MODE_OFF);
     /* 纵向 flex：用户话在上、回答在下，行高由内容决定，不写死 y。
      * 两行文字的起点必须跟着上一行的高度走 —— 用户说了 1 句还是 2 句，
-     * 回答的起始 y 是不一样的，绝对定位做不到。 */
+     * 回答的起始 y 是不一样的，绝对定位做不到。
+     *
+     * 行间距（pad_row）保留 6px 的视觉留白，但页高换算时必须把它算进去：
+     * "回答另起一页"要求 (用户话高 + 行间距) 恰好落在页边界上，所以撑高的
+     * 目标是 `pages * page_h - 行间距`，而不是 `pages * page_h`。写错这 6px
+     * 的后果是回答的每一行都相对页边界错位 6px，翻到第 3 页时正好把一行
+     * 切成上下两半。 */
     lv_obj_set_flex_flow(bottom_bar_, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(bottom_bar_, LV_FLEX_ALIGN_START,
                           LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
@@ -1242,6 +1277,146 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     ESP_ERROR_CHECK(esp_timer_start_once(preview_timer_, PREVIEW_IMAGE_DURATION_MS * 1000));
 }
 
+/* ================= 对话分页（2026-11-03 用户需求） =================
+ *
+ * 用户原话：「对话状态中，用户说的话和 AI 说的话文字放在同一页，一屏显示
+ * 不完全。把用户说的话和 AI 说的话放在不同的两页，如果一页显示不全，
+ * 自动翻页」。
+ *
+ * 为什么是"按页滚动"而不是"两个 label 轮着显示"：
+ *   轮显只能解决"两块话挤在一屏"，解决不了"一块话本身就超一屏"（回答经常
+ *   三四行，320x240 上 30px 字体一屏只有 4 行）。滚动才能把一段话按页翻完，
+ *   两种"显示不全"用同一套机制覆盖。
+ *
+ * 页高为什么取"整行倍数"：容器高 188px，行高 42px，只能放 4 行（168px）。
+ * 按 188 滚，第二页顶端会从第 5 行的中间切开 —— 老人看到半截字。
+ */
+
+/* 每页停留多久。4 行 30px 汉字，老人逐行读大约 3~5 秒；给 6 秒留余量。
+ * 太短等于催他，太长他会以为设备卡住了。 */
+#define CHAT_PAGE_DWELL_MS  6000
+
+int LcdDisplay::ChatLineH() {
+    /* 字体行高随主题变（20px 小字库 line_height=25 / 30px 大字库 38），
+     * 所以**每次现算**，不能缓存 —— 缓存的话换一次主题，分页就按旧行高切，
+     * 表现是"页边界压着半行字"。 */
+    const lv_font_t* f = nullptr;
+    if (chat_message_label_ != nullptr) {
+        f = lv_obj_get_style_text_font(chat_message_label_, LV_PART_MAIN);
+    }
+    const int lh = (f != nullptr) ? (int)f->line_height : 25;
+    /* 行间距与创建 label 时的取值同源（LV_VER_RES * 4 / 240）。 */
+    return lh + (LV_VER_RES * 4 / 240);
+}
+
+int LcdDisplay::ChatPageH() {
+    if (bottom_bar_ == nullptr) return 0;
+    const int avail = (int)lv_obj_get_height(bottom_bar_);
+    const int line_h = ChatLineH();
+    if (avail <= 0 || line_h <= 0) return 0;
+    int lines = avail / line_h;
+    if (lines < 1) lines = 1;
+    return lines * line_h;
+}
+
+void LcdDisplay::ChatPageLayout() {
+    if (bottom_bar_ == nullptr || chat_user_label_ == nullptr) return;
+
+    const int page_h = ChatPageH();
+    if (page_h <= 0) return;
+
+    /* 用户话先回到自然高度再量 —— 上一轮它可能被撑成了整页。 */
+    lv_obj_set_height(chat_user_label_, LV_SIZE_CONTENT);
+    lv_obj_update_layout(bottom_bar_);
+
+    const bool user_vis = !lv_obj_has_flag(chat_user_label_, LV_OBJ_FLAG_HIDDEN);
+    const bool bot_vis = (chat_message_label_ != nullptr) &&
+                         !lv_obj_has_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);
+    const int user_h = user_vis ? (int)lv_obj_get_height(chat_user_label_) : 0;
+    const int bot_h = bot_vis ? (int)lv_obj_get_height(chat_message_label_) : 0;
+
+    /* 两段**合起来放得下**一页 ⇒ 就放一页，不人为翻页。
+     * 短问答（「今天几号」/「11 月 3 号」）如果也强行分页，老人得等 6 秒
+     * 自动翻页才看得到答案 —— 那是把"显示不全"换成了"显示太慢"，更糟。
+     * 判"放得下"必须把 flex 插的那 6px 行间距算进去，否则刚好卡满一页时
+     * 会多出 6px 的"第 2 页"，老人看到一次毫无内容的翻页。 */
+    const int gap = LV_VER_RES * 6 / 240;
+    const bool split = (user_h > 0 && bot_h > 0 && (user_h + bot_h + gap) > page_h);
+    if (split) {
+        /* 把用户话撑成整页 ⇒ 回答**必然**从下一页的第一行开始。
+         * 撑的是 label 高度（不另插空白对象）：flex 列里一个定高 label 就是
+         * 一段留白，而下一轮改文案时高度会被重新量过，不会累积。
+         *
+         * 目标高度要减掉行间距：flex 会在两个子对象之间插 pad_row，
+         * 回答的起点 = 用户话高 + 行间距，必须恰好是 page_h 的整数倍。 */
+        const int pages = (user_h + gap + page_h - 1) / page_h;
+        lv_obj_set_height(chat_user_label_, pages * page_h - gap);
+        lv_obj_update_layout(bottom_bar_);
+    }
+
+    /* 滚动余量由 LVGL 现算：get_scroll_bottom() = 内容高 - 容器高（还能往下
+     * 滚多少像素）。自己累加各 label 高度会在"隐藏的 label / 换主题改行距"
+     * 这些情况下算错。 */
+    int max_scroll = (int)lv_obj_get_scroll_bottom(bottom_bar_);
+    if (max_scroll < 0) max_scroll = 0;
+    const int total = (int)lv_obj_get_height(bottom_bar_) + max_scroll;
+    int pages = (total + page_h - 1) / page_h;
+    if (pages < 1) pages = 1;
+
+    chat_page_index_ = 0;
+    chat_page_count_ = pages;
+    chat_page_h_ = page_h;
+    chat_page_max_scroll_ = max_scroll;
+    lv_obj_scroll_to_y(bottom_bar_, 0, LV_ANIM_OFF);
+
+    if (pages > 1) {
+        if (chat_page_timer_ == nullptr) {
+            /* lv_timer 回调必须是裸函数指针，用 user_data 带回 this
+             * （与防烧屏定时器同一写法）。 */
+            chat_page_timer_ = lv_timer_create([](lv_timer_t* t) {
+                static_cast<LcdDisplay*>(lv_timer_get_user_data(t))->ChatPageStep();
+            }, CHAT_PAGE_DWELL_MS, this);
+        }
+        if (chat_page_timer_ != nullptr) {
+            /* reset 让本页从"完整停留 6 秒"开始算：新字幕刚到就翻页，等于
+             * 第一页根本没让人看。 */
+            lv_timer_reset(chat_page_timer_);
+            lv_timer_resume(chat_page_timer_);
+        }
+        ESP_LOGI(TAG, "对话分页：共 %d 页（页高 %d / 内容 %d / 视口 %d）%s",
+                 pages, page_h, total, (int)lv_obj_get_height(bottom_bar_),
+                 split ? "，回答另起一页" : "");
+    } else if (chat_page_timer_ != nullptr) {
+        lv_timer_pause(chat_page_timer_);
+    }
+}
+
+void LcdDisplay::ChatPageStep() {
+    if (bottom_bar_ == nullptr || chat_page_count_ <= 1) {
+        if (chat_page_timer_ != nullptr) lv_timer_pause(chat_page_timer_);
+        return;
+    }
+    if (chat_page_index_ + 1 >= chat_page_count_) {
+        /* 最后一页就**停住**，不循环：
+         *   · 老人正在读结论，把它翻走等于让他再也看不到；
+         *   · 循环滚动会一直重置 last_ui_change_tick_，防烧屏永远接管不了
+         *     —— 屏上固定不动的高对比文字正是要防的那类残影。 */
+        lv_timer_pause(chat_page_timer_);
+        ESP_LOGI(TAG, "对话分页：已翻到最后一页（%d/%d），停住",
+                 chat_page_index_ + 1, chat_page_count_);
+        return;
+    }
+    chat_page_index_++;
+    int y = chat_page_index_ * chat_page_h_;
+    if (y > chat_page_max_scroll_) y = chat_page_max_scroll_;   /* 最后一页滚不满 */
+    lv_obj_scroll_to_y(bottom_bar_, y, LV_ANIM_ON);
+    /* 界面确实在变 ⇒ 推迟屏保。只在真正翻页时重置，停住之后不再动，
+     * 于是 60 秒静止后防烧屏能正常接管。 */
+    last_ui_change_tick_ = lv_tick_get();
+    ESP_LOGI(TAG, "对话分页：翻到第 %d/%d 页（y=%d）",
+             chat_page_index_ + 1, chat_page_count_, y);
+}
+
 void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     /* 有新字幕 = 界面正在变化 ⇒ 重置防烧屏空闲计时（见 StartAntiBurnInTimer） */
     last_ui_change_tick_ = lv_tick_get();
@@ -1298,7 +1473,11 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
 
     ESP_LOGI(TAG, "SetChatMessage role=%s len=%d", role ? role : "(null)",
              (int)strlen(text));
-    lv_obj_update_layout(chat_message_label_);
+    /* 分页（2026-11-03 用户需求）：两段话放不下一页时，把用户话撑成整页
+     * 的整数倍让回答另起一页；页数 > 1 就起定时器自动翻页。
+     * 必须在**两段文字都写完之后**量 —— 量在写之前只能看到上一轮的高度，
+     * 判断"放不放得下"必然错。 */
+    ChatPageLayout();
 }
 #endif  /* CONFIG_USE_WECHAT_MESSAGE_STYLE —— 以下两个函数两个分支都要有 */
 
@@ -2144,6 +2323,13 @@ void LcdDisplay::SetTheme(Theme* theme) {
     if (chat_user_label_ != nullptr) {
         lv_obj_set_style_text_font(chat_user_label_, chat_font, 0);
     }
+    /* 换主题 ⇒ 行高可能从 25 变成 38，页高必须重算（ChatLineH 每次现算，
+     * 但已经算好的 chat_page_h_ / 页数是上一套字体的）。不重算的表现是
+     * "换一次主题，自动翻页就按旧行高切，页边界压着半行字"。
+     * 重算顺带把滚动位置复位到第 1 页 —— 换主题时老人本来也要重看一遍。 */
+    if (bottom_bar_ != nullptr && chat_user_label_ != nullptr) {
+        ChatPageLayout();
+    }
     if (date_label_ != nullptr) {
         lv_obj_set_style_text_font(date_label_, text_font, 0);
     }
@@ -2289,6 +2475,9 @@ void LcdDisplay::SetHideSubtitle(bool hide) {
     if (bottom_bar_ != nullptr) {
         if (hide) {
             lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+            /* 藏了字幕就必须停分页：定时器还在滚一个看不见的容器，白白
+             * 重置 last_ui_change_tick_ ⇒ 防烧屏永远接管不了。 */
+            if (chat_page_timer_ != nullptr) lv_timer_pause(chat_page_timer_);
         } else {
             lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
         }
