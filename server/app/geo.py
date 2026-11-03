@@ -426,6 +426,37 @@ def tz_hint(name: str, at: datetime | None = None) -> str:
     return f"设备最后一次所在地是 {where}，{rel}。"
 
 
+def tz_short(name: str, at: datetime | None = None) -> str:
+    """同一件事的**短版**，给表格单元格用（一行放得下）。
+
+    为什么不复用 ``tz_hint``：那是一整句「设备最后一次所在地是 尼日利亚
+    （Africa/Lagos，UTC+01:00），比北京时间晚 7 小时。」—— 弹窗里合适，
+    塞进「我的设备」表的一列会把行高撑成三行。
+
+    但**不许让前端自己拼短版**：网页与 APP 两套前端各拼一遍必然漂移，
+    这正是 ``tz_hint`` 把文案放服务端的原因。所以短版也在这里生成，
+    前端只渲染；需要看整句时用 ``title`` 挂 ``hint``。
+
+    返回空串 = 时区名不可用（与 ``tz_hint`` 同口径）。
+    """
+    text = valid_timezone(name)
+    if not text:
+        return ""
+    off = offset_minutes(text, at)
+    delta = beijing_offset_min(text, at)
+    region = region_of(text)
+    # 区域名比 IANA 名对家属友好（"尼日利亚"胜过"Africa/Lagos"），
+    # 但认不出区域时必须回落到 IANA 名，不能留空 —— 空着等于没信息。
+    where = region or text
+    if delta == 0:
+        rel = "与北京同时"
+    else:
+        hh, mm = divmod(abs(delta), 60)
+        span = f"{hh}h" if mm == 0 else f"{hh}h{mm}m"
+        rel = f"{'早' if delta > 0 else '晚'}北京 {span}"
+    return f"{where} · {offset_text(off)} · {rel}"
+
+
 # ============================================================ 三层取国家
 def country_from_proxy(peer_ip: str, headers: Mapping[str, str]) -> str:
     """层 1：可信反代声明的国家头。
