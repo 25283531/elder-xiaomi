@@ -3570,6 +3570,12 @@ def t_dismiss_and_watchdog() -> None:
         # 否则测的只是一个同名的 lambda（假绿）。
         s._silence_watchdog = types.MethodType(
             S.VoiceSession._silence_watchdog, s)
+        # 2026-11-03 加埋点：这个分支现在要留音频指纹，同样必须是**真方法**
+        # （假对象没有 _pcm 的话它会被自己的 except 兜住，测出来的就不是
+        # "重新武装"而是"诊断失败后仍然重新武装"——两件事，都得测）。
+        s._pcm = []
+        s._listen_timeout_fingerprint = types.MethodType(
+            S.VoiceSession._listen_timeout_fingerprint, s)
         # 把 60s 上限压到 400ms，测试才跑得动
         real_max = S.config.VOICE_MAX_LISTEN_MS
         S.config.VOICE_MAX_LISTEN_MS = 400
@@ -3580,6 +3586,48 @@ def t_dismiss_and_watchdog() -> None:
         check("12i ★ 一句都没说时看门狗必须重新武装，而不是送 ASR"
               "（原先每 60s 念一次「我没听清」）",
               armed and not turned, f"armed={len(armed)} turned={len(turned)}")
+
+        # ---- ②b 诊断代码自己炸了，看门狗也必须照样重新武装 ----
+        # 这不是假想：2026-11-03 加埋点时真的因为取 self._pcm 抛了
+        # AttributeError，被看门狗外层 except 吞掉 ⇒ 看门狗直接退出 ⇒
+        # **设备永远卡在聆听态，再没有任何兜底**。拿不到证据是小事，
+        # 把会话搞死是大事，所以这里钉住"诊断失败必须降级，不许带走看门狗"。
+        #
+        # ⚠️ 必须让**底层** _dump_listen_timeout 抛，而不是替换
+        # _listen_timeout_fingerprint：安全网就在后者里面，把后者换掉
+        # 测到的是"外层 except"，那是另一件事（第一版就这么写错了）。
+        s3 = types.SimpleNamespace()
+        s3.session_id = "SMOKE-WD3"
+        s3.state = "listening"
+        s3._speech_ms = 0
+        s3._silence_ms = 0
+        s3._t0 = 0.0
+        s3._abort = False
+        s3._last_active_at = time.monotonic()
+        armed3 = []
+        s3._rearm_listening = lambda: armed3.append(1)
+        s3._start_turn = lambda: True
+        s3._silence_threshold_ms = lambda: 10 ** 9
+        s3._pcm = []
+        s3._silence_watchdog = types.MethodType(
+            S.VoiceSession._silence_watchdog, s3)
+        s3._listen_timeout_fingerprint = types.MethodType(
+            S.VoiceSession._listen_timeout_fingerprint, s3)
+
+        real_dump = S._dump_listen_timeout
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("留证炸了")
+
+        S._dump_listen_timeout = _boom          # type: ignore[assignment]
+        S.config.VOICE_MAX_LISTEN_MS = 400
+        try:
+            await asyncio.wait_for(s3._silence_watchdog(), timeout=5)
+        finally:
+            S._dump_listen_timeout = real_dump  # type: ignore[assignment]
+            S.config.VOICE_MAX_LISTEN_MS = real_max
+        check("12i ★ 留证函数抛异常时看门狗仍要重新武装（不许卡死在聆听）",
+              bool(armed3), f"armed={len(armed3)}（0 = 会话再也收不了尾）")
 
         # ---- ③ 有语音时才允许兜底 finalize ----
         s2 = types.SimpleNamespace()

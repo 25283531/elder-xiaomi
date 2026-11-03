@@ -979,41 +979,100 @@ def _asr_dump_dir() -> "Path | None":
     return parent if parent.is_dir() else None
 
 
-def _dump_empty_asr(pcm: bytes, speech_ms: int, session_id: str) -> str:
-    """ASR 返回空时留证：落一个 wav + 返回一行可读的统计摘要。
-
-    只在「VAD 认为说了话（≥ ASR_DUMP_MIN_SPEECH_MS）且确实为空」时调用，
-    正常对话零开销。落盘失败一律吞掉（诊断不能影响对话）。
+def _join_pcm(pcm: "bytes | list[bytes]") -> bytes:
+    """统一成 bytes。两处调用方天然给不同型：``_run_turn`` 给的是已拼好的
+    bytes，看门狗分支手里只有 ``_pcm`` 帧列表。**不能只在一边做转换** ——
+    两处各写一份必然分叉（本仓踩过：函数返回 list 却被当 bytes 用）。
     """
-    rms, peak = _pcm_stats(pcm)
+    if isinstance(pcm, (bytes, bytearray)):
+        return bytes(pcm)
+    return b"".join(pcm)
+
+
+def _pcm_fingerprint(pcm: "bytes | list[bytes]", speech_ms: int) -> tuple[str, float]:
+    """一行音频指纹：(可读摘要, 峰值)。峰值单独返回给调用方做闸门判断，
+    免得为了取一个数把 1MB 音频再统计一遍。"""
+    raw = _join_pcm(pcm)
+    rms, peak = _pcm_stats(raw)
     summary = ("rms=%.4f peak=%.3f 时长=%.1fs 语音=%dms"
-               % (rms, peak, len(pcm) / 32000.0, speech_ms))
-    if not getattr(config, "ASR_DUMP", False):
-        return summary
-    if speech_ms < getattr(config, "ASR_DUMP_MIN_SPEECH_MS", 800):
-        return summary
+               % (rms, peak, len(raw) / 32000.0, speech_ms))
+    return summary, peak
+
+
+def _save_dump(pcm: "bytes | list[bytes]", tag: str, session_id: str) -> str:
+    """落一个 ``asr_<tag>_<时间>_<会话8位>.wav``，返回文件名；失败返回空串。
+
+    轮换用 ``asr_*.wav`` 而不是 ``asr_empty_*.wav``：两种 tag 共用一个配额，
+    否则"空识别"和"窗口超时"各留 3 个，磁盘上翻倍且更难找。
+    """
+    raw = _join_pcm(pcm)
     try:
         folder = _asr_dump_dir()
         if folder is None:
-            return summary + "（无处落盘）"
+            return ""
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        path = folder / ("asr_empty_%s_%s.wav" % (stamp, session_id[:8]))
+        path = folder / ("asr_%s_%s_%s.wav" % (tag, stamp, session_id[:8]))
         with open(path, "wb") as fh:
-            fh.write(asr_tts.wav_header_bytes(len(pcm), 16000))
-            fh.write(pcm)
+            fh.write(asr_tts.wav_header_bytes(len(raw), 16000))
+            fh.write(raw)
         # 只留最近 N 个：这是排障证据，不是录音档案。
-        olds = sorted(folder.glob("asr_empty_*.wav"))
+        olds = sorted(folder.glob("asr_*.wav"))
         keep = max(1, int(getattr(config, "ASR_DUMP_KEEP", 3)))
         for stale in olds[:-keep]:
             try:
                 stale.unlink()
             except OSError:
                 pass
-        return summary + " 已存 %s" % path.name
+        return path.name
     except Exception as exc:  # noqa: BLE001  落盘失败不影响对话
-        log.warning("ASR 空结果音频落盘失败：%s: %s",
-                    type(exc).__name__, exc)
+        log.warning("ASR 音频留证落盘失败（%s）：%s: %s",
+                    tag, type(exc).__name__, exc)
+        return ""
+
+
+def _dump_empty_asr(pcm: "bytes | list[bytes]", speech_ms: int,
+                    session_id: str) -> str:
+    """ASR 返回空时留证：落一个 wav + 返回一行可读的统计摘要。
+
+    只在「VAD 认为说了话（≥ ASR_DUMP_MIN_SPEECH_MS）且确实为空」时调用，
+    正常对话零开销。落盘失败一律吞掉（诊断不能影响对话）。
+    """
+    summary, _ = _pcm_fingerprint(pcm, speech_ms)
+    if not getattr(config, "ASR_DUMP", False):
         return summary
+    if speech_ms < getattr(config, "ASR_DUMP_MIN_SPEECH_MS", 800):
+        return summary
+    name = _save_dump(pcm, "empty", session_id)
+    return summary + (" 已存 %s" % name if name else "")
+
+
+#: 窗口超时留证的峰值闸门（约 -40dBFS，相当于底噪 0.002 的 5 倍）。
+_DUMP_TIMEOUT_PEAK: Final[float] = 0.01
+
+
+def _dump_listen_timeout(pcm: "bytes | list[bytes]", speech_ms: int,
+                         session_id: str, window_ms: int) -> str:
+    """收听了整个窗口、VAD 却一帧都没判成语音 —— 但老人说他明明说了话。
+
+    这是 2026-11-03 深夜现场里**最要命的一种**：60 秒窗口累计语音 0ms，
+    服务端按设计"重新武装而不送 ASR"（见看门狗注释里 2026-10-21 那个
+    "音箱永远自言自语"的事故），日志里只有一行数字，**一点证据都不留**。
+    如果下次复现还是这一种，`_dump_empty_asr` 那套完全抓不到 —— 它的闸门
+    是"语音量 ≥ 800ms"，这里恒为 0。
+
+    所以闸门换成**峰值**：房间真安静时 peak 只有 0.001 级，落了也是白占
+    磁盘（60 秒 wav 约 1.9MB，且每分钟一次）；一旦 peak ≥ 0.01 就说明这段
+    音频里确实有可听的东西，VAD 却判成了静音 —— 那正是要抓的两种可能：
+    门限定得太高，或者设备送上来的音频被衰减过。
+    """
+    summary, peak = _pcm_fingerprint(pcm, speech_ms)
+    summary = "窗口=%dms %s" % (window_ms, summary)
+    if not getattr(config, "ASR_DUMP", False):
+        return summary
+    if peak < _DUMP_TIMEOUT_PEAK:
+        return summary + "（峰值过低，未落盘）"
+    name = _save_dump(pcm, "timeout", session_id)
+    return summary + (" 已存 %s" % name if name else "")
 
 
 class VoiceSession:
@@ -2215,6 +2274,27 @@ class VoiceSession:
                      self.session_id, type(exc).__name__, exc,
                      config.VOICE_DISMISS_COOLDOWN_SEC)
 
+    def _listen_timeout_fingerprint(self, window_ms: int) -> str:
+        """看门狗超时分支的音频指纹（必要时落 wav）。**绝不抛异常**。
+
+        为什么单独包一层而不是直接调 ``_dump_listen_timeout``：这段代码跑在
+        :meth:`_silence_watchdog` 的循环体里，外层只有一个 ``except Exception``
+        —— 诊断代码抛出去就被它吞掉，看门狗**直接退出**，表现是设备永远卡在
+        聆听态、再也不会有任何兜底。拿不到证据是小事，把会话搞死是大事，
+        所以这里的任何失败都只能降级成一行字符串。
+
+        （这条不是假想：2026-11-03 加埋点时真的因为取 ``self._pcm`` 抛了
+        AttributeError，``smoke_voice`` 12i 立刻红了 —— 那个测试用的假会话
+        对象没有 ``_pcm``。测试替身恰好暴露了真实风险。）
+        """
+        try:
+            return _dump_listen_timeout(list(self._pcm), self._speech_ms,
+                                        self.session_id, window_ms)
+        except Exception as exc:  # noqa: BLE001  诊断失败不许影响会话
+            log.warning("[%s] 窗口超时音频留证失败：%s: %s",
+                        self.session_id, type(exc).__name__, exc)
+            return "留证失败：%s" % type(exc).__name__
+
     async def _silence_watchdog(self) -> None:
         """连续静音达到阈值就自动 finalize（等价于设备端 VAD 断句）。
 
@@ -2282,11 +2362,18 @@ class VoiceSession:
                 elapsed_ms = int((time.monotonic() - self._t0) * 1000)
                 if elapsed_ms >= config.VOICE_MAX_LISTEN_MS:
                     if self._speech_ms < config.VOICE_MIN_SPEECH_MS:
+                        # ⚠️ 这个分支原先**只打一行数字**（"累计语音 0ms"），
+                        # 2026-11-03 深夜现场就撞上了：老人说他明明说了话，
+                        # 服务端却认定 60 秒里一句没说。没有音频指纹就无从
+                        # 判断是"门限太高"还是"送上来的音频被衰减"，所以
+                        # 这里也留指纹（峰值够高时连 wav 一起落）。
+                        # 必须在 _rearm_listening() **之前**取，它会清 _pcm。
                         log.info("[%s] 收听超 %ds 但一句都没说（累计语音 %dms "
-                                 "< %dms），重新武装而不送 ASR",
+                                 "< %dms），重新武装而不送 ASR；音频指纹：%s",
                                  self.session_id,
                                  config.VOICE_MAX_LISTEN_MS // 1000,
-                                 self._speech_ms, config.VOICE_MIN_SPEECH_MS)
+                                 self._speech_ms, config.VOICE_MIN_SPEECH_MS,
+                                 self._listen_timeout_fingerprint(elapsed_ms))
                         self._rearm_listening()
                         return
                     log.info("[%s] 收听超 %ds 兜底 finalize（累计语音 %dms）",

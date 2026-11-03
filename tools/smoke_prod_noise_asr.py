@@ -196,6 +196,59 @@ def t_dump() -> None:
             check(list(folder.glob("asr_empty_*.wav")) == [],
                   "ELDER_ASR_DUMP=0 时完全不写盘", "现场要有开关")
             check("rms=" in summary, "关掉落盘也照样打指纹")
+
+            # ---- 3b. 窗口超时（VAD 判"一句没说"，老人却说他说了话）----
+            # 这一种是 2026-11-03 深夜现场里最要命的：60 秒窗口累计语音 0ms，
+            # 走的是"重新武装而不送 ASR"，_dump_empty_asr 的闸门是
+            # "语音 ≥ 800ms"，在这里恒为 0 ⇒ **永远抓不到**。所以它单独有
+            # 一套判据（看峰值），必须单独钉住。
+            print("\n  -- 窗口超时留证：闸门是峰值，不是语音量 --")
+            config.ASR_DUMP = True
+            for f in folder.glob("asr_*.wav"):
+                f.unlink()
+
+            # 有声（peak 0.125）但语音量 0ms ⇒ 必须落，且 tag 是 timeout
+            summary = S._dump_listen_timeout(pcm, 0, "tout1234abcd", 60000)
+            files = list(folder.glob("asr_timeout_*.wav"))
+            check(len(files) == 1,
+                  "语音量 0ms 但有能量 ⇒ 照样落盘（不看 800ms 闸门）",
+                  f"实际 {len(files)} 个；摘要 {summary!r}")
+            check("窗口=60000ms" in summary, "摘要里带窗口长度",
+                  f"实际 {summary!r}")
+            check("已存" in summary, "摘要里给出文件名", f"实际 {summary!r}")
+            if files:
+                check(len(files[0].read_bytes()) == 44 + len(pcm),
+                      "超时留证的 wav 长度也对（44 + PCM）")
+
+            # 房间真安静（peak 0.0078 < 0.01）⇒ 不落，只打指纹。
+            # 否则空房间里每分钟写一个 1.9MB 的文件。
+            quiet = b"\x00\x01" * 16000
+            _r, quiet_peak = S._pcm_stats(quiet)
+            summary = S._dump_listen_timeout(quiet, 0, "quiet123abcd", 60000)
+            check(quiet_peak < S._DUMP_TIMEOUT_PEAK,
+                  "静音样本峰值确实低于闸门（测试前提成立）",
+                  f"peak={quiet_peak}")
+            check(len(list(folder.glob("asr_*.wav"))) == 1,
+                  "峰值低于闸门时不落盘（空房间不能每分钟写 1.9MB）",
+                  f"实际 {len(list(folder.glob('asr_*.wav')))} 个")
+            check("峰值过低" in summary, "摘要里说明为什么没落盘",
+                  f"实际 {summary!r}")
+
+            # 两种 tag 共用同一个配额：asr_*.wav 一起轮换
+            for i in range(3):
+                S._dump_listen_timeout(pcm, 0, f"mix{i}abcd", 60000)
+            total = sorted(folder.glob("asr_*.wav"))
+            check(len(total) <= 2,
+                  "empty/timeout 两种 tag 共用 ASR_DUMP_KEEP 配额",
+                  f"实际留下 {len(total)} 个（配额 2）")
+
+            # 关掉开关 ⇒ 超时分支也不写
+            for f in folder.glob("asr_*.wav"):
+                f.unlink()
+            config.ASR_DUMP = False
+            S._dump_listen_timeout(pcm, 0, "offtoutabcd", 60000)
+            check(list(folder.glob("asr_*.wav")) == [],
+                  "ELDER_ASR_DUMP=0 时超时分支也不写盘")
         finally:
             S._asr_dump_dir = orig_dir       # type: ignore[assignment]
             config.ASR_DUMP = orig_dump
@@ -211,6 +264,33 @@ def t_wiring() -> None:
           "空识别分支调用 _dump_empty_asr（源码接线）",
           "只写函数不调用 = 永远拿不到证据，且不报错")
     check("ASR 返回空，音频指纹" in src, "日志里带可 grep 的固定标记")
+
+    # 看门狗那条"60 秒一句没说"的分支：**必须先取指纹再重新武装**，
+    # _rearm_listening() 会清 _pcm，顺序反了就永远落出 0 字节的 wav。
+    # 这一条只能按"代码位"判顺序，不能整文件子串匹配（MEMORY 第 3 条）。
+    head, sep, tail = src.partition(
+        "self._listen_timeout_fingerprint(elapsed_ms)")
+    check(bool(sep), "看门狗超时分支调用 _listen_timeout_fingerprint（源码接线）",
+          "只给 _dump_empty_asr 装埋点 ⇒ '一句没说'那种现场永远抓不到")
+    if sep:
+        after = tail.split("_rearm_listening()", 1)
+        check(len(after) == 2 and after[0].strip(),
+              "调用在 _rearm_listening() 之前（后者会清 _pcm）",
+              "顺序反了 ⇒ 落出 0 字节 wav，比不落更误导")
+        check(after[0].count("\n") < 8,
+              "指纹调用紧挨着重新武装（不在别的分支里）")
+
+    # 包装层必须自己兜异常：它跑在看门狗循环里，抛出去会被外层
+    # except 吞掉 ⇒ 看门狗退出 ⇒ 设备永远卡在聆听（比没证据严重得多）。
+    body_head, body_sep, body_tail = src.partition(
+        "def _listen_timeout_fingerprint(")
+    check(bool(body_sep), "_listen_timeout_fingerprint 方法存在")
+    if body_sep:
+        body = body_tail.split("async def _silence_watchdog", 1)[0]
+        check("try:" in body and "except Exception" in body,
+              "包装层自己 try/except（不许把异常抛给看门狗）")
+        check("_dump_listen_timeout(list(self._pcm)" in body,
+              "包装层真的去取 _pcm 并调用底层留证")
 
     cfg = (ROOT / "server" / "app" / "config.py").read_text(encoding="utf-8")
     check('"ELDER_ASR_DUMP", "1"' in cfg,
