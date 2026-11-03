@@ -1238,34 +1238,93 @@ extern "C" int elder_confirm_pending_medicine(void)
  * 这里换成非 force_done 的 confirm_ex，那会让状态退回 HALF_CONFIRMED，
  * 屏幕收不起来、家属端也等不到终态。
  *
- * server_id == 0（没传 / 类型不对 / 传了 0）：**完全走旧路径**
- *   elder_confirm_pending_medicine()。服务端某个版本没带参数时不能因此
- *   让语音确认彻底失效 —— 宁可退化成"确认正在响铃的那条"。
- *   注意这条旧路径**仍然是半置信**（真人只说了句"吃了"），这是刻意的；
- *   它也不消费按键发起标记（拿不到 server_id 就没法证明是"这一条"）。
+ * server_id == 0（没传 / 类型不对 / 传了 0）：**先按"正在响的那条"定位**
+ *   （``FirstUndoneReminder()``），定位到了就能判断它是不是按键发起的：
+ *     · 命中按键发起标记 ⇒ 与上面完全同一条定向路径（报 BUTTON、落 DONE）。
+ *       服务端拿不到候选（规则被停用/已删、或时间窗对不上）时会退回不带参数
+ *       的旧调用，而老人**确实按了键**——不认这个标记就等于把一次全置信降级
+ *       成"仅语音 + 半置信"，老人还得再按一次，而他刚按过。
+ *     · 未命中 ⇒ 与改造前逐字一致（``ConfirmMedicine(idx, VOICE)``、落
+ *       HALF_CONFIRMED）。老人只是顺口说了句"吃过了"，没有任何"人在场"的
+ *       证据，不能替他升成全置信。
+ *   拿不到 server_id 时**只消费不置位**：标记是靠 server_id 定位的，这里
+ *   定位到的是"此刻正在响的那条"，两者相等才成立（见 MedArmedFor）。
  *
  * 返回：0 = 已确认；-1 = 本地没有正在等确认的该条（服务端收到 false，
  *       据此知道设备状态没同步上）。 */
-extern "C" int elder_confirm_reminder_by_server_id(uint32_t server_id)
+
+/* 按键发起标记是否命中 ``server_id``（并顺手清掉过期的）。
+ *
+ * 抽成函数而不是在两条分支里各写一遍：TTL 判断漏一处，表现是"过期标记被
+ * 当成有效" —— 老人上午按了一次键、下午随口说"吃了"，下午那条被算成全置信，
+ * 而日志里一切正常（只是少了行"已过期"）。 */
+static bool MedArmedFor(uint32_t server_id)
 {
-    if (server_id == 0) {
-        return elder_confirm_pending_medicine();
-    }
+    if (s_med_armed_us <= 0 || server_id == 0) return false;
 
-    /* 按键发起标记：命中 ⇒ 报 BUTTON（服务端合并成全置信），否则报 VOICE。 */
     const int64_t now_us = esp_timer_get_time();
-
     /* 先清过期的：过期标记留着没有任何用处，还会让"是不是按键发起"这个问题
      * 每次都多一次分支判断。清掉之后下面的判据只剩"同一条提醒"一个条件。 */
-    if (s_med_armed_us > 0 && (now_us - s_med_armed_us) > kMedArmedTtlUs) {
+    if ((now_us - s_med_armed_us) > kMedArmedTtlUs) {
         ESP_LOGI(TAG, "按键发起标记已过期（%lld 秒 > 600 秒），作废",
                  (long long)((now_us - s_med_armed_us) / 1000000));
         s_med_armed_server_id = 0;
         s_med_armed_us = 0;
+        return false;
+    }
+    return s_med_armed_server_id == server_id;
+}
+
+/* 标记用一次就作废：这次按键的"贷款"已经还掉了，留着会让同一条提醒的下一轮
+ * （比如明天的同一个 server_id）也被算成全置信。 */
+static void MedArmedConsume(uint32_t server_id)
+{
+    if (s_med_armed_server_id == server_id) {
+        s_med_armed_server_id = 0;
+        s_med_armed_us = 0;
+    }
+}
+
+extern "C" int elder_confirm_reminder_by_server_id(uint32_t server_id)
+{
+    if (server_id == 0) {
+        /* 旧路径：服务端没带 server_id（拿不到候选时它会退成这样）。
+         * 先按"正在响的那条"定位 —— 定位到之后就能判断它是不是按键发起的，
+         * 见本函数 docstring 里 server_id == 0 那一段。 */
+        const int idx = FirstUndoneReminder();
+        if (idx < 0) {
+            ESP_LOGW(TAG, "语音确认请求（无 server_id）：当前没有待确认的提醒，忽略");
+            return -1;
+        }
+        const elder_rmd_item_t *it = ItemAt(idx);
+        const uint32_t resolved = (it != nullptr) ? it->server_id : 0;
+
+        if (MedArmedFor(resolved)) {
+            ESP_LOGI(TAG, "无 server_id 但命中按键发起标记（解析到 server_id=%lu，"
+                          "提醒 #%d）⇒ 按定向路径上报 BUTTON（全置信）",
+                     (unsigned long)resolved, idx);
+            esp_err_t rc = elder_reminder_confirm_server(resolved,
+                                                         ELDER_CFM_BUTTON);
+            if (rc == ESP_OK) {
+                MedArmedConsume(resolved);
+                elder_input_close_confirm_window();
+                s_arming_id = -1;
+                return 0;
+            }
+            /* 定向失败就退回旧路径：不能因为"想记全置信"而让确认本身失败 ——
+             * 老人按了键却什么都没发生，比少记一次全置信严重得多。 */
+            ESP_LOGW(TAG, "无 server_id 的定向确认失败（rc=%d），退回旧路径", (int)rc);
+        }
+
+        /* 未命中标记 ⇒ 与改造前**逐字一致**：走纯语音入口（落 HALF_CONFIRMED）。
+         * 这里不直接调 ConfirmMedicine(idx, VOICE)，是为了让"旧路径"只有
+         * 一份实现 —— 它同时是 test_elder_host T13 的被测对象，两处各写一遍
+         * 迟早会漂移，而漂移的表现是"真机上半置信、host 测试里全置信"。 */
+        return elder_confirm_pending_medicine();
     }
 
-    const bool armed = (s_med_armed_server_id != 0 &&
-                        s_med_armed_server_id == server_id);
+    /* 按键发起标记：命中 ⇒ 报 BUTTON（服务端合并成全置信），否则报 VOICE。 */
+    const bool armed = MedArmedFor(server_id);
 
     uint8_t method = ELDER_CFM_VOICE;
     if (armed) {
@@ -1273,7 +1332,7 @@ extern "C" int elder_confirm_reminder_by_server_id(uint32_t server_id)
         ESP_LOGI(TAG, "定向确认：server_id=%lu 是按键发起的（%lld 秒前）⇒ "
                       "上报 BUTTON，服务端合并成语音+按键（全置信）",
                  (unsigned long)server_id,
-                 (long long)((now_us - s_med_armed_us) / 1000000));
+                 (long long)((esp_timer_get_time() - s_med_armed_us) / 1000000));
     }
 
     esp_err_t rc = elder_reminder_confirm_server(server_id, method);
@@ -1283,12 +1342,7 @@ extern "C" int elder_confirm_reminder_by_server_id(uint32_t server_id)
         return -1;
     }
 
-    /* 标记用一次就作废：这次按键的"贷款"已经还掉了，留着会让同一条提醒
-     * 的下一轮（比如明天的同一个 server_id）也被算成全置信。 */
-    if (s_med_armed_server_id == server_id) {
-        s_med_armed_server_id = 0;
-        s_med_armed_us = 0;
-    }
+    MedArmedConsume(server_id);
 
     /* 收尾与 ConfirmMedicine() 保持一致：状态机已经由 reminder.c 改完
      * （含 flush 落盘），这里只负责关掉确认窗、清掉长按待确认标记 ——
