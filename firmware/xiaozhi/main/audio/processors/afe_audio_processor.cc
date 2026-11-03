@@ -5,18 +5,6 @@
 
 #define TAG "AfeAudioProcessor"
 
-/* 是否启用 WebRTC 降噪（算法，不需要 model 分区）。
- *
- * 开关直接用 esp-sr 自己的 choice（Kconfig.projbuild 的 SR_NSN_MODEL_LOAD），
- * 这样"关降噪"只是模板里一行，不必改代码。两个符号都处理，代码在**两种
- * 配置下都必须能编译** —— 否则 CI 只编到其中一支，另一支永远是没编过的
- * 死代码（本仓踩过：写了不跑比没写更坏）。 */
-#ifdef CONFIG_SR_NSN_WEBRTC
-constexpr bool kWebrtcNs = true;
-#else
-constexpr bool kWebrtcNs = false;
-#endif
-
 AfeAudioProcessor::AfeAudioProcessor()
     : afe_data_(nullptr) {
     event_group_ = xEventGroupCreate();
@@ -61,26 +49,25 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
         afe_config->ns_init = true;
         afe_config->ns_model_name = ns_model_name;
         afe_config->afe_ns_mode = AFE_NS_MODE_NET;
-    } else if (kWebrtcNs) {
-        /* 2026-11-04：**本机永远走这一支**，因为分区表里没有 `model` 分区
-         * （partitions/v2/16m.csv 只有 nvs/otadata/phy_init/ota_0/ota_1/assets）。
-         * 没有模型列表 ⇒ `esp_srmodel_filter(models, ESP_NSNET_PREFIX, NULL)`
-         * 恒为 nullptr ⇒ 原来那句 `ns_init = false` 就是**唯一结局**。
-         *
-         * 后果：10-31 那次提交「降噪改用 NSNet2」**至今一帧降噪都没做**，
-         * 开机日志的管线串是铁证（NS 槽是空的）：
-         *   `[input] -> |AEC(SR_HIGH_PERF)| ->  -> |VAD(WebRTC)| -> |WakeNet(...)|`
-         * 而且它当时把模板从 SR_NSN_WEBRTC 改成了 SR_NSN_NSNET2，等于
-         * 把一个"不需要模型、本来能生效"的降噪换成了一个"永远加载不到"的。
-         *
-         * 现在改回 WebRTC NS：它是**算法**不是模型，不需要 model 分区。
-         * 开关仍是 esp-sr 自己的 choice（CONFIG_SR_NSN_WEBRTC / NSNET2），
-         * 想关掉降噪只改模板一行，不用碰代码。 */
-        static char kWebrtcNsName[] = "WEBRTC";   // esp-sr 约定的伪模型名
-        afe_config->ns_init = true;
-        afe_config->ns_model_name = kWebrtcNsName;
-        afe_config->afe_ns_mode = AFE_NS_MODE_WEBRTC;
     } else {
+        /* ⚠️⚠️ 2026-11-04 事故：这里一度改成"没有模型就走 WebRTC 降噪"
+         * （ns_init=true + ns_model_name="WEBRTC" + AFE_NS_MODE_WEBRTC），
+         * 结果**唤醒后设备必重启**（用户连试三次，三次都重启）。
+         *
+         * 现场证据：本文件创建的 AFE 是**第二条**管线（第一条是 WakeNet 自己
+         * 建的 `|AEC(SR_HIGH_PERF)| -> ... -> |WakeNet(...)|`）。回滚版开机
+         * 14.5s 会打出第二条 `|AEC(VOIP_HIGH_PERF)| -> [output]`；
+         * 而事故版抓了 20 秒，**第二条始终没出现** —— 说明 create_from_config
+         * 这一步就没回来。
+         *
+         * 原因：本机分区表没有 `model` 分区（`esp_srmodel_init("model")` 拿到
+         * 的是空列表），而 WebRTC NS 这条要求 ns_model_name 能在模型列表里
+         * 解析出来。列表是空的时候给它一个伪模型名 "WEBRTC"，等于让它在空表里
+         * 找东西 —— 空指针解引用。
+         *
+         * ⇒ **没有 model 分区就老老实实关掉降噪**。真要在本机开降噪，先得有
+         * 一个 model 分区（要动分区表，红线 C14），不是改两行配置能解决的。
+         * 别再把 ns_init 打开。 */
         afe_config->ns_init = false;
     }
 
@@ -99,7 +86,11 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
      * 避免老人凑近说话时削顶（削顶对 ASR 的伤害比小声更大）。
      *
      * ⚠️ AGC 作用在 **AFE 输出（上行，ASR 听到的那一路）**，与播放通路
-     * 完全无关 —— 不违反"声音已正常、不许再修出破音/卡顿"的硬约束。 */
+     * 完全无关 —— 不违反"声音已正常、不许再修出破音/卡顿"的硬约束。
+     *
+     * ⚠️ 验证方法：开机日志里**第二条** AFE 管线（本文件创建的那条，特征是有
+     * `AEC(VOIP_HIGH_PERF)`）必须出现 `|AGC(WebRTC)|`。只 grep 第一条
+     * （WakeNet 那条）会得出"没生效"的错误结论 —— 踩过。 */
     afe_config->agc_init = true;
     afe_config->agc_mode = AFE_AGC_MODE_WEBRTC;
     afe_config->agc_compression_gain_db = 9;

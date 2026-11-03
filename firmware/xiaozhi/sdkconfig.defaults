@@ -139,30 +139,30 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/16m.csv"
 # 离线命令词（elder_cmd/elder_mn/custom_wake_word）已删除，NVS 离线提醒
 # 引擎（reminder.c 到点播报）保留。
 #
-# --- 降噪：WebRTC NS（2026-11-04 更正 10-31 的错误选择）---
+# --- 降噪：本机开不了，保持关闭（2026-11-04 两次尝试都失败）---
 #
-# 10-31 把这里从 SR_NSN_WEBRTC 改成了 SR_NSN_NSNET2，理由是"模型进 model 列表
-# ⇒ ns_init=true"。**这个理由不成立**：本机分区表（partitions/v2/16m.csv）只有
-# nvs/otadata/phy_init/ota_0/ota_1/assets，**没有 `model` 分区** ⇒
-# `esp_srmodel_init("model")` 拿不到模型列表 ⇒
-# `esp_srmodel_filter(models, ESP_NSNET_PREFIX, NULL)` 恒为 nullptr ⇒
-# `ns_init = false` 是唯一结局。当时注释里"nsnet2 模型 337KB 随 app 镜像走"
-# 这句也没兑现：模型不在 app 里，在 model 分区里。
+# 事实链（每一环都有真机证据，别再重走）：
 #
-# 真机证据（2026-11-04 开机日志，grep "AFE Pipeline"）：
-#   `[input] -> |AEC(SR_HIGH_PERF)| ->  -> |VAD(WebRTC)| -> |WakeNet(...)|`
-#   NS 槽至今是空的 —— 也就是说「改用 NSNet2」这两个星期，一帧降噪都没做。
+# 1. 10-31 选了 SR_NSN_NSNET2，理由"模型进 model 列表 ⇒ ns_init=true"。
+#    不成立：本机分区表（partitions/v2/16m.csv）只有
+#    nvs/otadata/phy_init/ota_0/ota_1/assets，**没有 `model` 分区** ⇒
+#    `esp_srmodel_init("model")` 拿到空列表 ⇒ `esp_srmodel_filter` 恒为
+#    nullptr ⇒ `ns_init=false` 是唯一结局。这两个星期**一帧降噪都没做**。
 #
-# 改回 WebRTC NS：它是**算法**不是模型，不需要 model 分区，配了就能真的生效。
-# 代码侧配套（afe_audio_processor.cc）：模型找不到时走 WebRTC 分支，不再静默关闭。
+# 2. 11-04 改选 SR_NSN_WEBRTC，并在代码里"没有模型就走 WebRTC 伪模型名"。
+#    结果**唤醒后设备必重启**（用户连试三次三次重启）。证据：本文件创建的
+#    是**第二条** AFE 管线，回滚版开机 14.5s 会打出
+#    `|AEC(VOIP_HIGH_PERF)| -> [output]`，事故版抓了 20 秒**第二条始终没出现**
+#    ⇒ create_from_config 没回来。空模型列表 + 伪模型名 = 空指针。
 #
-# 判据只能看开机日志的管线串（应出现 `|NS(WebRTC)|` 或类似字样）——
-# grep 产物二进制不算数：模型缺失时字符串照样在。
+# ⇒ 本机要开降噪，前提是**先有 model 分区**（要动分区表，红线 C14），
+#   不是改两行配置能解决的。所以这里保持 NSNET2（等价于关闭：加载不到），
+#   让 `ns_init` 走 false，与"能正常跑"的那一版完全一致。
 #
-# 想关掉降噪做 A/B：把下面这行换成 `CONFIG_SR_NSN_NSNET2=y` 即可 ——
-# 本机没有 model 分区，NSNet2 加载不到，代码会走"无降噪"那一支。**不用改代码**。
-# （esp-sr 的 SR_NSN_MODEL_LOAD 是 choice，必选一项，所以"关"只能靠这个间接办法。）
-CONFIG_SR_NSN_WEBRTC=y
+# ⚠️ 判据只能看开机日志里**第二条** AFE 管线（特征是有 `AEC(VOIP_HIGH_PERF)`）。
+#    第一条是 WakeNet 自己建的，与这里的配置无关 —— 只看第一条会得出
+#    "降噪没生效"或"AGC 没生效"的错误结论（踩过）。
+CONFIG_SR_NSN_NSNET2=y
 # 业务后端地址（2026-10-18 起 IP 直连：域名未备案被厂商按 SNI 阻断，
 # 连 IP 不带 SNI 可绕过；服务端配 IP 证书后可开证书校验，见 Kconfig 帮助）
 CONFIG_ELDER_SERVER_URL="https://152.136.230.132"
