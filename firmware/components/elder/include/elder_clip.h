@@ -36,8 +36,8 @@ extern "C" {
  *    中间插入会让所有已有取值重新编号，而错位不会编译报错 ——
  *    表现是"服药提醒播了待办的话"，极难归因。 */
 typedef enum {
-    ELDER_CLIP_MEDICINE = 0,   /* 提醒音 + 「您有一条服药提醒」 */
-    ELDER_CLIP_TODO,           /* 提醒音 + 「您有一条待办事项」 */
+    ELDER_CLIP_MEDICINE = 0,   /* 提醒音 + 「您今天有服药提醒，请您知悉」 */
+    ELDER_CLIP_TODO,           /* 提醒音 + 「您今天有待办事项，请您知悉」 */
     ELDER_CLIP_CONFIRM_HINT,   /* 「请长按机身顶部凸起的橙色大按键进行服药确认」 */
     ELDER_CLIP_DONE,           /* 「已记录，今天不用再吃了」 */
     ELDER_CLIP_ESCALATED,      /* 「该吃药了，请长按按钮」 */
@@ -65,15 +65,15 @@ typedef enum {
  *    `MAX_DECODE_PACKETS_IN_QUEUE = 2400 / 60 = 40` 包（2.4 秒）。
  *    所以推送一段 N 帧的 OGG 会让**调用它的那个任务**占用 (N - 40) × 60ms：
  *      · 提醒音乐 82 帧 → 2.52 秒
- *      · medicine 176 帧 → **8.16 秒**
- *      · todo     177 帧 → **8.22 秒**
+ *      · medicine 135 帧 → **5.70 秒**（2026-11-04 话术缩短后；原 176 帧 = 8.16 秒）
+ *      · todo     135 帧 → **5.70 秒**（原 177 帧 = 8.22 秒）
  *    在 elder_input 任务（按键）上占用 8 秒，会把「长按 3 秒」的判定挤歪；
  *    在主事件循环上占用，至少还能保证调用方不被自己的栈压穿。
  *    ⇒ 新增任何"播一段东西"的地方，都必须走 Schedule，不许就地 PlaySound。
  *
  *    安全性已核实（2026-11-03，值取自 build/config/sdkconfig.h）：
  *    `CONFIG_ESP_TASK_WDT_TIMEOUT_S=10`、`CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=1`、
- *    `..._CPU1=1` —— idle 任务**是**被看门狗盯着的。但这里的 8.16 秒是
+ *    `..._CPU1=1` —— idle 任务**是**被看门狗盯着的。但这里的 5.70 秒（2026-11-04 话术缩短后的最大值，此前 8.16 秒）是
  *    `audio_queue_cv_.wait()` 的**阻塞等待**，任务进 Blocked 态会主动让出 CPU，
  *    idle 任务照常运行、照常喂狗；只有"忙等/不阻塞"才会饿死 idle。
  *    另外 `CONFIG_ESP_TASK_WDT_PANIC` 未开启 ⇒ 即使真的超时也只打警告不重启。
