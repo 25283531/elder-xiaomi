@@ -1365,6 +1365,30 @@ void LcdDisplay::SetStatusClock(const char* text) {
         ESP_LOGI(TAG, "状态栏 WiFi 图标已刷新（rssi 档位变化或首次设置）");
     }
 
+    /* 一次性诊断（2026-11-03）：真机上 WiFi 图标看不见。
+     *
+     * 两种原因在屏上是**同一个现象**，靠猜分不出来：
+     *   ① 文本压根没设（network_label_ 一直空）→ net_text=空
+     *   ② 文本设了，但 label 被 flex 压成 0 宽 → net_text=非空 net_w=0
+     * 所以一次把文本有无、label 宽高、父容器（right_icons）宽与 x、状态栏宽
+     * 全打出来。只打一次：这条日志是排查用的，不该每 10 秒刷屏。 */
+    {
+        static bool diag_done = false;
+        if (!diag_done && network_label_ != nullptr) {
+            diag_done = true;
+            lv_obj_t* parent = lv_obj_get_parent(network_label_);
+            const char* t = lv_label_get_text(network_label_);
+            ESP_LOGW(TAG, "状态栏诊断: net_text=%s net_w=%d net_h=%d "
+                     "right_w=%d right_x=%d bar_w=%d",
+                     (t != nullptr && t[0] != '\0') ? "非空" : "空",
+                     (int)lv_obj_get_width(network_label_),
+                     (int)lv_obj_get_height(network_label_),
+                     parent != nullptr ? (int)lv_obj_get_width(parent) : -1,
+                     parent != nullptr ? (int)lv_obj_get_x(parent) : -1,
+                     top_bar_ != nullptr ? (int)lv_obj_get_width(top_bar_) : -1);
+        }
+    }
+
     time_t now = time(NULL);
     struct tm* tm = localtime(&now);
     if (tm == nullptr || tm->tm_year < 2025 - 1900) {
