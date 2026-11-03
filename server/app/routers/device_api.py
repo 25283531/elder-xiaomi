@@ -590,12 +590,18 @@ def report_event(payload: EventReportIn, db: Session = Depends(get_db),
     # 「恰好 1 条候选 + 该条只有 1 味药」，多候选/多味药时不再下发空参数确认。
     ev.state = payload.state
     # 语音确认 = 半置信，按键确认 = 全置信（2026-10-27 用户定义）。
-    # 同一条提醒实例设备会报两次：先 method=VOICE（老人说「我吃过了」），
-    # 再 method=BUTTON（长按 3 秒复核）。这里把"先语音、后按键"合并成
-    # VOICE_AND_BUTTON(5)，而不是让后到的直接覆盖：
+    # 同一条提醒实例设备会报两次，而两次的**先后两种顺序都真实存在**：
+    #   * 旧流程：先 method=VOICE（老人说「我吃过了」），再 BUTTON（长按复核）；
+    #   * 新流程（2026-11-03）：老人先长按发起（那次回执报 BUTTON），"吃了
+    #     哪味药"在随后的对话里说清，服务端确认后设备再报一次。
+    # 这里把「库里的 VOICE」+「这次的 BUTTON」合并成 VOICE_AND_BUTTON(5)，
+    # 而不是让后到的直接覆盖：
     #   * 覆盖 ⇒ 子女端只看到「按键确认」，丢掉"语音也确认过"这个事实，
     #     也看不出老人是"自己说的"还是"被催着按的"；
-    #   * 反过来（先按键、后语音）保持 BUTTON：按键已是全置信，不该被降级。
+    #   * 反过来（库里已是 BUTTON、这次又是 VOICE）保持 BUTTON：按键已是全置信，
+    #     不该被降级。
+    # ⚠️ 触发前提：服务端必须先于设备回执把库里的 method 落成 VOICE ——
+    # 由 ``voice/tools._confirm_reminder`` 在 commit 之前保证（那里有说明）。
     _method = payload.confirm_method
     # ⚠️ 逐味确认（2026-11-03）后同一个 ``(reminder_id, due_at)`` 实例会**多次**
     # 上报（每确认一味一条），下面这条「先 VOICE 后 BUTTON 合并成
@@ -610,7 +616,12 @@ def report_event(payload: EventReportIn, db: Session = Depends(get_db),
     ):
         _method = int(ConfirmMethod.VOICE_AND_BUTTON)
         if not ev.note:
-            ev.note = "语音确认后半置信，按键复核"
+            # 措辞必须**中性、不带先后**：``note`` 会随 EventOut 给到家属端，
+            # 而两种顺序都真实存在（见上）。写成「先语音后按键」在新流程里正好
+            # 说反了 —— 家属会以为老人是被催着按键复核的，而实际是老人自己按
+            # 键发起、在对话里说清了药名。也不能再写「半置信」：走到这里结果
+            # 已经是全置信。
+            ev.note = "语音确认 + 按键确认（全置信）"
     ev.confirm_method = _method
     # 逐味确认：把这次点名的药记进 ``confirmed_medicines``（去重、保持顺序）。
     # **只做这一件事** —— 不在这里推导 state（"全确认才算 CONFIRMED"属于状态机

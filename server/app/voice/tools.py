@@ -1300,6 +1300,45 @@ def _confirm_reminder(db: Any, device_pk: int, device_call: Any,
     if complete:
         ev.state = int(models.EventState.CONFIRMED)
         ev.confirmed_at = now
+        # ---------------------------------------------------------------
+        # 下面这一行是「按键发起 + 对话确认 = 全置信(5)」能算出来的**唯一前提**。
+        #
+        # ⚠️ 顺序依赖（动它之前务必读完）：
+        #   ① 必须在下面 ``db.commit()`` **之前**赋值；
+        #   ② 必须在 ``device_call("self.elder.confirm_reminder", ...)``
+        #      **之前**赋值（commit 在前、通知设备在其后，见本函数尾部）。
+        # 设备回执到达时 ``routers/device_api.report_event`` 拿**库里的值**判断
+        # 是否合并：``payload.method == BUTTON and ev.method == VOICE``
+        # ⇒ 落 ``VOICE_AND_BUTTON(5)``。赋值晚一步（挪到 commit 之后、或挪到
+        # device_call 之后），设备那条 CONFIRMED+BUTTON 回执就先到、读到的还是
+        # NONE/BUTTON ⇒ 合并永不触发，全置信永远算不出来。而且它**不报错、
+        # 不告警**，只是家属端一直显示「按键确认」。
+        #
+        # 为什么是**无条件覆盖**（即使库里已经是 BUTTON）：新流程里老人先按键
+        # 发起，固件在"按键发起"那次回执里报的就是 BUTTON(2)，库里因此可能已经
+        # 是 BUTTON。这里必须改回 VOICE，否则上面的合并条件不成立。按用户
+        # 2026-11-03 的定义，那次按键只负责"发起"，"吃的是哪味药"是在对话里
+        # 说清的 ⇒ 属于「按键 + 语音」，不是「纯按键」。
+        #
+        # ⚠️ 第二个前提：``ev`` 必须是设备回执会命中的**同一条实例**。
+        # report_event 按 ``(reminder_id, due_at)`` 定位，定位不到就补建一条新
+        # 实例（device_api.py:568-577），补建那条的 method 是 NONE ⇒ 合并同样
+        # 不会发生，全置信丢失且静默。所以 ``ev.due_at`` 必须与设备上报的
+        # due_at 逐字相等（前提：设备时区 == 规则时区，见 report_event 的
+        # docstring）。时区不一致属于固件侧待补（设备上报自己的时区），这里
+        # 不做兜底 —— 兜底就得猜，猜错的代价是把 A 的确认记到 B 头上。
+        #
+        # ---- 纯对话确认（VOICE=1）的口径，别再"顺手升级" ----
+        # 老人没按过任何键、只跟小智说「我吃过了 / 降压药吃了」时，落到这里就是
+        # **最终结果** VOICE：固件走 ``force_done`` 直接落 DONE（不再进半置信的
+        # HALF_CONFIRMED，也不需要老人再按一次键），回执 method=VOICE，库里是 1。
+        # 依从率统计里 VOICE 与 VOICE_AND_BUTTON **都算已确认**（home.py 的
+        # ``confirmed_count`` 只数 ``state == CONFIRMED``，不看 method），两者
+        # 的区别只在审计留痕与家属端的展示口径。
+        # 将来若要按置信度加权算依从率，入口就是这一行 —— 但**现在不要改统计
+        # 口径**：存量数据会被整体重算，历史依从率一夜之间变化，家属会以为老人
+        # "突然不听话了"。
+        # ---------------------------------------------------------------
         ev.confirm_method = int(models.ConfirmMethod.VOICE)
     elif ev.state == int(models.EventState.PENDING):
         # 已到点却还是 PENDING：按"响过了"记。否则它留在 PENDING 里，
