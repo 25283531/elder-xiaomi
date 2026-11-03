@@ -1507,9 +1507,17 @@ void LcdDisplay::AntiBurnInStep() {
          *      reminder_overlay_ 晚就会画在卡片**上面** —— 老人看到"提醒卡片
          *      上飘着两个表情"。StartIdleMarquee() 里也拦了，但那是最后一道，
          *      挡不住下面那条静态兜底轮播；
-         *   2) 下面那条静态兜底每 20 秒给 emoji_image_ 换一次 src。它被卡片
-         *      完全盖住看不见，纯属白解一次 PNG（CONFIG_LV_CACHE_DEF_SIZE=0，
-         *      没有图片缓存，每次都是完整的 lodepng 解码）。4 小时 = 720 次。
+         *   2) 下面那条静态兜底会调 SetEmotion() 换一次表情。它被卡片完全
+         *      盖住看不见，代价却照付：SetEmotion 里 lv_image_set_src +
+         *      取消 HIDDEN ⇒ 被遮住的那块图片区仍然要被标脏、重绘一遍
+         *      （LVGL 没有遮挡剔除）；顺带还把 emoji_box_ 重新取消隐藏 ——
+         *      现在靠"卡片尺寸恰好盖住它"才看不见，这是隐式前提，不该留。
+         *      触发频率约 60 秒一次（不是定时器的 20 秒：SetEmotion 会把
+         *      last_ui_change_tick_ 重置，本函数下次还得重新等满 60 秒），
+         *      4 小时约 240 次。
+         *      ⚠️ 这里**不是** PNG 解码的代价：表情 2026-11-02 起是 cbin
+         *      裸 RGB565A8、零解码。assets.cc 里那条 "CONFIG_LV_CACHE_DEF_SIZE=0
+         *      ⇒ 每次重绘都 lodepng 重解" 说的是**旧 PNG 路径**，别套过来。
          *
          * 判据用 overlay 的**可见性**，不用"有没有待处理的提醒"：这张卡片
          * 的显隐只由 ShowReminder / HideReminder 改，两者都持同一把锁。 */
