@@ -21,6 +21,17 @@
 
 #define TAG "Application"
 
+/* ---- 字幕对齐参数（2026-11-03）-----------------------------------------
+ * 轮询 50ms：一帧音频 60ms，所以「判据成立」到「真的画上去」之间最多
+ * 差 50ms，老人感知不到。再密就是白烧 CPU（LVGL 刷一屏也要时间）。
+ *
+ * 兜底 6 秒：一句 20 字左右的中文播报差不多就是这个长度。真等到这个
+ * 数说明本句**根本没有音频**（TTS 失败被跳过 / 帧被丢 / 被打断），
+ * 此时宁可字幕早一点也不让它永远不上屏 —— 所以超时后照常显示并打
+ * WARNING，让这个数在串口日志里可数。 */
+static constexpr int kSubtitlePollMs = 50;
+static constexpr int64_t kSubtitleMaxWaitUs = 6LL * 1000 * 1000;
+
 // >>> BEGIN elder-companion overlay >>>
 // VAD 边沿（老人开口 / 说完）转发给 elder 灯效模块。
 // 定义在 components/elder/src/elder_bridge.cc；elder 组件没有对外头文件，
@@ -147,6 +158,21 @@ Application::Application() {
         .skip_unhandled_events = true
     };
     esp_timer_create(&clock_timer_args, &clock_timer_handle_);
+
+    /* 字幕对齐轮询器：只在有 pending 字幕时才跑（见 QueueSubtitle）。
+     * 回调只做一件事 —— 把「检查」丢回主任务，避免在 esp_timer 任务里
+     * 碰 display / pending_subtitles_。 */
+    esp_timer_create_args_t subtitle_timer_args = {
+        .callback = [](void* arg) {
+            Application* app = (Application*)arg;
+            app->Schedule([app]() { app->FlushSubtitles(false); });
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "subtitle_sync",
+        .skip_unhandled_events = true
+    };
+    esp_timer_create(&subtitle_timer_args, &subtitle_timer_handle_);
 }
 
 Application::~Application() {
@@ -154,7 +180,74 @@ Application::~Application() {
         esp_timer_stop(clock_timer_handle_);
         esp_timer_delete(clock_timer_handle_);
     }
+    if (subtitle_timer_handle_ != nullptr) {
+        esp_timer_stop(subtitle_timer_handle_);
+        esp_timer_delete(subtitle_timer_handle_);
+    }
     vEventGroupDelete(event_group_);
+}
+
+/* ---------------------------------------------------------------- 字幕对齐
+ * 三件事：入队（收到 sentence_start）、判据成立就上屏（轮询）、
+ * 一轮结束时收尾（tts stop 强制清空 / tts start 丢弃上一轮残句）。
+ * 详见 application.h 里 PendingSubtitle 的说明。
+ * ---------------------------------------------------------------------- */
+void Application::QueueSubtitle(const std::string& text, int frame_mark) {
+    pending_subtitles_.push_back(PendingSubtitle{text, frame_mark, esp_timer_get_time()});
+    if (subtitle_timer_handle_ != nullptr &&
+        !esp_timer_is_active(subtitle_timer_handle_)) {
+        esp_timer_start_periodic(subtitle_timer_handle_, kSubtitlePollMs * 1000);
+    }
+    // 门可能已经开了（本句音频先于字幕到达 / 队列本来就是空的），
+    // 那就立刻上屏，不要白等一个 50ms 周期。
+    FlushSubtitles(false);
+}
+
+void Application::FlushSubtitles(bool force) {
+    auto display = Board::GetInstance().GetDisplay();
+    if (display == nullptr) {
+        pending_subtitles_.clear();
+        return;
+    }
+
+    const int played = audio_service_.PlayedFrameCount();
+    const int64_t now_us = esp_timer_get_time();
+
+    while (!pending_subtitles_.empty()) {
+        auto& p = pending_subtitles_.front();
+        const int64_t waited_us = now_us - p.queued_us;
+        const bool audio_started = played > p.frame_mark;
+        const bool timed_out = waited_us >= kSubtitleMaxWaitUs;
+        if (!audio_started && !timed_out && !force) {
+            break;
+        }
+        if (!audio_started) {
+            /* 走到这里只有两种可能：本句没有音频（TTS 失败/丢帧/打断），
+             * 或者这一轮被强制收尾。两者都说明「等声音」这条路走不通了，
+             * 必须让字先出来 —— 但要在日志里留下证据，否则下次调参时
+             * 又只能靠猜。 */
+            ESP_LOGW(TAG, "subtitle shown without audio: mark=%d played=%d waited=%lldms%s",
+                     p.frame_mark, played, (long long)(waited_us / 1000),
+                     force ? " (forced)" : " (timeout)");
+        } else {
+            ESP_LOGI(TAG, "subtitle synced: waited=%lldms mark=%d played=%d",
+                     (long long)(waited_us / 1000), p.frame_mark, played);
+        }
+        display->SetChatMessage("assistant", p.text.c_str());
+        pending_subtitles_.pop_front();
+    }
+
+    if (pending_subtitles_.empty() && subtitle_timer_handle_ != nullptr &&
+        esp_timer_is_active(subtitle_timer_handle_)) {
+        esp_timer_stop(subtitle_timer_handle_);
+    }
+}
+
+void Application::ClearPendingSubtitles() {
+    pending_subtitles_.clear();
+    if (subtitle_timer_handle_ != nullptr && esp_timer_is_active(subtitle_timer_handle_)) {
+        esp_timer_stop(subtitle_timer_handle_);
+    }
 }
 
 void Application::CheckAssetsVersion() {
@@ -575,12 +668,18 @@ void Application::Start() {
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this]() {
                     aborted_ = false;
+                    // 新一轮开始：上一轮没来得及上屏的残句直接丢（它们属于
+                    // 已经结束/被打断的那一轮，等它们的音频永远等不到）。
+                    ClearPendingSubtitles();
                     if (device_state_ == kDeviceStateIdle || device_state_ == kDeviceStateListening) {
                         SetDeviceState(kDeviceStateSpeaking);
                     }
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
+                    // 收尾：本句音频已经播完，还没上屏的字现在就该出来，
+                    // 否则老人只能看到"说到一半"的字幕。
+                    FlushSubtitles(true);
                     if (device_state_ == kDeviceStateSpeaking) {
                         if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
@@ -593,8 +692,14 @@ void Application::Start() {
                 auto text = cJSON_GetObjectItem(root, "text");
                 if (cJSON_IsString(text)) {
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
-                    Schedule([this, display, message = std::string(text->valuestring)]() {
-                        display->SetChatMessage("assistant", message.c_str());
+                    /* ⚠️ frame_mark 必须在这里（协议任务）取，不能放进
+                     * Schedule 回调里取：回调跑起来时后续音频帧可能已经
+                     * 收进来了，门就提前打开，字幕又跑回声音前面 —— 那正是
+                     * 这次要修的现象。取到的是「本句音频之前已收的帧数」，
+                     * 因为控制消息和音频帧共用同一条 FIFO、按序到达。 */
+                    const int frame_mark = audio_service_.ReceivedFrameCount();
+                    Schedule([this, message = std::string(text->valuestring), frame_mark]() {
+                        QueueSubtitle(message, frame_mark);
                     });
                 }
             }
@@ -810,6 +915,14 @@ void Application::OnWakeWordDetected() {
 void Application::AbortSpeaking(AbortReason reason) {
     ESP_LOGI(TAG, "Abort speaking");
     aborted_ = true;
+    /* 打断时把还没上屏的字幕丢掉：它们的音频不会再来（服务端已停止推流），
+     * 留着只会在下一轮开头突然冒出一句上一轮的半截话。
+     *
+     * ⚠️ 必须走 Schedule 而不是直接清：AbortSpeaking 会被**按键任务 /
+     * elder 任务**调用（老人按键打断走的就是这条），而 pending_subtitles_
+     * 是主任务独占的 std::deque —— 跨任务直接 clear 是数据竞争，
+     * 表现是偶发崩溃或字幕列表错乱，且与按键时机强相关、极难复现。 */
+    Schedule([this]() { ClearPendingSubtitles(); });
     if (protocol_) {
         protocol_->SendAbortSpeaking(reason);
     }

@@ -96,6 +96,18 @@ TARGETS = {
     # ⚠️ 它属于 main 组件，-I 集合与 elder 组件不同 —— 靠 base_command() 优先
     #    用该文件自己那条命令来保证正确（回退模板会给出一堆假红）。
     "lcd_display.cc": ROOT / "firmware" / "xiaozhi" / "main" / "display" / "lcd_display.cc",
+    # 2026-11-03 加：字幕与语音对齐改了两个**最不能出错**的文件。
+    #   * audio_service.cc —— 下行播放链路的唯一入口/出口，这里加一行
+    #     计数写错（写进错的分支、加在 OutputData 之前）的后果是
+    #     "字幕永不显示"或"字幕抢跑一帧"，而且**编译不报错**；
+    #   * application.cc —— 协议消息 → 状态机 → 显示的总入口，
+    #     lambda 捕获/成员初始化写错同样编译期无感。
+    # 两者都属于 main 组件，-I 集合与 elder 不同，靠 base_command() 优先用
+    # 各自那条命令（回退模板会给出一堆假红）。
+    # ⚠️ 这两个文件是本项目里**最贵**的编译单元：application.cc 一旦编译
+    #    失败，整台设备起不来（不是某个功能没有），所以提交前必须先过这里。
+    "application.cc": ROOT / "firmware" / "xiaozhi" / "main" / "application.cc",
+    "audio_service.cc": ROOT / "firmware" / "xiaozhi" / "main" / "audio" / "audio_service.cc",
 }
 
 #: 需要确保存在的宏（见坑 3）。

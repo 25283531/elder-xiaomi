@@ -299,6 +299,10 @@ void AudioService::AudioOutputTask() {
             codec_->EnableOutput(true);
         }
         codec_->OutputData(task->pcm);
+        /* 字幕对齐计数：写进 codec 才算「老人真的听到」。
+         * 放在 OutputData 之后而不是之前 —— OutputData 内部会阻塞到 DMA
+         * 有空位，之后才真正开始响；提前 +1 会让字幕抢跑一帧（60ms）。 */
+        played_frames_.fetch_add(1, std::memory_order_relaxed);
 
         /* Update the last output time */
         last_output_time_ = std::chrono::steady_clock::now();
@@ -454,6 +458,10 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
         }
     }
     audio_decode_queue_.push_back(std::move(packet));
+    /* 字幕对齐计数（见 audio_service.h 里 ReceivedFrameCount 的说明）。
+     * 只 +1，不加锁、不做任何判断 —— 这里在 ssl_receive 任务里，任何
+     * 多余的等待都可能反压到音频通路，宁可只写一个 atomic。 */
+    received_frames_.fetch_add(1, std::memory_order_relaxed);
     audio_queue_cv_.notify_all();
     return true;
 }
