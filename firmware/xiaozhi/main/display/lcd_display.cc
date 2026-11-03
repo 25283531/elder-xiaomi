@@ -1610,13 +1610,43 @@ void LcdDisplay::IdleMarqueeExecCb(void* var, int32_t x) {
      * 也不用 start_cb：repeat 不走 start_cb，只在首次启动时调。 */
     if (x > self->idle_marquee_last_x_) {
         self->AdvanceIdleMarqueeImage();
+        self->AdvanceIdleMarqueeImage();   /* 第二张也要跟着换（见下） */
     }
     self->idle_marquee_last_x_ = x;
     lv_obj_set_x(self->idle_marquee_image_, x);
+
+    /* 第二张图**错开半个行程**：设计稿（mock-3）主区里同时能看到 3~4 个圆，
+     * 而只放一张的话，任何时刻屏上只有一个 60px 的圆漂在 320px 的空场里，
+     * 观感是"有个东西在飘"而不是"表情依次移过"。
+     *
+     * 用同一个 lv_anim 驱动两张、而不是给第二张另起一条动画：lv_anim_start
+     * 会 remove_concurrent_anims（同 var + 同 exec_cb），同一对 (this, cb)
+     * 只能存在一条；要两条就得再写一个 exec_cb，还要保证两条动画的相位
+     * 永远不漂移。一个回调里算两个 x 最省事，也天然同步。
+     *
+     * 越界回绕：x2 = x + half，x 从 LV_HOR_RES 走到 -img_w，所以 x2 会跑到
+     * 屏幕右侧之外 —— 减一个 track 把它接回左缘外，视觉上就是"前一张还在
+     * 屏中、后一张刚从右缘进来"。 */
+    if (self->idle_marquee_image2_ != nullptr) {
+        const int32_t track = LV_HOR_RES + self->idle_marquee_size_;
+        int32_t x2 = x + track / 2;
+        if (x2 > LV_HOR_RES) {
+            x2 -= track;
+        }
+        lv_obj_set_x(self->idle_marquee_image2_, x2);
+    }
 }
 
 void LcdDisplay::AdvanceIdleMarqueeImage() {
-    if (idle_marquee_ready_.empty() || idle_marquee_image_ == nullptr) {
+    if (idle_marquee_ready_.empty()) {
+        return;
+    }
+    /* 两张图轮流填：一次回绕时 exec 回调会连调本函数两次，
+     * 正好把 image_ 与 image2_ 都换成新的、且两张不是同一个表情。 */
+    lv_obj_t* target = idle_marquee_second_turn_ ? idle_marquee_image2_
+                                                 : idle_marquee_image_;
+    idle_marquee_second_turn_ = !idle_marquee_second_turn_;
+    if (target == nullptr) {
         return;
     }
     auto* theme = static_cast<LvglTheme*>(current_theme_);
@@ -1635,7 +1665,7 @@ void LcdDisplay::AdvanceIdleMarqueeImage() {
             ESP_LOGW(TAG, "待机跑马灯：表情 \"%s\" 取不到图，跳过", name);
             continue;
         }
-        lv_image_set_src(idle_marquee_image_, image->image_dsc());
+        lv_image_set_src(target, image->image_dsc());
         return;
     }
 }
@@ -1643,6 +1673,19 @@ void LcdDisplay::AdvanceIdleMarqueeImage() {
 bool LcdDisplay::StartIdleMarquee() {
     if (idle_marquee_running_) {
         return true;
+    }
+    /* 全屏提醒正挂着 ⇒ 绝不开播。
+     *
+     * 为什么必须在这里拦（2026-11-03）：AntiBurnInStep 每 20 秒检查一次
+     * 「待机 + 60 秒无 UI 变化就开播」，而提醒挂 4 小时期间设备一直是待机、
+     * 界面也不变 —— 它会在提醒挂上 60 秒后把跑马灯重新拉起来。
+     * 旧实现的图挂在 emoji_box_ 底下，只是白烧 CPU（被 overlay 盖住看不见）；
+     * 现在两张图是 screen 的直接子对象，一旦建得比 reminder_overlay_ 晚
+     * （提醒先来、第一次待机后到），就会画在卡片**上面** ——
+     * 老人看到"提醒卡片上飘着两个表情"。 */
+    if (reminder_overlay_ != nullptr &&
+        !lv_obj_has_flag(reminder_overlay_, LV_OBJ_FLAG_HIDDEN)) {
+        return false;
     }
     if (emoji_box_ == nullptr) {
         ESP_LOGW(TAG, "待机跑马灯：图片区还没建好，不启动");
@@ -1699,10 +1742,21 @@ bool LcdDisplay::StartIdleMarquee() {
         lv_image_set_inner_align(idle_marquee_image_, LV_IMAGE_ALIGN_CONTAIN);
         lv_obj_add_flag(idle_marquee_image_, LV_OBJ_FLAG_HIDDEN);
     }
+    if (idle_marquee_image2_ == nullptr) {
+        idle_marquee_image2_ = lv_image_create(lv_screen_active());
+        lv_obj_set_style_pad_all(idle_marquee_image2_, 0, 0);
+        lv_obj_set_style_border_width(idle_marquee_image2_, 0, 0);
+        lv_image_set_inner_align(idle_marquee_image2_, LV_IMAGE_ALIGN_CONTAIN);
+        lv_obj_add_flag(idle_marquee_image2_, LV_OBJ_FLAG_HIDDEN);
+    }
     lv_obj_set_size(idle_marquee_image_, img_sz, img_sz);
     lv_obj_set_y(idle_marquee_image_, img_y);
+    lv_obj_set_size(idle_marquee_image2_, img_sz, img_sz);
+    lv_obj_set_y(idle_marquee_image2_, img_y);
+    idle_marquee_size_ = img_sz;
 
     idle_marquee_next_ = 0;
+    idle_marquee_second_turn_ = false;
     const LvglImage* first = collection->GetEmojiImage(idle_marquee_ready_[0]);
     if (first == nullptr) {
         /* 上面刚校验过，走到这里说明这一瞬间主题换了 —— 交给下一轮兜底 */
@@ -1711,6 +1765,18 @@ bool LcdDisplay::StartIdleMarquee() {
     }
     lv_image_set_src(idle_marquee_image_, first->image_dsc());
     idle_marquee_next_ = 1 % idle_marquee_ready_.size();
+
+    /* 第二张的初始表情取列表里的下一张；只有一张可用时就是同一张
+     * （此时两张错开半个行程仍然有"依次移过"的观感，只是图案相同）。 */
+    {
+        const LvglImage* second = collection->GetEmojiImage(
+            idle_marquee_ready_[idle_marquee_next_]);
+        if (second == nullptr) {
+            second = first;
+        }
+        lv_image_set_src(idle_marquee_image2_, second->image_dsc());
+        idle_marquee_next_ = (idle_marquee_next_ + 1) % idle_marquee_ready_.size();
+    }
 
     if (emoji_image_ != nullptr) {
         lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
@@ -1725,6 +1791,7 @@ bool LcdDisplay::StartIdleMarquee() {
         lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
     }
     lv_obj_remove_flag(idle_marquee_image_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(idle_marquee_image2_, LV_OBJ_FLAG_HIDDEN);
 
     /* x 从屏幕右缘之外开始（对象左边缘 = LV_HOR_RES ⇒ 整张在屏外），
      * 匀速左移到 -img_w（对象右边缘 = 0 ⇒ 整张移出左边缘）。一条 lv_anim
@@ -1791,8 +1858,16 @@ void LcdDisplay::StopIdleMarquee() {
             lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
         }
     }
+    /* 第二张也要藏起来并断开 src：只藏第一张的话，屏上会永远留着半个
+     * 圆停在它最后一次算出来的 x 上 —— 表现为"待机指示灯走了，但屏幕上
+     * 还粘着一个表情"，而且它盖在所有内容上面（是 screen 的直接子对象）。 */
+    if (idle_marquee_image2_ != nullptr) {
+        lv_obj_add_flag(idle_marquee_image2_, LV_OBJ_FLAG_HIDDEN);
+        lv_image_set_src(idle_marquee_image2_, nullptr);
+    }
     idle_marquee_last_x_ = 0;
     idle_marquee_next_ = 0;
+    idle_marquee_second_turn_ = false;
 }
 
 /* 进入待机：立即开播待机跑马灯，**不**等防烧屏的 60 秒。
