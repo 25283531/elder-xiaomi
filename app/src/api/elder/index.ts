@@ -36,6 +36,37 @@ export interface ActivationCode {
 }
 
 /**
+ * 「这台设备现在按哪个时区」—— GET /api/devices/{pk}/timezone。
+ *
+ * 为什么要问服务端、而不是用手机自己的时区：提醒是**从设备上响出来**的，
+ * "早上 8 点吃药"指的是老人眼前那个钟的 8 点。家属手机在北美、设备在非洲
+ * 时，按手机时区填的 8 点会整整错 7 小时 —— 这是服药提醒，错小时是安全问题。
+ *
+ * ⚠️ `hint` 是**服务端拼好的整句**，直接渲染，前端不许自己拼：网页
+ * （static/user.html）与 APP 是两套前端，同一句话各拼一遍必然漂移。
+ */
+export interface DeviceTimezone {
+  /** false = 判不出来（设备没上报过公网 IP / 在内网后面）。**不是错误** */
+  ok: boolean
+  device_pk: number
+  /** IANA 名，如 Africa/Lagos；判不出来是空串 */
+  timezone: string
+  /** 该时区相对 UTC 的偏移分钟（东为正） */
+  offset_minutes: number
+  /** 相对**北京时间**的偏差分钟（正 = 比北京早）。非洲拉各斯 = -420 */
+  offset_from_beijing_min: number
+  /** 大洲中文名，如「非洲」 */
+  region: string
+  country: string
+  /** 判定来源：proxy / geoip / api / device / default / '' */
+  source: string
+  /** 该时区此刻的墙上时间（ISO，带偏移） */
+  local_now: string
+  last_seen_at: string | null
+  hint: string
+}
+
+/**
  * 一条提醒里的**一味药**（2026-11 起支持一条提醒带多种药）。
  *
  * 服务端约束：`name` ≤ 32 字符、`dose` ≤ 64 字符、一条提醒**最多 4 项**、
@@ -77,6 +108,15 @@ export interface Reminder {
   confirm_methods: string[]
   enabled: boolean
   next_fire_at: string | null
+  /**
+   * 这条规则的钟点按哪个时区解释（IANA 名）。空串 = 历史数据 = 服务端 TZ。
+   *
+   * ⚠️ **只读**：服务端按「设备 IP 判定的时区」自动填，客户端不传也不该传
+   * （传了也会被 `_reminder_tz` 的显式分支覆盖 —— 只有"确实要改时区"时才传）。
+   */
+  tz?: string
+  /** 相对**北京时间**的偏差分钟（正 = 比北京早）。服务端算的派生值，只读。 */
+  tz_offset_min?: number
   /* ---- 软删除（2026-10 起）：删掉的提醒仍在库里，可查、可恢复 ---- */
   deleted_at: string | null
   deleted_by: number | null
@@ -241,6 +281,16 @@ export function deleteDevice(devicePk: number) {
 
 export function deviceEvents(devicePk: number, limit = 50) {
   return elderGet<ReminderEvent[]>(`/api/devices/${devicePk}/events`, { limit })
+}
+
+/**
+ * 这台设备按哪个时区提醒（新建提醒前给家属看）。
+ *
+ * 只读、幂等、不改库：服务端按 `Device.ip` 现判一次。判不出来时照常 200，
+ * `ok=false` 且 `hint` 说明会退回哪个兜底时区 —— **不要**把它当错误弹 toast。
+ */
+export function deviceTimezone(devicePk: number) {
+  return elderGet<DeviceTimezone>(`/api/devices/${devicePk}/timezone`)
 }
 
 // ============================================================ 提醒
