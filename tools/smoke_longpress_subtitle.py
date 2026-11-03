@@ -123,9 +123,17 @@ def t2_long_press_wiring() -> None:
           "顺序反了 ⇒ 仍然先走 TTS")
 
     # 片段不可用 / 开不了麦时必须还能退回原路径，不能变成"按了没反应"。
-    check("if (med_n == 0 && !CanStartDialog())" in b,
-          "药数未知 + 开不了麦 ⇒ 退回直接确认（fail-safe）",
+    #
+    # 判据 2026-11-03 晚从 CanStartDialog() 换成 CanPlayClip()：前者要求
+    # kDeviceStateIdle，而 realtime 对话期间设备一直停在 kDeviceStateListening
+    # ⇒ 长按 3 秒既播不出片段、也进不了这条 fail-safe，现场就是**一片安静**。
+    # CanPlayClip() 放行 Idle 与 Listening，只排除 Speaking/Connecting。
+    check("if (med_n == 0 && !CanPlayClip())" in b,
+          "药数未知 + 播不了片段 ⇒ 退回直接确认（fail-safe）",
           "删掉这条会让离线老人按了没反应")
+    check("if (med_n == 0 && !CanStartDialog())" not in b,
+          "fail-safe 不再用 CanStartDialog()（Listening 态会被判成开不了麦）",
+          "回到 CanStartDialog ⇒ 对话中长按服药键静默无响应")
 
 
 def t3_subtitle_accumulate() -> None:

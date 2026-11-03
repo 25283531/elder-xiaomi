@@ -19,6 +19,7 @@
 
 #include <string.h>
 #include <stdio.h>     /* snprintf：R3 的反向对账要重建全屏文案 */
+#include <stddef.h>    /* ptrdiff_t：med_line_of() 用指针差反查下标 */
 #include <time.h>
 
 static const char *TAG = "elder.reminder";
@@ -100,6 +101,10 @@ static struct {
      *    留着就会「拿错药名去确认」，比未知更危险）。 */
     uint8_t           med_count[ELDER_REMINDER_MAX];
     elder_med_name_t  med_name[ELDER_REMINDER_MAX];
+    /* 「药名 剂量」显示行（2026-11-03 用户实报「服药提醒页只有标题，没有
+     * 种类和剂量」）。与 med_name 同生命周期、同 RAM-only 约束。
+     * 16×96 = 1.5KB；不放函数栈（elder_sync 任务栈 8KB，见 MEMORY 第 7 条）。 */
+    elder_med_line_t  med_line[ELDER_REMINDER_MAX];
 } g;
 
 static int64_t now_us(void);
@@ -1598,6 +1603,7 @@ int elder_reminder_first_ringing(void)
 
 void elder_reminder_set_med_info(const uint8_t *counts,
                                  const elder_med_name_t *first_names,
+                                 const elder_med_line_t *lines,
                                  uint8_t n)
 {
     if (n > ELDER_REMINDER_MAX) n = ELDER_REMINDER_MAX;
@@ -1606,6 +1612,7 @@ void elder_reminder_set_med_info(const uint8_t *counts,
      * 否则缩表后残留的旧药名会被长按分支读走。 */
     memset(g.med_count, 0, sizeof(g.med_count));
     memset(g.med_name, 0, sizeof(g.med_name));
+    memset(g.med_line, 0, sizeof(g.med_line));
 
     if (counts == NULL) return;
     for (uint8_t i = 0; i < n; i++) {
@@ -1625,6 +1632,10 @@ void elder_reminder_set_med_info(const uint8_t *counts,
             memcpy(g.med_name[i], first_names[i], ELDER_MED_NAME_MAX);
             g.med_name[i][ELDER_MED_NAME_MAX] = '\0';
         }
+        if (lines != NULL) {
+            memcpy(g.med_line[i], lines[i], ELDER_MED_LINE_MAX);
+            g.med_line[i][ELDER_MED_LINE_MAX] = '\0';
+        }
     }
 }
 
@@ -1640,6 +1651,12 @@ const char *elder_reminder_first_med_name(uint8_t idx)
 {
     if (idx >= ELDER_REMINDER_MAX || idx >= g.table.count) return "";
     return g.med_name[idx];
+}
+
+const char *elder_reminder_med_line(uint8_t idx)
+{
+    if (idx >= ELDER_REMINDER_MAX || idx >= g.table.count) return "";
+    return g.med_line[idx];
 }
 
 /* 同一分钟内「还在等确认」的提醒条数（含自己）。
@@ -1666,6 +1683,19 @@ static uint8_t pending_same_minute(int64_t due_at)
         }
     }
     return n;
+}
+
+/* 取某条提醒的「药名 剂量」显示行。
+ *
+ * 入参是**表内指针**（两个调用方都传 &g.table.items[idx]），所以用指针差
+ * 反查下标；越界一律当空串 —— 宁可少显示一行，也不能读到别的提醒的药单。
+ * 抽成函数是因为 screen_text 拿不到 idx（保持既有签名，两个调用方都不用改）。 */
+static const char *med_line_of(const elder_rmd_item_t *item)
+{
+    if (item == NULL) return "";
+    const ptrdiff_t off = item - g.table.items;
+    if (off < 0 || off >= g.table.count) return "";
+    return g.med_line[off];
 }
 
 void elder_reminder_screen_text(const elder_rmd_item_t *item, char *out, size_t len)
@@ -1750,7 +1780,31 @@ void elder_reminder_screen_text(const elder_rmd_item_t *item, char *out, size_t 
         }
         snprintf(out, len, "%s\n%s\n%s", head, list, hint);
     } else {
-        snprintf(out, len, "%s\n%s", head, hint);
+        /* 单条提醒：把「药名 剂量」作为明细行插在标题与提示语之间。
+         *
+         * 2026-11-03 用户实报：「服药提醒页面上只显示了标题，没有显示需要
+         * 服药的种类和剂量。」—— 原来单条只有 `标题 + 请及时服用` 两行，
+         * 老人知道"该吃药了"却不知道吃哪种、吃多少，只能去问子女。
+         *
+         * 多条的场合不加这一行：那一屏的明细位已经被逐条清单占满
+         * （见上面 cap 的算式），再塞一行会把清单挤掉 —— 先保证"哪几件事"
+         * 看得全，药名剂量留给单条提醒（现实里同一分钟多条服药提醒极少）。
+         *
+         * ⚠️ 剂量是家属自由输入（可能带换行），必须挡一次：换行会破坏
+         * "一行一件事"的格式契约，让显示层把后半句当成新的明细项。 */
+        char med[ELDER_MED_LINE_MAX + 1];
+        med[0] = '\0';
+        if (item->type == ELDER_RMD_TYPE_MEDICINE) {
+            snprintf(med, sizeof(med), "%s", med_line_of(item));
+            for (char *p = med; *p != '\0'; p++) {
+                if (*p == '\r' || *p == '\n' || *p == '\t') *p = ' ';
+            }
+        }
+        if (med[0] != '\0') {
+            snprintf(out, len, "%s\n%s\n%s", head, med, hint);
+        } else {
+            snprintf(out, len, "%s\n%s", head, hint);
+        }
     }
 }
 

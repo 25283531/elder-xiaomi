@@ -169,7 +169,22 @@ def _norm_utterance(text: str) -> str:
 # 阈值（VOICE_SILENCE_MS 起）—— 每轮 1~3s 是纯静音，白等 0.2~0.7s。
 # VAD 每帧能量本来就在 _feed_vad 里算过，这里只按记录到的语音帧区间切片，
 # 不引入第二次能量计算（同一事实两份实现必然分叉）。
-_TRIM_PAD_FRAMES: Final[int] = 2             # 语音区间前后各留 2 帧 = 120ms，防切掉词头/词尾
+_TRIM_HEAD_PAD_FRAMES: Final[int] = 6        # 词头留 6 帧 = 360ms
+_TRIM_TAIL_PAD_FRAMES: Final[int] = 2        # 词尾留 2 帧 = 120ms
+#: 兼容名：句中断点两侧外扩时两头都按**词头**值算（断点后面是新词的词头，
+#: 那里才是会丢字的地方；尾部多留只是白等 ASR）。
+_TRIM_PAD_FRAMES: Final[int] = _TRIM_HEAD_PAD_FRAMES
+#: ⚠️ 2026-11-03 用户实报「如果我在10秒左右再次说话，前面两个字没有识别到」。
+#:
+#: 头尾原先都是 2 帧（120ms），词头这一侧**太窄**：``_first_speech_frame``
+#: 是 VAD 判"能量过 enter 门限"的第一帧，而老人开口的头一两个字常常是
+#: 轻声（"我""这""嗯"），能量在门限之下 ⇒ 那两帧不被记进语音区间 ⇒
+#: 按 ``first-2`` 切就把这两个字整段切掉，送进 ASR 的音频直接从第三个字
+#: 开始。症状正是"前面两个字没识别到"，而且**每轮都发生、只丢开头**。
+#:
+#: 为什么加长是安全的：多留 240ms 只是多送 240ms 静音，按 230ms/秒的
+#: 实测关系只多 ~55ms 延迟；而切掉词头是**不可逆**的内容损失。
+#: 词尾不加长：那里没有"丢字"风险（静音多留反而让 ASR 更容易断句）。
 _TRIM_MIN_SAVE_MS: Final[int] = 300          # 裁掉总量不足 300ms 就原样发：切片有风险
                                               # （VAD 误判会切掉轻声的词），没收益不担风险
 
@@ -413,6 +428,22 @@ _DISMISS_WEAK_RE: Final[re.Pattern[str]] = re.compile(
     r"睡吧|睡觉吧|我睡了|我要睡了|要睡了|该睡了|去睡了|困了|"
     r"不聊|别聊|不用聊|聊到这儿|聊到这|先这样吧|就这样吧|到此为止|"
     r"不说了|别说了|不用说了|不要再说了|别讲了|别念了|别吵了|别嚷嚷|"
+    # ⚠️ 2026-11-03 用户实报「设备已经应答『有事随时叫我』，但是没有进入待机」。
+    #
+    # 现场（生产日志 22:07:32）：老人说「嗯，我不想说了。」→ 模型**正确**地
+    # 调了 enter_standby → 被 _run_tool 的闸门拒了，日志写着
+    # 「本轮没有待机关键词，拒绝模型发起的待机」，于是设备念完告别语还醒着。
+    #
+    # 为什么「不想说了」漏网：上面只有 ``不说了``（字面三连），而老人说的是
+    # 「不**想说**了」—— 中间多一个"想"就匹配不上。同类的还有"不想聊了"
+    # "不想讲了""没话说""说够了"。
+    #
+    # 放进**弱档**而不是强档，与上面 2026-11-03 那条用户裁决一致：这一档只
+    # 负责"把 enter_standby 工具放开给模型"，是否真待机仍由模型按上下文判
+    # —— "我不想说了"在陪聊里也可能只是"今天不想说这件事"，模型不调工具
+    # 就什么都不会发生。强档只管「退下/待机/闭嘴」这类只能对机器说的祈使句。
+    r"不想说|不想聊|不想讲|不想再聊|不想再说|"
+    r"没什么好说|没啥好说|没话说|说够了|不问了|先不聊|"
     r"小点声|安静|再见|拜拜|晚安|"
     r"你忙|不用管我|别管我|"
     r"不用了|没事了|别放了|停一下|停止播放")
@@ -1009,6 +1040,13 @@ class VoiceSession:
         # 到期后由 idle 态收到音频的那条兜底自动恢复。
         self._dismissed_until: float = 0.0
 
+        # ---- "服务端在忙、设备还在说"的丢帧计数（2026-11-03）----
+        # 每轮清零，轮次结束时若非 0 打一行日志。用途只有一个：把
+        # 「老人说没反应」拆成两半 —— 有数 = 设备听到了、服务端没接住
+        # （thinking 态）；没数 = 设备根本没送上来（麦克风/聆听态问题）。
+        # 这一区分靠日志之外的任何手段都做不到，而两种原因的修法完全不同。
+        self._drop_thinking_frames: int = 0
+
         # ---- 连续空识别计数（2026-11-03 用户实报）----
         # "老人已经说了不想聊，设备还在反复念『抱歉，我没听清』"的根因就是
         # 这个数字不存在：每一次空 ASR 都被当成**第一次**，于是永远念同一句。
@@ -1385,6 +1423,14 @@ class VoiceSession:
             # 非 listening 态收到的音频：设备在播报时也可能继续推流
             # （固件不停止麦克风）。丢弃即可，不回错误 —— 回错误会让
             # 设备以为协议出错而重连。
+            #
+            # ⚠️ 2026-11-03 用户实报「偶发性的我说话设备完全没有识别到」：
+            # 这条**静默丢弃**正是最可能的现场之一 —— ``thinking``（ASR +
+            # LLM + TTS 首帧，实测 3~8 秒）期间老人说的话全被扔掉，且日志里
+            # 一个字都没有，事后只能靠猜。所以现在计数，并在轮次结束时打一行
+            # 汇总：有数就是"设备听到了但服务端在忙"，没数才轮到查麦克风。
+            if self.state == "thinking":
+                self._drop_thinking_frames += 1
             return
         payload = self._strip_binary_header(data)
         if payload is None:
@@ -2181,6 +2227,8 @@ class VoiceSession:
         if self.state != "listening":
             return
         self.state = "thinking"
+        # 本轮"服务端在忙"的丢帧从 0 起算（见 __init__ 里 _drop_thinking_frames）
+        self._drop_thinking_frames = 0
         # ``_frames``（Opus 裸包）保留在成员上不清：abort 时 _on_abort 要清它，
         # 而这里只用 ``_pcm``（已解码）送 ASR。故意不把 frames 传下去 ——
         # 下游只需要 PCM，多传一个参数就多一处"该清哪个"的歧义。
@@ -2215,6 +2263,16 @@ class VoiceSession:
         finally:
             if self.state == "thinking":
                 self.state = "idle"
+            # ---- 诊断：思考期丢帧汇总（2026-11-03）----
+            # 放在 state 回落**之后**：这行日志的语义是"这一轮忙的时候，
+            # 设备一共送上来多少帧被我扔掉了"，与后面的待机兜底无关。
+            if self._drop_thinking_frames:
+                frame_ms = config.VOICE_FRAME_DURATION_MS or 60
+                log.info("[%s] 思考期丢弃上行音频 %d 帧（%dms）：老人这期间"
+                         "说的话没进 ASR（设备听到了、服务端在忙）",
+                         self.session_id, self._drop_thinking_frames,
+                         self._drop_thinking_frames * frame_ms)
+                self._drop_thinking_frames = 0
             # ---- 兜底：命中待机关键词，但这一轮没能走到"模型判定"----
             # （LLM 未配置 / 调用异常 / 回复为空 / 播报前就崩了）
             #
@@ -2245,8 +2303,10 @@ class VoiceSession:
         能量计算，同一事实两份实现必然分叉）。
 
         三条保守性设计：
-        1. 前后各留 ``_TRIM_PAD_FRAMES`` 帧（120ms）—— 老人语速慢，
-           词头能量建立需要时间，贴边裁会把第一个字切掉一半；
+        1. 词头留 ``_TRIM_HEAD_PAD_FRAMES`` 帧（360ms）、词尾留
+           ``_TRIM_TAIL_PAD_FRAMES`` 帧（120ms）—— 老人语速慢，词头能量
+           建立需要时间，贴边裁会把第一个字（常常还是轻声）切掉一半；
+           头比尾长得多，因为只有"词头"会丢内容（见常量处 2026-11-03 的说明）；
         2. 裁掉总量不足 ``_TRIM_MIN_SAVE_MS`` 就原样发 —— 切片有风险
            （VAD 误判会切掉轻声的词），没收益不担风险；
         3. 一轮里没记录到任何语音帧 ⇒ 原样返回。此时 ``_speech_ms``
@@ -2265,8 +2325,8 @@ class VoiceSession:
         n = len(pcm)
         if n == 0:
             return pcm
-        start = max(0, self._first_speech_frame - _TRIM_PAD_FRAMES)
-        end = min(n - 1, self._last_speech_frame + _TRIM_PAD_FRAMES)
+        start = max(0, self._first_speech_frame - _TRIM_HEAD_PAD_FRAMES)
+        end = min(n - 1, self._last_speech_frame + _TRIM_TAIL_PAD_FRAMES)
         if end < start:
             return pcm
         saved_frames = start + (n - 1 - end)
@@ -2287,8 +2347,8 @@ class VoiceSession:
                 segs.append([i, i])
         merged: list[list[int]] = []
         for a, b in segs:
-            a = max(start, a - _TRIM_PAD_FRAMES)
-            b = min(end, b + _TRIM_PAD_FRAMES)
+            a = max(start, a - _TRIM_HEAD_PAD_FRAMES)
+            b = min(end, b + _TRIM_TAIL_PAD_FRAMES)
             if merged and a <= merged[-1][1] + 1:
                 merged[-1][1] = max(merged[-1][1], b)
             else:
