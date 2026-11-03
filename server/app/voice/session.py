@@ -501,6 +501,96 @@ def _pending_reminder_label(device_pk: int) -> str:
         return ""
 
 
+#: 今天已提醒的日程清单最多列几条。
+#:
+#: 这段**每轮**都进 system prompt，而 system 是 prompt 缓存的前缀 —— 太长会
+#: 挤掉记忆、提醒清单等其他上下文，也会让模型把注意力放在"念清单"上。
+#: 日程提醒本来就不多（一天通常 1-3 条），4 条足够覆盖；超出的直接省略，
+#: 宁可少提一句，也不要每轮拖着一长串旧事。
+_REMINDED_SCHEDULE_MAX: Final[int] = 4
+
+_REMINDED_SCHEDULE_HINT: Final[str] = (
+    "【今天已经提醒过的日程】下面这些日程提醒**已经播报过、流程已走完**"
+    "（日程类不需要老人确认，这是与服药提醒的区别）：\n{block}\n"
+    "你可以在聊天里自然地问一句他做完了没有，例如"
+    "「您让我提醒您的今天要还信用卡，您已经完成了吗？」。四条纪律：\n"
+    "· 这只是关心，**不要调用任何工具去改状态** —— 记录已经算完成了，"
+    "再确认一次只会制造假的第二条记录。\n"
+    "· **一次对话里最多提一条**，别把清单整段念出来：老人记不住，"
+    "而且连着念几件事听起来像在催账。\n"
+    "· 老人说还没做完 → 可以问「要不要过一会儿再提醒您一次」，"
+    "但**不要**承诺你去改提醒、**不要**自己新建提醒（那是另一个功能）。\n"
+    "· 老人明显在说别的事（问天气、说不舒服、聊家常）时**不要**插这个话题；"
+    "等他这轮说完了、有空档再顺口问。"
+)
+
+
+def _reminded_schedule_label(device_pk: int) -> str:
+    """今天已经播报过的日程提醒（渲染成多行文本）；没有则返回空串。
+
+    为什么需要它：日程类提醒「播报即完成」（2026-11-03 用户定义），状态一旦
+    落成 CONFIRMED 就不再出现在 ``_pending_reminder_label`` 的待确认清单里，
+    模型也就无从知道"刚才提醒过他还信用卡"。而用户明确要求模型能主动问
+    「您已经完成了吗？」，所以必须另开一份"已完成、可闲聊"的清单。
+
+    判据三条，缺一不可：
+      * ``confirm_method == AUTO`` —— 只认"系统自动完成"这一种。子女在手机上
+        代确认（APP）或老人自己确认过的，不该被当成"我刚提醒过你"来追问。
+      * ``rtype != MEDICINE`` —— 服药提醒**不许**进这份清单。它的完成与否是
+        依从率数据，模型随口一句"您吃完了吗"若被老人答"没有"，会诱导模型去
+        改服药记录（另一个更严重的错）。
+      * ``due`` 落在**今天**（按服务端时区，与 ``local_now`` 同源）—— 不按
+        "最近 N 条"取，否则昨天没做完的日程会一直在今天的对话里冒出来。
+
+    取 ``due_at`` 倒序 + limit：同一天里越晚的越"新鲜"，先提它。
+
+    任何异常都吞掉返回空串 —— 与 ``_pending_reminder_label`` 同一个理由：
+    这是加分项，查不到就不注入，绝不能因为它把整轮对话打挂。
+    """
+    try:
+        # 局部导入：``..schedule`` 与 ``..voice`` 之间存在间接依赖，
+        # 放到模块顶层容易绕成循环导入。这两个函数调用开销可忽略。
+        from ..schedule import event_due_utc, local_now
+
+        now = local_now()
+        with SessionLocal() as db:
+            rows = db.execute(
+                select(_m.ReminderEvent, _m.Reminder)
+                .join(_m.Reminder,
+                      _m.Reminder.id == _m.ReminderEvent.reminder_id)
+                .where(
+                    _m.ReminderEvent.device_id == device_pk,
+                    _m.ReminderEvent.state == int(_m.EventState.CONFIRMED),
+                    _m.ReminderEvent.confirm_method == int(_m.ConfirmMethod.AUTO),
+                    _m.Reminder.deleted_at.is_(None),
+                    _m.Reminder.rtype != int(_m.ReminderType.MEDICINE),
+                )
+                .order_by(_m.ReminderEvent.due_at.desc())
+                .limit(_REMINDED_SCHEDULE_MAX * 2)   # 多取一点，过滤"今天"后再截断
+            ).all()
+
+            lines: list[str] = []
+            for ev, rule in rows:
+                try:
+                    # ``event_due_utc`` 给的是绝对时刻（UTC）；必须换到本地再看
+                    # "是不是今天"，否则跨零点那几条会归错日子。
+                    due = event_due_utc(ev).astimezone(now.tzinfo)
+                except Exception:  # noqa: BLE001  脏 tz 不该让整段清单消失
+                    continue
+                if due.date() != now.date():
+                    continue
+                title = sanitize_for_prompt(str(rule.title or ""), limit=40)
+                if not title:
+                    continue
+                lines.append(f"- {due:%H:%M} 「{title}」")
+                if len(lines) >= _REMINDED_SCHEDULE_MAX:
+                    break
+            return "\n".join(lines)
+    except Exception:  # noqa: BLE001
+        log.debug("查询今天已提醒的日程失败（不影响本轮对话）", exc_info=True)
+        return ""
+
+
 def _fallback_confirm_verdict(device_pk: int) -> tuple[bool, str]:
     """服务端兜底确认（模型漏调 confirm_reminder）能否下发；返回 (可否, 跳过原因)。
 
@@ -849,6 +939,12 @@ class VoiceSession:
         # 非空时 system 里会多一段状态说明 + 追问纪律，模型才知道该调
         # confirm_reminder、以及还剩哪一味没问。空串 = 不注入（行为与旧版一致）。
         self._pending_reminder: str = ""
+
+        # 今天**已经播报过**的日程提醒清单（每轮开头查一次，多行文本）。
+        # 日程类「播报即完成」，所以它不会出现在 _pending_reminder 里；但用户
+        # 要求模型能主动问一句「您已经完成了吗？」，这份清单就是那个话头。
+        # 空串 = 不注入（行为与旧版一致）。
+        self._reminded_schedule: str = ""
 
         # 当前这一轮的播报器（_ReplySpeaker）。abort 时要能立刻丢掉它
         # 队列里还没发出去的音频帧 —— 否则老人已经喊停了，音箱还在
@@ -2192,6 +2288,9 @@ class VoiceSession:
         # 两个用途：① 注入 system 让模型知道该调 confirm_reminder、还剩哪味要问；
         # ② 模型漏调时由服务端补一刀（见下面 _confirm_candidate 的收尾）。
         self._pending_reminder = _pending_reminder_label(self.dev.id)
+        # ---- 今天已提醒的日程（播报即完成，用来"顺口问一句做完了没"）----
+        # 与上面的待确认清单互斥：同一条不可能既是"待确认"又是"已完成"。
+        self._reminded_schedule = _reminded_schedule_label(self.dev.id)
         # 有确认措辞 **且** 没有否定措辞才算。见 _NEG_RE 上方注释：
         # 「还没喝完」带着"喝完"，不挡就会把没做的事记成做完了。
         self._confirm_candidate = (bool(_CONFIRM_RE.search(utterance))
@@ -2328,6 +2427,13 @@ class VoiceSession:
         if self._pending_reminder:
             system = system + "\n\n" + _PENDING_REMINDER_HINT.format(
                 block=self._pending_reminder)
+        # ---- 今天已提醒的日程：给模型一个"顺口关心一句"的话头 ----
+        # 不注入的话模型根本不知道刚才提醒过什么，用户明确要求的
+        # 「您让我提醒您的今天要还信用卡，您已经完成了吗？」就问不出来。
+        # 注意这段**只用于闲聊**，纪律里已经写明不许调工具改状态。
+        if self._reminded_schedule:
+            system = system + "\n\n" + _REMINDED_SCHEDULE_HINT.format(
+                block=self._reminded_schedule)
 
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend(self._history[-config.VOICE_HISTORY_TURNS * 2:])

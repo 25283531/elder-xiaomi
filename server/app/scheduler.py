@@ -22,11 +22,24 @@ from sqlalchemy.orm import Session
 from .config import SCHEDULER_INTERVAL_SEC, SCHEDULE_AHEAD_HOURS, TZ
 from .db import SessionLocal
 from .device_state import mark_offline_devices
-from .models import Device, EventState, Reminder, ReminderEvent
+from .models import (ConfirmMethod, Device, EventState, Reminder, ReminderEvent,
+                     ReminderType)
 from .schedule import event_due_utc, local_now, materialize_events
 from .schemas import derive_medicines
 
 log = logging.getLogger("elder.scheduler")
+
+#: 日程类提醒「按已提醒处理」的宽限（分钟）。
+#:
+#: 日程提醒不需要老人确认（2026-11-03 用户定义），设备播报后会上报 FIRED、
+#: ``device_api.report_event`` 当场落成 CONFIRMED。但设备可能离线，服务端
+#: 收不到回执，实例就会永远挂在 PENDING/FIRED 里 —— 既不升级（日程类不升级），
+#: 也不完成，首页的待办数字就一直是假的。
+#:
+#: 取 30 分钟：覆盖一次心跳间隔（默认 5 分钟）+ 离线重连 + 网络抖动绰绰有余，
+#: 又不会让家属拖到当天很晚才看到"已完成"。**不要**改成按小时级：日程提醒
+#: 的价值就是"当时提醒到了"，隔太久才标记等于没记。
+SCHEDULE_AUTO_DONE_GRACE_MIN = 30
 
 # 周期任务的健康快照，供 GET /api/health/scheduler 读取。
 #
@@ -148,6 +161,26 @@ def _tick(session: Session) -> None:
         # 家属删掉提醒后还会收到"老人没吃药"的告警，去问老人却发现提醒早就
         # 删了。`is_alive()` 是 models.Reminder 上与 Avatar 同风格的判据。
         if not rule or not rule.is_alive() or not rule.require_confirm:
+            continue
+        # 日程类提醒**不参与超时升级**（2026-11-03 用户定义：「日程类提醒只要
+        # 进行提醒就算完成流程了」）。它们没有"依从性"概念，把它判成 MISSED
+        # 会让家属收到「老人没完成日程」的假告警。
+        #
+        # 但也不能就此 continue —— 设备可能离线、根本没上报 FIRED，这条实例
+        # 会永远挂在 PENDING/FIRED 里污染统计。日程提醒的价值是"提醒过"，
+        # 而设备本地时钟到点会自己触发（不依赖服务端在线），所以过了宽限
+        # 就按"已提醒"落成 CONFIRMED + AUTO。宽限取 30 分钟：够覆盖一次
+        # 心跳间隔（默认 5 分钟）+ 设备离线重连 + 网络抖动，又不会让家属在
+        # 当天很晚才看到"已完成"。
+        if int(rule.rtype) != int(ReminderType.MEDICINE):
+            due_sched = event_due_utc(ev)
+            if now > due_sched + timedelta(minutes=SCHEDULE_AUTO_DONE_GRACE_MIN):
+                ev.state = int(EventState.CONFIRMED)
+                ev.confirm_method = int(ConfirmMethod.AUTO)
+                if not ev.confirmed_at:
+                    ev.confirmed_at = now
+                if not ev.note:
+                    ev.note = "已到点，按已提醒处理"
             continue
         # due_at 存的是**规则所在时区**的裸钟点（跨时区之后不再是"服务端钟点"），
         # 直接和 now（aware）比较会抛 TypeError，而且就算补了 TZ 也只有北京规则

@@ -31,7 +31,8 @@ from ..deps import get_current_device
 from ..llm_gateway import resolve_row
 from ..chat_quota import quota_snapshot
 from ..model_catalog import DEVICE_KINDS, KIND_LLM
-from ..models import ConfirmMethod, EventState, Interaction, ReminderEvent, utcnow
+from ..models import (ConfirmMethod, EventState, Interaction, ReminderEvent,
+                      ReminderType, utcnow)
 from ..schedule import (TZ_MARGIN, event_due_utc, local_now, materialize_events,
                         next_occurrence)
 from ..schemas import (
@@ -623,6 +624,30 @@ def report_event(payload: EventReportIn, db: Session = Depends(get_db),
             # 已经是全置信。
             ev.note = "语音确认 + 按键确认（全置信）"
     ev.confirm_method = _method
+    # 日程类提醒「播报即完成」（2026-11-03 用户定义）。
+    #
+    # 服药提醒必须老人确认：依从率统计、漏服告警、家属端展示全都看 ``state``，
+    # 提前置 CONFIRMED 会让告警整体失效。日程提醒没有"依从性"这个概念 ——
+    # 用户原话是「日程类提醒只要进行提醒就算完成流程了」，设备把话播出来的
+    # 那一刻流程就走完了，老人不需要按任何键、也不需要回一句"知道了"。
+    #
+    # 所以设备上报 FIRED（= 已播报）时直接落成 CONFIRMED + AUTO：
+    #   * 不落 CONFIRMED ⇒ scheduler 会在 escalate_after_min 之后把它判成
+    #     MISSED 并通知家属「老人没完成日程」—— 那是纯粹的假告警；
+    #   * 用 AUTO 而不是 APP ⇒ APP 的语义是"子女在手机上代确认"，写错会让
+    #     家属以为是自己点的，也会污染"谁确认的"这条审计线索。
+    #
+    # 判据用规则上的 ``rtype`` 而不是设备报的 state：设备不知道也不需要知道
+    # "这条算不算完成"，口径必须由服务端按规则类型定，否则改固件就能改统计。
+    _is_schedule = (rule is not None
+                    and int(rule.rtype) != int(ReminderType.MEDICINE))
+    if _is_schedule and payload.state == int(EventState.FIRED):
+        ev.state = int(EventState.CONFIRMED)
+        ev.confirm_method = int(ConfirmMethod.AUTO)
+        if not ev.confirmed_at:
+            ev.confirmed_at = payload.fired_at or local_now()
+        if not ev.note:
+            ev.note = "已播报，日程类提醒无需确认"
     # 逐味确认：把这次点名的药记进 ``confirmed_medicines``（去重、保持顺序）。
     # **只做这一件事** —— 不在这里推导 state（"全确认才算 CONFIRMED"属于状态机
     # 改造，别在这里顺手改，否则老固件的整条确认会立刻变成"永远不确认"）。
