@@ -186,7 +186,7 @@ def frozen_banner(src: Path) -> None:
 #: 直接改上游文件的清单（与 README「上游定制补丁」节、决策记录 D24 对齐）。
 #: sync 会覆盖它们，所以冻结保护的就是这一组。
 CUSTOM_PATCH_FILES = (
-    "main/display/lcd_display.cc            （70/30 对话布局，标记 elder-layout-70-30）",
+    "main/display/lcd_display.cc            （左右分栏+藏青状态栏+提醒卡片，标记 elder-layout-design-20261103）",
     "main/main.cc                            （elder_boot + 绑定引导任务）",
     "main/boards/bread-compact-esp32/esp32_bread_board.cc",
     "main/boards/bread-compact-esp32-lcd/esp32_bread_board_lcd.cc",

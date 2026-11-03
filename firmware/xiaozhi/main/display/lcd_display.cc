@@ -873,24 +873,31 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     lv_obj_scroll_to_view_recursive(img_bubble, LV_ANIM_ON);
 }
 #else
-// >>> BEGIN elder-layout-70-30 (2026-10-19 布局改造，勿手改；被上游 sync 冲掉时
-// merge_to_xiaozhi.py --check 会红，按 README「上游定制补丁」节重贴) >>>
-// 简洁风格布局（本板启用，320x240 物理 / swap_xy 后 LVGL 逻辑 240x320 竖屏）：
+// >>> BEGIN elder-layout-design-20261103 (2026-11-03 按设计稿重排，勿手改；
+// 被上游 sync 冲掉时 merge_to_xiaozhi.py --check 会红，按 README「上游定制补丁」节重贴) >>>
+// 简洁风格布局（本板启用，320x240 横屏；config.h 已把 swap_xy/mirror 关掉）。
 //
-//    ┌──────────────────────────┐
-//    │ 状态栏 WiFi/静音/电量（不变）│  ← top_bar_ / status_bar_
-//    ├──────────────────────────┤
-//    │                          │
-//    │      字幕区（约 70%）      │  ← bottom_bar_（全宽，紧贴状态栏下方）
-//    │                          │
-//    ├──────────────┬───────────┤
-//    │  （空）        │ 图片区 30% │  ← emoji_box_ / preview_image_（右下角）
-//    └──────────────┴───────────┘
+// 2026-11-03 起按 deliverables/gstack/design/mock-{1,2,3} 重排为**左右分栏**：
 //
-// 2026-10-19 用户拍板：对话界面上下 70/30 分割，右下角 30% 显示图标/表情，
-// 字幕占 70%，顶部状态栏保留。改动只涉及默认风格分支；WECHAT 气泡风格
-// （CONFIG_USE_WECHAT_MESSAGE_STYLE，本板未启用）不动。
-// <<< END elder-layout-70-30 >>>
+//    ┌──────────────────────────────────┐
+//    │ 上午 08:30            (wifi)10月29日 周三 │ ← top_bar_ 藏青 30px
+//    ├──────────────────────────────────┤
+//    │ 用户的话（蓝 #4982FC）      ╭────╮ │ ← bottom_bar_（左列 x18 宽183）
+//    │ 小安的回答（深 #232F54）    │头像│ │    emoji_box_（右侧 90x90 圆）
+//    │                            ╰────╯ │
+//    └──────────────────────────────────┘
+//
+// 待机态：头像圆整块隐藏，表情按 60px 从屏幕右缘外滚到左缘外（跑马灯）。
+// 提醒态：reminder_overlay_ 盖住状态栏以下的 210px，画成结构化卡片。
+//
+// 沿革：2026-10-19 用户拍板过「上下 70/30 分割」（字幕占 70%、右下角 30%
+// 放表情），2026-11-03 用户按设计稿改成上面的左右分栏 —— 旧的 70/30 已经不
+// 存在了。**标记名跟着改**（原 `elder-layout-70-30`）：名字留着不改，
+// 下一个读到这行的人会以为屏上还是上下分割，而 merge --check 只 grep 这个
+// 标记，标记说错了它照样绿。
+// 改动只涉及默认风格分支；WECHAT 气泡风格（CONFIG_USE_WECHAT_MESSAGE_STYLE，
+// 本板未启用）不动。
+// <<< END elder-layout-design-20261103 >>>
 void LcdDisplay::SetupUI() {
     DisplayLockGuard lock(this);
     LvglTheme* lvgl_theme = static_cast<LvglTheme*>(current_theme_);

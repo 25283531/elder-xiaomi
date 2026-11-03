@@ -557,22 +557,30 @@ ES7210（ADC）、FT5x06（触摸）、**GC0308（摄像头，DVP）**。
 `SpiLcdDisplay`），不是 `esp_emote_gfx` 自绘——开 emote 路径时它根本不创建
 LVGL display，真机表现为全黑屏 + `font context is NULL`。
 
-**对话界面 70/30 布局**（2026-10-19 用户拍板）：屏幕上下分割——字幕区占屏幕
-**高度 70%**（全宽、紧贴顶部状态栏，文字在区内居中），**右下角 30%×30%** 是
-图片区（表情图标 `emoji_box_` 与服务端预览图 `preview_image_` 共用同一块区域，
-两者互斥显示），顶部状态栏（WiFi/静音/电量）原样保留。低电量弹窗移到左下角
-65% 宽，避免压图。图片缩放用 LVGL 原生 `LV_IMAGE_ALIGN_CONTAIN`（等比缩放进区），
-不再手算 scale。
+**对话界面按设计稿左右分栏**（2026-11-03 用户按设计稿拍板，取代 2026-10-19 的
+上下 70/30 分割）：顶部藏青状态栏固定 30px（左「上午 08:30」、右「wifi + 静音 +
+电量 + 10月29日 周三」）；主区底色 `#D3DBFC`，左侧一列文字（x 18、宽 183，
+用户话蓝色 `#4982FC` 在上、小安回答深色 `#232F54` 在下），右侧 90×90 头像圆
+（`emoji_box_` 与预览图 `preview_image_` 共用同一块区域，两者互斥显示）。
+待机态头像圆整块隐藏，表情按 60px 从屏幕右缘外滚到左缘外（跑马灯）；
+提醒态 `reminder_overlay_` 盖住状态栏以下的 210px，画成结构化卡片
+（药丸图标 + 标题 + 明细 + 橙色提示 + 橙色圆角按钮 + 右侧头像）。
+三张设计稿在 `deliverables/gstack/design/`。
 
 ⚠️ 该布局是**直接改上游 `main/display/lcd_display.cc` 默认风格分支**
 （`CONFIG_USE_WECHAT_MESSAGE_STYLE` 气泡分支未启用、未动）。上游
-`sync_xiaozhi.py --force` 会冲掉它 ⇒ 文件内有 `elder-layout-70-30` 标记，
-`tools/merge_to_xiaozhi.py --check`（CI 每次构建都跑）会校验该标记，
+`sync_xiaozhi.py --force` 会冲掉它 ⇒ 文件内有 `elder-layout-design-20261103`
+标记，`tools/merge_to_xiaozhi.py --check`（CI 每次构建都跑）会校验该标记，
 缺失即构建失败。重贴步骤：对照 git 历史里 `lcd_display.cc` 的默认分支
-（`#else` 与 `#endif` 之间）恢复 6 处几何改动——`emoji_box_`/`preview_image_`
-改 `LV_ALIGN_BOTTOM_RIGHT` + `lv_pct(30)` + CONTAIN、`bottom_bar_` 改
-`lv_obj_align_to(top_bar_, LV_ALIGN_OUT_BOTTOM_LEFT)` + 高度 70% 减状态栏、
-`low_battery_popup_` 改左下角 65%。
+（`#else` 与 `#endif` 之间）恢复整套几何与配色——`InitializeLcdThemes` 的
+light 主题色、`top_bar_` 的藏青/30px/左时钟右日期、`emoji_box_` 的右侧 90×90
+圆、`bottom_bar_` 的左列 flex、`StartIdleMarquee` 的整屏轨道、`ShowReminder`
+的卡片。
+
+> 2026-11-03 之前这个标记叫 `elder-layout-70-30`（对应上下 70/30 分割）。
+> 标记名跟着布局一起改了：只改布局不改标记的话，`merge --check` 只 grep
+> 字符串，名字说错了它照样绿。
+
 
 **摄像头驱动已真正编进固件**，初始化改为「探到硬件才起来」：先用 SCCB 探地址，
 探不到就打一条 WARNING 跳过，既不占 DVP 的 11 个 IO 也不刷 ERROR；接上排线重启

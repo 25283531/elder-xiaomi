@@ -52,7 +52,7 @@
 
 | 文件 | 定制内容 |
 | --- | --- |
-| `main/display/lcd_display.cc` | 对话界面 70/30 布局（6 处几何改造，带 `elder-layout-70-30` 标记） |
+| `main/display/lcd_display.cc` | 对话界面左右分栏 + 藏青状态栏 + 待机跑马灯 + 提醒卡片（带 `elder-layout-design-20261103` 标记） |
 | `main/main.cc` | elder_boot 任务 + 未绑定设备绑定引导任务 |
 | `main/boards/bread-compact-esp32/esp32_bread_board.cc` | ASR 按钮唤醒词硬编码「你好小智」 |
 | `main/boards/bread-compact-esp32-lcd/esp32_bread_board_lcd.cc` | 同上 |
@@ -100,7 +100,7 @@ python tools/sync_xiaozhi.py --unlock \
 python tools/merge_to_xiaozhi.py && python tools/merge_to_xiaozhi.py --check
 
 # 6) 按 README「上游定制补丁」节，把上表 8 个文件的定制重新贴回去
-#    （merge --check 会因 elder-layout-70-30 标记缺失而红，正是提醒信号）
+#    （merge --check 会因 elder-layout-design-20261103 标记缺失而红，正是提醒信号）
 
 # 7) 同步 VENDOR.md 的 tag / commit / 同步日期字段，并更新
 #    tools/sync_xiaozhi.py 顶部的 PINNED_TAG / PINNED_COMMIT / PINNED_ON
