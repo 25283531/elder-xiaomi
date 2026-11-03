@@ -1663,7 +1663,21 @@ void elder_reminder_screen_text(const elder_rmd_item_t *item, char *out, size_t 
     if (item == NULL) return;
 
     /* 首行沿用 2026-10-29 用户实报后定下的措辞（「该吃X了」/「X时间到了」），
-     * 不给老人换一种说法 —— 他认的是这句话。 */
+     * 不给老人换一种说法 —— 他认的是这句话。
+     *
+     * ⚠️ 2026-11-03 设计稿还原：屏幕改成了**结构化卡片**（标题 / 明细 /
+     *    橙色提示 / 橙色按钮），所以这里输出的不再是"一段话"，而是
+     *    **一行一件事**。格式契约（显示层 lcd_display.cc 的 ShowReminder
+     *    按同一份规则拆行）：
+     *      第 1 个非空行      标题
+     *      以「请」开头的行    橙色提示语
+     *      其余行             明细，逐行列出
+     *    改一边必须改另一边；只改一边的表现是"提示语跑到明细里去了"。
+     *
+     *    行动指令（"长按机身顶部大按键确认"）**不再**由这里下发 ——
+     *    它是界面常量（怎么操作这台机器，与是哪条提醒无关），
+     *    画在显示层的橙色按钮上。原来那句「长按按钮 3 秒确认」留在文案里
+     *    会和按钮重复，老人看到两遍"长按"，反而不知道该按哪个。 */
     char head[96];
     if (item->type == ELDER_RMD_TYPE_MEDICINE) {
         snprintf(head, sizeof(head), "该吃%s了", item->label);
@@ -1676,11 +1690,13 @@ void elder_reminder_screen_text(const elder_rmd_item_t *item, char *out, size_t 
      * 触发时不会预支后面的条数（tick 在同一轮里会紧接着触发剩下的，
      * 屏幕会连着刷新到最终值，老人看到的是最后一次）。 */
     uint8_t total = pending_same_minute(item->fired_due_at);
+    const char *hint = (item->type == ELDER_RMD_TYPE_MEDICINE)
+                           ? "请及时服用" : "请及时处理";
     if (total > 1) {
-        snprintf(out, len, "%s\n（还有 %u 条）\n\n长按按钮 3 秒确认",
-                 head, (unsigned)(total - 1));
+        snprintf(out, len, "%s\n（还有 %u 条）\n%s",
+                 head, (unsigned)(total - 1), hint);
     } else {
-        snprintf(out, len, "%s\n\n长按按钮 3 秒确认", head);
+        snprintf(out, len, "%s\n%s", head, hint);
     }
 }
 
