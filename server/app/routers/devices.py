@@ -4,13 +4,14 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from typing import Final
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from .. import models
-from ..config import ACT_CODE_LEN
+from .. import geo, models
+from ..config import ACT_CODE_LEN, TZ
 from ..db import get_db
 from ..deps import get_current_user, require_device_owner, require_role
 from ..device_state import is_online
@@ -24,6 +25,7 @@ from ..schemas import (
     DeviceAgentOut,
     DeviceCreate,
     DeviceOut,
+    DeviceTimezoneOut,
     DeviceUpdate,
     DeviceWifiIn,
     DeviceWifiOut,
@@ -119,6 +121,84 @@ def list_devices(db: Session = Depends(get_db), user: models.User = Depends(get_
 def get_device(device_pk: int, db: Session = Depends(get_db),
                user: models.User = Depends(get_current_user)):
     return require_device_owner(device_pk, user, db)
+
+
+def build_device_timezone(dev: models.Device,
+                          request: Request | None = None) -> DeviceTimezoneOut:
+    """「这台设备现在按哪个时区」—— 抽成普通函数，接口只做鉴权转发。
+
+    为什么不在路由里写：这段有三条分支（判得出 / 判不出 / 时区名合法但
+    tzdata 不认），而每条分支都**不会报错**，只是文案不同。写在路由里就
+    只能起整套鉴权才测得到，那种测试最后通常退化成"接口 200 就算过"。
+
+    ``request`` 只用于**判不出来时**告诉家属"那到底会按哪儿的时间"：
+    创建提醒的真实回落链是「设备时区 → **创建者时区** → config.TZ」
+    （``geo.reminder_timezone``），所以此时会退到**家属手机**的时区，
+    而不是服务端默认。这里直接问同一条链，避免"提示说北京、实际按纽约"。
+
+    ``ok=False`` 不是错误，见 ``schemas.DeviceTimezoneOut`` 的说明。
+    """
+    guess = geo.device_guess(dev)
+    base = dict(device_pk=int(dev.id), last_seen_at=dev.last_seen_at)
+    if guess is None:
+        return DeviceTimezoneOut(
+            ok=False,
+            hint=_fallback_hint(request, dev),
+            **base,
+        )
+
+    name = geo.valid_timezone(guess.timezone)
+    if not name:
+        # 理论上走不到（guess.timezone 一定来自 COUNTRY_ZONES 或设备自报的
+        # 合法名），但它是**客户端可控输入**（X-Client-Timezone），留一支
+        # 兜底比某天被写坏后抛 ZoneInfoNotFoundError 好。
+        return DeviceTimezoneOut(
+            ok=False, country=guess.country, source=guess.source,
+            hint=("设备的时区名无法识别（" + str(guess.timezone) + "）。"
+                  + _fallback_hint(request, dev)),
+            **base,
+        )
+
+    zone = ZoneInfo(name)
+    return DeviceTimezoneOut(
+        ok=True,
+        timezone=name,
+        offset_minutes=geo.offset_minutes(name),
+        offset_from_beijing_min=geo.beijing_offset_min(name),
+        region=geo.region_of(name),
+        country=guess.country,
+        source=guess.source,
+        local_now=datetime.now(zone).isoformat(timespec="seconds"),
+        hint=geo.tz_hint(name),
+        **base,
+    )
+
+
+def _fallback_hint(request: Request | None, dev: models.Device) -> str:
+    """判不出设备时区时，如实说"那会按哪个时区生效"。
+
+    必须走 ``geo.reminder_timezone``（与创建提醒同一条链），**不要**在这里
+    写死 ``config.TZ``：真实回落是「设备 → 创建者 → config.TZ」，家属在
+    北美用手机建提醒时，落库的是北美时区而不是北京 —— 提示说北京就是错的。
+    """
+    effective = geo.valid_timezone(geo.reminder_timezone(request, dev, "")) or TZ.key
+    if request is None:
+        return (f"现在确定不了设备所在时区，提醒会按 {effective} 生效。")
+    return ("设备还没上报过可判定的公网 IP（或它在内网后面），"
+            f"现在确定不了它所在的时区。提醒会按你手机所在时区（{effective}）生效。")
+
+
+@router.get("/{device_pk}/timezone", response_model=DeviceTimezoneOut)
+def get_device_timezone(device_pk: int, request: Request,
+                        db: Session = Depends(get_db),
+                        user: models.User = Depends(get_current_user)):
+    """新建/编辑提醒前，家属要看到的那块「设备最后一次所在地」。
+
+    只读、幂等、不改库：``Device.ip`` 由设备取 token 时维护，这里只是按它
+    重新判一次。**不要**在这里回写 ``dev.ip`` 或加一列缓存 —— 那会变成
+    第二处真源，两者漂移时没有任何症状（见 ``geo.device_timezone`` 注释）。
+    """
+    return build_device_timezone(require_device_owner(device_pk, user, db), request)
 
 
 @router.patch("/{device_pk}", response_model=DeviceOut)

@@ -341,6 +341,91 @@ def offset_minutes(name: str, at: datetime | None = None) -> int:
     return int(delta.total_seconds() // 60) if delta else 0
 
 
+#: IANA 时区的**地区段**（第一个 ``/`` 之前那段）→ 中文。
+#: 只用来给家属看"设备最后一次在哪个大洲"，不做地理精确性承诺 ——
+#: 所以刻意**不**翻译城市段（``Lagos`` 有公认中文名，``Kiritimati`` 没有，
+#: 半翻半不翻比不翻更让人困惑）。这也是用户原话的口径：「设备最后一次所在地
+#: 为非洲」，大洲就够了。
+_ZONE_REGION_CN: dict[str, str] = {
+    "Africa": "非洲",
+    "Asia": "亚洲",
+    "Europe": "欧洲",
+    "America": "美洲",
+    "Pacific": "大洋洲",
+    "Atlantic": "大西洋",
+    "Indian": "印度洋",
+    "Antarctica": "南极洲",
+    "Arctic": "北极",
+    "Etc": "",
+}
+
+
+def region_of(name: str) -> str:
+    """时区名 → 地区中文（``Africa/Lagos`` → ``非洲``）。认不出返回空串。"""
+    text = valid_timezone(name)
+    if not text or "/" not in text:
+        return ""
+    return _ZONE_REGION_CN.get(text.split("/", 1)[0], "")
+
+
+def beijing_offset_min(name: str, at: datetime | None = None) -> int:
+    """该时区相对**北京时间**的偏差（分钟，正 = 比北京早）。
+
+    这是用户定下的存储口径「北京时间加上时区偏差」里那个偏差。例：
+    ``Africa/Lagos`` → ``-420``（比北京晚 7 小时），于是"拉各斯 08:00"
+    与"北京 15:00"是同一个时刻：``8:00 - (-420min) = 15:00``。
+
+    ``at`` 必须是**该时区自己的裸钟点**（naive）。传 UTC 或传别的时区的
+    钟点都会让夏令时判定落在错误的日期上 —— 南半球/欧美有半年会差一小时，
+    而那正是这个模块存在的理由。
+
+    空串 / 非法名按 ``config.TZ`` 处理（与 ``Reminder.tz`` 的空串语义一致：
+    历史数据 = config.TZ），于是偏差是 0 而不是 ``-480``。**这条兜底不能省**：
+    ``offset_minutes("")`` 会返回 0，直接相减会得到 -480，让每一条北京规则
+    都被记成"比北京晚 8 小时"。
+
+    北京一侧取 ``offset_minutes(TZ.key)``（"此刻"）：中国自 1991 年起没有
+    夏令时，所以它恒为 +480；``config.TZ`` 被部署方改成别的时区时才可能变，
+    而那种情况下"此刻的偏移"仍是对的口径。
+    """
+    zone_name = valid_timezone(name) or config.TZ.key
+    return offset_minutes(zone_name, at) - offset_minutes(config.TZ.key)
+
+
+def offset_text(minutes: int) -> str:
+    """偏移分钟 → ``UTC+1`` / ``UTC-7`` / ``UTC+5:30`` 这种人读的形式。"""
+    sign = "+" if minutes >= 0 else "-"
+    total = abs(int(minutes))
+    hh, mm = divmod(total, 60)
+    return f"UTC{sign}{hh}" if mm == 0 else f"UTC{sign}{hh}:{mm:02d}"
+
+
+def tz_hint(name: str, at: datetime | None = None) -> str:
+    """「设备最后一次所在地」那句话 —— **服务端唯一真源**。
+
+    为什么文案在服务端拼、不下发给前端自己拼：网页（``user.html``）与
+    APP（``uni-app``）是两套前端，同一句话各拼一遍必然漂移；而这个仓已经
+    因为"清单/文案有两份真源"踩过一次（音色清单，见 MEMORY 第 8 条）。
+    前端只负责渲染，不许改字。
+
+    返回空串 = 时区名不可用（调用方自己给"判不出来"的文案）。
+    """
+    text = valid_timezone(name)
+    if not text:
+        return ""
+    off = offset_minutes(text, at)
+    delta = beijing_offset_min(text, at)
+    region = region_of(text)
+    where = f"{region}（{text}，{offset_text(off)}）" if region else f"{text}（{offset_text(off)}）"
+    if delta == 0:
+        rel = "与北京时间相同"
+    else:
+        hh, mm = divmod(abs(delta), 60)
+        span = f"{hh} 小时" if mm == 0 else f"{hh} 小时 {mm} 分钟"
+        rel = f"比北京时间{'早' if delta > 0 else '晚'} {span}"
+    return f"设备最后一次所在地是 {where}，{rel}。"
+
+
 # ============================================================ 三层取国家
 def country_from_proxy(peer_ip: str, headers: Mapping[str, str]) -> str:
     """层 1：可信反代声明的国家头。
@@ -618,6 +703,27 @@ def reset_cache() -> None:
 
 
 # ============================================================ 请求级便捷入口
+def device_guess(dev: Any) -> Guess | None:
+    """一台设备"生活在"哪个时区 —— **完整结论**（含国家与 ``source``）。
+
+    为什么要有它、而不让调用方直接 ``resolve(dev.ip)``：判定的**失败语义
+    必须只有一处**。这里把「没上报过 IP / IP 是内网 / 查询没结果 / 抛异常」
+    四种情况统一收敛成 ``None``，调用方拿到的 ``None`` 就是"判不出来"，
+    不必各自去判 ``country`` 空不空（那种判据迟早有一处写反）。
+
+    ``source`` 必须一路带到接口输出：链路静默退化时表现是"所有人都是北京
+    时间"，与"配置全对"长得一模一样，没有 ``source`` 就只能靠猜。
+    """
+    ip = str(getattr(dev, "ip", "") or "").strip()
+    if not ip:
+        return None
+    try:
+        guess = resolve(ip)
+    except Exception:  # noqa: BLE001  判不出设备时区不该让建提醒失败
+        return None
+    return guess if guess.country else None
+
+
 def device_timezone(dev: Any) -> str:
     """一台设备"生活在"哪个时区 —— 按它上一次心跳的 IP 判定。
 
@@ -628,14 +734,43 @@ def device_timezone(dev: Any) -> str:
     返回空串表示**判不出来**（没上报过 IP / IP 是内网 / 查询没结果）——
     调用方必须据此退回下一级兜底，不要拿空串去 ``ZoneInfo()``。
     """
-    ip = str(getattr(dev, "ip", "") or "").strip()
-    if not ip:
-        return ""
-    try:
-        guess = resolve(ip)
-    except Exception:  # noqa: BLE001  判不出设备时区不该让建提醒失败
-        return ""
-    return guess.timezone if guess.country else ""
+    guess = device_guess(dev)
+    return guess.timezone if guess is not None else ""
+
+
+def reminder_timezone(request: Any, dev: Any, explicit: str = "") -> str:
+    """这条提醒该按哪个时区解释 ``times_of_day`` —— **全仓唯一**的回落链。
+
+    **优先级（顺序即答案，不要"综合判断"）**：
+
+    1. 请求里显式给的 ``tz``（前端知道自己在哪个时区时最准）；
+    2. **设备所在时区** —— 由设备上一次心跳的 IP 判定（:func:`device_guess`）。
+       为什么设备排在创建者前面：提醒是**从设备上响出来的**，"早上 8 点吃药"
+       指的是老人眼前那个钟的 8 点。家属在纽约用手机给国内老人建提醒，
+       按家属时区会算成国内的晚上 8 点 —— 这是服药提醒，错 12 小时是安全问题；
+    3. 创建者所在时区（请求 IP 判定）—— 设备还没上报过 IP 时的兜底；
+    4. ``config.TZ``（调用方拿到空串后自己退）。
+
+    返回**合法 IANA 名或空串**。不返回非法值：``Reminder.tz`` 是客户端可控
+    输入，落一条坏值会让排期线程在后台抛 ``ZoneInfoNotFoundError``，而那个
+    异常被 ``run_forever`` 吞掉，表现是"这条规则永远不排期"。
+
+    为什么放在 geo 而不是 ``routers/reminders``：``routers/devices`` 的设备
+    时区接口要回答"**实际**会按哪个时区生效"，它必须用与创建提醒**完全同一条**
+    链。两处各写一遍的后果是「提示说北京、实际按纽约」，而两边的日志都正常。
+    """
+    given = valid_timezone(explicit)
+    if given:
+        return given
+    dev_tz = device_timezone(dev)
+    if dev_tz:
+        return dev_tz
+    if request is not None:
+        try:
+            return resolve_request(request).timezone
+        except Exception:  # noqa: BLE001  判定失败不该让建提醒失败
+            pass
+    return ""
 
 
 def resolve_request(request: Any, device_tz: Any = None) -> Guess:

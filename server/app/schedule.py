@@ -29,7 +29,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from sqlalchemy.orm import Session
 
 from .config import TZ
-from .geo import valid_timezone
+from .geo import beijing_offset_min, valid_timezone
 from .models import Reminder, ScheduleKind
 
 from zoneinfo import ZoneInfo
@@ -47,6 +47,18 @@ def reminder_zone(r: Reminder) -> ZoneInfo:
     """
     name = valid_timezone(getattr(r, "tz", ""))
     return ZoneInfo(name) if name else TZ
+
+
+def rule_offset_min(r: Reminder, at: datetime | None = None) -> int:
+    """这条规则相对**北京时间**的偏差（分钟，正 = 比北京早）。
+
+    统一入口，别在 router 里各写一遍 ``geo.offset_minutes(...) - 480`` ——
+    写两遍就有一遍会忘掉"减北京"，而症状只是显示的数字差 8 小时。
+
+    ``at`` 传**规则时区的裸钟点**（一般是 ``times_of_day`` 里那个点）；
+    不传按"此刻"算，用于创建/修改时落快照。
+    """
+    return beijing_offset_min(reminder_zone(r).key, at)
 
 
 def zone_of(tz: str) -> ZoneInfo:
@@ -71,22 +83,46 @@ def event_zone(ev: object) -> ZoneInfo:
     return ZoneInfo(name) if name else TZ
 
 
-def event_instant(due_at: datetime, tz: str = "") -> datetime:
+def event_instant(due_at: datetime, tz: str = "", offset_min: int = 0) -> datetime:
     """把「规则时区的裸钟点」还原成**绝对时刻**（aware，UTC）。
 
     这是全仓唯一该做这件事的地方。散着写必然出现「某处补了 TZ、某处没补」，
     而症状是「提醒到点不响 / 提前几小时响」—— 对服药提醒是安全问题，
     却没有任何异常可看（比较只是悄悄地错了）。
+
+    ``offset_min`` 是 ``tz_offset_min`` 列（相对**北京时间**的偏差，分钟）。
+    它的位置很明确：**``tz`` 名合法时完全不参与**，只有 ``tz`` 不可用
+    （历史坏值 / tzdata 不再认识这个旧名）才拿它兜底。今天的兜底是
+    ``config.TZ``，那会让一条外国时区的规则整整差出一个时区；用
+    「北京时间 + 偏差」能还原回正确的绝对时刻，因为
+    ``规则时区钟点 = 北京钟点 + 偏差`` ⇒ ``北京钟点 = due_at - 偏差``。
+
+    ``offset_min == 0`` 时行为与改造前**逐字一致**（走 ``config.TZ``）——
+    存量行补列后读出的就是 0，所以升级本身不改变任何一条提醒的响铃时刻。
     """
-    zone = zone_of(tz)
     if due_at.tzinfo is not None:
         return due_at.astimezone(timezone.utc)
+    zone_name = valid_timezone(tz)
+    if not zone_name and offset_min:
+        # 只有"tz 名不可用"这一支才用偏差，见 docstring。
+        beijing = due_at - timedelta(minutes=int(offset_min))
+        return beijing.replace(tzinfo=TZ).astimezone(timezone.utc)
+    zone = ZoneInfo(zone_name) if zone_name else TZ
     return due_at.replace(tzinfo=zone).astimezone(timezone.utc)
 
 
 def event_due_utc(ev: object) -> datetime:
-    """同 :func:`event_instant`，入参是整行对象（读它的 ``due_at`` 与 ``tz``）。"""
-    return event_instant(getattr(ev, "due_at"), getattr(ev, "tz", ""))
+    """同 :func:`event_instant`，入参是整行对象（读 ``due_at``/``tz``/``tz_offset_min``）。
+
+    ⚠️ 三个字段必须一起读。少传 ``tz_offset_min`` 不会报错，只是让
+    「tz 名坏掉」的那些历史行悄悄退回北京时间 —— 而这条路径平时没有症状，
+    只有那几行会偏，是最难发现的一类错。所以本函数用 ``getattr`` 取默认值
+    而不是硬取属性：调用方传进来的可能是 ``Reminder``（也有这一列）或
+    测试里的假对象，硬取会让老代码直接 AttributeError。
+    """
+    return event_instant(getattr(ev, "due_at"), getattr(ev, "tz", ""),
+                         int(getattr(ev, "tz_offset_min", 0) or 0))
+
 
 
 def device_zone(db: Session, device_pk: int) -> ZoneInfo:
@@ -273,6 +309,13 @@ def materialize_events(db: Session, device_pk: int, since: datetime | None = Non
                 # 时区跟着规则走（不 JOIN）：这一列是 due_at 的**解读方式**，
                 # 漏了它 due_at 就是个无法还原的裸钟点。
                 tz=r.tz or "",
+                # 偏差**按这一次的 due_at 现算**，不是复制规则的快照：
+                # 有夏令时的国家换季前后差 60 分钟，而"这次提醒相当于北京
+                # 几点"必须按这次算（见 models.ReminderEvent 的注释）。
+                # ts 是规则时区的 aware 时刻，先转成该时区的裸钟点再喂给
+                # beijing_offset_min —— 它要求入参是"该时区自己的钟点"。
+                tz_offset_min=rule_offset_min(
+                    r, ts.astimezone(reminder_zone(r)).replace(tzinfo=None)),
                 state=int(EventState.PENDING),
             ))
             created += 1
