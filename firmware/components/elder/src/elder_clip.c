@@ -27,24 +27,28 @@ static const char *TAG = "elder.clip";
  *    重新生成 .ogg 之后必须重跑脚本、把新的时长抄回来 ——
  *    表错了不会报错，只会让"等片段播完"的地方错位（播早了盖住人声）。
  *
- * 2026-11-03 实测（7 条，24kHz/mono/60ms 帧）：
- *   medicine       176 帧 = 10560ms（音乐 4.92s + 200ms 静音 + 话术 5.4s）
- *   todo           177 帧 = 10620ms
+ * 2026-11-04 实测（7 条，24kHz/mono/60ms 帧）：
+ *   medicine       135 帧 =  8100ms（音乐 4.92s + 200ms 静音 + 话术 2.98s）
+ *   todo           135 帧 =  8100ms
  *   confirm_hint    76 帧 =  4560ms
  *   done            43 帧 =  2580ms
  *   escalated       42 帧 =  2520ms
  *   skipped         34 帧 =  2040ms
  *   no_reminder     32 帧 =  1920ms
  *
- * ⚠️ medicine/todo 在 2026-11-03 加长过一次：原话术只有「您有一条服药提醒」
- *    （7080ms），后来补上「请长按机身顶部凸起的橙色大按键确认」——
- *    屏幕早就写了这个动作，语音不说等于让不看屏的老人无从下手。
- *    代价是片段从 7.1s 涨到 10.6s，`PlaySound` 在主事件循环的阻塞时间
- *    也随之从 ~4.7s 涨到 ~8.2s（算式见 elder_clip.h 的说明）。
+ * ⚠️ medicine/todo 的时长改过两次，两条都是**用户需求**，别"顺手改回去"：
+ *    2026-11-03 第一次加长（7080 → 10560ms）：补上「请长按机身顶部凸起的
+ *      橙色大按键确认」—— 屏幕早就写了这个动作，语音不说等于让不看屏的老人
+ *      无从下手。代价是 PlaySound 阻塞主事件循环从 ~4.7s 涨到 ~8.2s。
+ *    2026-11-04 又改回短版（10560 → 8100ms）：那条行动指令**与在线话术不一致**
+ *      —— 在线 TTS 说的是「您今天上午有服药提醒，请您知悉」，不含按键指令。
+ *      于是同一条提醒断网时催按键、联网时不催，老人听到什么取决于有没有 Wi-Fi。
+ *      行动指令现在只由 confirm_hint 在**升级态**播（那才是该催的时机）。
+ *      顺带把阻塞时间从 ~8.2s 降回 ~6.4s，老人按键到听见「已记录」也变短。
  */
 static const uint32_t kClipMs[ELDER_CLIP_COUNT] = {
-    10560,  /* ELDER_CLIP_MEDICINE */
-    10620,  /* ELDER_CLIP_TODO */
+    8100,   /* ELDER_CLIP_MEDICINE */
+    8100,   /* ELDER_CLIP_TODO */
     4560,   /* ELDER_CLIP_CONFIRM_HINT */
     2580,   /* ELDER_CLIP_DONE */
     2520,   /* ELDER_CLIP_ESCALATED */

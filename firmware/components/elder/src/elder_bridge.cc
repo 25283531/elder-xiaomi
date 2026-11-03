@@ -588,8 +588,15 @@ void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
          * 静默失败 —— 老人只听到一声音乐、一个字都没有。 */
         if (!OnIsOnline(nullptr) || !elder_net_is_online()) {
             /* 离线：TTS 一定不可用。回落预录片段 —— 它虽然不带时段，
-             * 但含提醒音 + 「该按哪个键」的行动指令，比"只有一声音乐"强。
-             * 断网时提醒内容可以简化，但不能没有，这是本工程一贯的口径。 */
+             * 但含提醒音 + 与在线**同口径**的话术（「您今天有服药提醒，
+             * 请您知悉」），比"只有一声音乐"强。
+             * 断网时提醒内容可以简化，但不能没有，这是本工程一贯的口径。
+             *
+             * ⚠️ 2026-11-04：片段里**不再含**「请长按…确认」。此前片段比在线
+             * 多一句行动指令，导致同一条提醒"断网时催按键、联网时不催"，
+             * 老人听到什么取决于当时有没有 Wi-Fi。行动指令现在只由
+             * CONFIRM_HINT 在升级态播 —— 那才是该催的时机。
+             * 改片段话术必须同步改 tools/make_elder_clips.py 并重新生成 .ogg。 */
             ESP_LOGW(TAG, "离线：时段话术不可用，回落预录片段");
             elder_clip_id_t clip = (item->type == ELDER_RMD_TYPE_MEDICINE)
                                        ? ELDER_CLIP_MEDICINE : ELDER_CLIP_TODO;

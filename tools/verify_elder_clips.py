@@ -19,16 +19,45 @@
     python tools/verify_elder_clips.py                     # 校验默认目录下全部 elder_*.ogg
     python tools/verify_elder_clips.py --dir <目录>         # 指定目录
     python tools/verify_elder_clips.py --file x.ogg ...     # 指定文件
+
+同时核对 ``elder_clip.c`` 的 ``kClipMs[]``
+-----------------------------------------
+OGG 换掉之后，``kClipMs[]`` 里那张**手抄的**时长表必须跟着改。漏改**不会**
+编译报错，症状是"等片段播完"的地方错位：表偏长 ⇒ 播完了还静着一大截
+（老人以为设备卡住）；表偏短 ⇒ 话没说完就被下一段声音盖住。
+
+这个错是纯手工引入的（生成脚本只把新值**打印**出来，人要自己抄回去），
+所以必须在拿到文件之后从 C 源码里把表读出来、与 OGG 实测帧数逐项比对。
+**顺序**也一起校验：``kClipMs`` 的下标就是 ``elder_clip_id_t`` 的顺序，
+错位不会报错，表现是"服药提醒播了待办的话"。
 """
 from __future__ import annotations
 
 import argparse
+import re
 import struct
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DIR = ROOT / "firmware" / "xiaozhi" / "main" / "assets" / "common"
+
+#: kClipMs 的真源（`firmware/xiaozhi/components/elder` 是生成物，不读它）。
+CLIP_C = ROOT / "firmware" / "components" / "elder" / "src" / "elder_clip.c"
+CLIP_H = ROOT / "firmware" / "components" / "elder" / "include" / "elder_clip.h"
+
+#: 枚举名 → ogg 文件名。**手工维护**，但它两侧都被校验：
+#: 左边对着 elder_clip.h 的枚举顺序，右边对着目录里真实存在的文件 ——
+#: 少一条会立刻红（找不到文件），多一条也会红（枚举里没有）。
+_CLIP_FILES = {
+    "ELDER_CLIP_MEDICINE": "elder_medicine.ogg",
+    "ELDER_CLIP_TODO": "elder_todo.ogg",
+    "ELDER_CLIP_CONFIRM_HINT": "elder_confirm_hint.ogg",
+    "ELDER_CLIP_DONE": "elder_done.ogg",
+    "ELDER_CLIP_ESCALATED": "elder_escalated.ogg",
+    "ELDER_CLIP_SKIPPED": "elder_skipped.ogg",
+    "ELDER_CLIP_NO_REMINDER": "elder_no_reminder.ogg",
+}
 
 #: 硬约束：设备解码链路的采样率（boards/lichuang-dev/config.h + es8311 编解码器）
 EXPECT_SAMPLE_RATE = 24000
@@ -238,6 +267,78 @@ def check_file(path: Path) -> tuple[bool, str]:
     return ok, "\n".join(lines)
 
 
+def _strip_c_comments(text: str) -> str:
+    """先剥注释再匹配 —— 否则注释里提到的数字/名字会被当成代码。
+
+    这不是洁癖：``kClipMs`` 上方那段注释里写着"medicine 135 帧 = 8100ms"，
+    不剥注释就会把注释里的 135 和 8100 一起抓进"数组内容"里。
+    """
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    text = re.sub(r"//[^\n]*", "", text)
+    return text
+
+
+def _parse_enum_order() -> list[str]:
+    """``elder_clip.h`` 里 ``elder_clip_id_t`` 的枚举顺序（去掉 COUNT）。"""
+    code = _strip_c_comments(CLIP_H.read_text(encoding="utf-8"))
+    m = re.search(r"typedef\s+enum\s*\{(.*?)\}\s*elder_clip_id_t", code, re.S)
+    if not m:
+        raise RuntimeError("elder_clip.h 里找不到 elder_clip_id_t")
+    names = re.findall(r"\b(ELDER_CLIP_[A-Z0-9_]+)\b", m.group(1))
+    return [n for n in names if n != "ELDER_CLIP_COUNT"]
+
+
+def _parse_kclip_ms() -> list[int]:
+    """``elder_clip.c`` 里 ``kClipMs[]`` 的数值（按出现顺序）。"""
+    code = _strip_c_comments(CLIP_C.read_text(encoding="utf-8"))
+    m = re.search(r"kClipMs\s*\[\s*ELDER_CLIP_COUNT\s*\]\s*=\s*\{(.*?)\}\s*;", code, re.S)
+    if not m:
+        raise RuntimeError("elder_clip.c 里找不到 kClipMs[ELDER_CLIP_COUNT] = {...};")
+    return [int(x) for x in re.findall(r"\b\d+\b", m.group(1))]
+
+
+def check_kclip_ms(dirpath: Path) -> tuple[bool, str]:
+    """``kClipMs[]`` 与 OGG 实测时长逐项对账（含顺序）。"""
+    lines: list[str] = ["--- kClipMs[] 与 OGG 实测时长对账 ---"]
+    ok = True
+    try:
+        order = _parse_enum_order()
+        vals = _parse_kclip_ms()
+    except Exception as exc:                      # noqa: BLE001  读不到就是红
+        return False, "\n".join(lines + [f"  ✗ 读不到时长表/枚举：{exc}"])
+
+    if len(vals) != len(order):
+        ok = False
+        lines.append(f"  ✗ kClipMs 有 {len(vals)} 项，elder_clip_id_t 有 {len(order)} 项")
+    if len(_CLIP_FILES) != len(order):
+        ok = False
+        lines.append(f"  ✗ _CLIP_FILES 有 {len(_CLIP_FILES)} 条，枚举有 {len(order)} 项"
+                     f"（加片段必须同时补映射，否则这条断言会静默漏掉新片段）")
+
+    for i, name in enumerate(order):
+        if i >= len(vals):
+            break
+        fname = _CLIP_FILES.get(name)
+        if not fname:
+            ok = False
+            lines.append(f"  ✗ {name} 没有对应的 ogg 文件名（补 _CLIP_FILES）")
+            continue
+        path = dirpath / fname
+        if not path.exists():
+            ok = False
+            lines.append(f"  ✗ {name} → {fname} 不存在")
+            continue
+        packets = iter_packets(parse_pages(path.read_bytes()))
+        actual = len(packets[2:]) * int(EXPECT_FRAME_MS)   # [0]=OpusHead [1]=OpusTags
+        if actual != vals[i]:
+            ok = False
+            lines.append(f"  ✗ {fname}: kClipMs[{i}] = {vals[i]}ms，实测 {actual}ms"
+                         f"（{len(packets) - 2} 帧）—— 重新生成 ogg 后忘了把新时长抄回去")
+        else:
+            lines.append(f"  ✓ {fname}: kClipMs[{i}] = {vals[i]}ms 与实测一致")
+    return ok, "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="校验固件内置 OGG 的 OpusHead 与帧长")
     ap.add_argument("--dir", default=str(DEFAULT_DIR))
@@ -258,6 +359,14 @@ def main(argv: list[str] | None = None) -> int:
     failed = 0
     for path in files:
         ok, text = check_file(path)
+        print(text)
+        if not ok:
+            failed += 1
+
+    # 时长表对账只在"整目录校验"时做 —— 用 --file 指定单个文件时，
+    # 表里其它项本来就不在本次范围内，硬比会得到一堆假红。
+    if not args.file:
+        ok, text = check_kclip_ms(Path(args.dir))
         print(text)
         if not ok:
             failed += 1
