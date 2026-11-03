@@ -109,6 +109,31 @@ async def t_wiring() -> None:
     check("唤醒词必须清掉「退下吧」冷却", s2._dismissed_until == 0.0,
           f"_dismissed_until={s2._dismissed_until}")
 
+    # ---- 按键唤醒：解冷却但**不许**应答（2026-11-03）----
+    #
+    # 固件在 Idle → Listening 补发 detect 解 180 秒冷却（否则老人说完
+    # 「不聊了」后按键说话，服务端最长聋三分钟）。但那条消息带
+    # "greet":false：老人按下键就是要说话，一句「你好，要聊点什么？」
+    # 会把设备推成 Speaking、上行音频被丢弃 —— 他刚开口的字正好没了。
+    s3 = make_session()
+    s3._dismissed_until = time.monotonic() + 60
+    calls3: list[int] = []
+    s3._schedule_wake_greet = lambda: calls3.append(1)
+    await s3._on_listen({"state": "detect", "text": "按键唤醒", "greet": False})
+    check("★ 按键唤醒（greet=false）不排唤醒应答", calls3 == [], f"calls={calls3}")
+    check("★ 按键唤醒仍然解掉冷却（它存在的唯一理由）",
+          s3._dismissed_until == 0.0, f"_dismissed_until={s3._dismissed_until}")
+
+    # 缺省必须照旧应答：老固件根本不带这个字段，判据写成
+    # `not obj.get("greet")` 会让**所有**唤醒都不应答，且完全不报错。
+    s4 = make_session()
+    calls4: list[int] = []
+    s4._schedule_wake_greet = lambda: calls4.append(1)
+    await s4._on_listen({"state": "detect", "text": "你好小智", "greet": True})
+    await s4._on_listen({"state": "detect", "text": "你好小智"})
+    check("★ 缺省 / greet=true 必须照旧应答（老固件不带这个字段）",
+          calls4 == [1, 1], f"calls={calls4}")
+
 
 # ================================================================ 第 2 组
 async def t_text() -> None:
