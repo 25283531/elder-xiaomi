@@ -477,10 +477,18 @@ def check() -> int:
     ok &= SDK_DEFAULTS.is_file() and BEGIN in SDK_DEFAULTS.read_text(encoding="utf-8")
     lcd_ok = LCD_DISPLAY_CC.is_file() and "elder-companion overlay" in LCD_DISPLAY_CC.read_text(encoding="utf-8")
     ok &= lcd_ok
-    # 70/30 对话布局是**直接改上游 lcd_display.cc** 的定制（不是 overlay 注入），
+    # 对话界面布局是**直接改上游 lcd_display.cc** 的定制（不是 overlay 注入），
     # 上游 sync_xiaozhi.py --force 会把它冲掉 ⇒ 这里守住标记，CI 的 merge --check
     # 会红，避免「布局悄悄回退」还照样出包。重贴步骤见 README「上游定制补丁」节。
-    layout_ok = LCD_DISPLAY_CC.is_file() and "elder-layout-70-30" in LCD_DISPLAY_CC.read_text(encoding="utf-8")
+    #
+    # ⚠️ 2026-11-03 标记改名：elder-layout-70-30 → elder-layout-design-20261103。
+    # 那天用户按设计稿把界面从「上下 70/30 分割」改成了「左列文字 + 右侧头像圆」，
+    # 标记名留着不改的话，下一个读到它的人会以为屏上还是上下分割 —— 而本检查
+    # 只 grep 标记字符串，标记说错了它照样绿。旧名一并认（过渡期容错）。
+    layout_ok = LCD_DISPLAY_CC.is_file() and (
+        "elder-layout-design-20261103" in LCD_DISPLAY_CC.read_text(encoding="utf-8")
+        or "elder-layout-70-30" in LCD_DISPLAY_CC.read_text(encoding="utf-8"))
+
     ok &= layout_ok
     # 需求 8（2026-10-22）：全屏大字提醒。同样是**直接改上游**的两处
     # （lcd_display.h 加声明、lcd_display.cc 加实现），上游 sync 会一起冲掉。
@@ -506,7 +514,7 @@ def check() -> int:
     print(f"  main/main.cc     : {'OK' if MAIN_CC.is_file() and 'elder_bridge_start' in MAIN_CC.read_text(encoding='utf-8') else 'MISSING'}")
     print(f"  sdkconfig.defaults: {'OK' if SDK_DEFAULTS.is_file() and BEGIN in SDK_DEFAULTS.read_text(encoding='utf-8') else 'MISSING'}")
     print(f"  display/lcd_display.cc: {'OK' if lcd_ok else 'MISSING'}")
-    print(f"  lcd_display.cc 70/30 布局: {'OK' if layout_ok else 'MISSING（被上游同步冲掉？按 README「上游定制补丁」节重贴）'}")
+    print(f"  lcd_display.cc 对话界面布局: {'OK' if layout_ok else 'MISSING（被上游同步冲掉？按 README「上游定制补丁」节重贴）'}")
     print(f"  lcd_display.h 全屏提醒: {'OK' if remind_h_ok else 'MISSING（需求 8）'}")
     print(f"  lcd_display.cc 全屏提醒: {'OK' if remind_cc_ok else 'MISSING（需求 8）'}")
     print(f"  mcp_server.cc 待机工具: {'OK' if standby_ok else 'MISSING（需求 7）'}")
