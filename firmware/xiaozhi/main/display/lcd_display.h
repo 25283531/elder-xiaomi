@@ -95,13 +95,33 @@ protected:
      * 调用），所以不需要 atomic。 */
     int ChatLineH();        /* 一行多少像素：字体行高 + 行间距，现算不缓存 */
     int ChatPageH();        /* 一页多少像素：整行倍数 */
-    void ChatPageLayout();  /* 重新量文字、决定是否让回答另起一页、按需起定时器 */
+    /* `follow_newest=true` 表示「这一屏要跟着最新一句走」——回答还在往下长时
+     * 用最后一页，别把屏停在开头。详见 lcd_display.cc 里 chat_follow_tail_ 的
+     * 说明。 */
+    void ChatPageLayout(bool follow_newest = false);
     void ChatPageStep();    /* 定时器回调：滚到下一页，最后一页停住 */
     lv_timer_t* chat_page_timer_ = nullptr;
     int chat_page_index_ = 0;       /* 当前页号，0 起 */
     int chat_page_count_ = 0;       /* 总页数 */
     int chat_page_h_ = 0;           /* 页高（像素） */
     int chat_page_max_scroll_ = 0;  /* 内容高 - 容器高，最后一页可能滚不到整页 */
+
+    /* ---- 「跟着最新一句」状态（2026-11-03，用户第 6 条需求：字幕要和语音同步）----
+     *
+     * 问题：字幕是累积的，每来一句都调 ChatPageLayout()，而它原来无条件把
+     * 页号归零滚到顶部。于是长回答里**屏永远停在第一页**，声音却已经念到
+     * 第三页 —— 老人看到的是"字幕和声音对不上"，而且每来一句就弹回顶部
+     * 一次，看起来像在闪。
+     *
+     * 做法：追加 assistant 文字时 follow_newest=true ⇒ 先贴最后一页；
+     * ChatPageStep 在「8 秒内还有新句」时**不翻页**（翻走就等于让字幕和
+     * 声音分家），等回答说完满 8 秒再回到第一页，从头让老人读一遍。
+     *
+     * 为什么是 8 秒：一句回答内部相邻两句间隔 1~4 秒（TTS 语速），取 8 秒
+     * 能容下一次 TTS 抖动而不误判"说完了"；比 20 秒的跨轮判据短，是因为
+     * 这里等的是"这一轮结束"，不是"下一轮开始"。 */
+    bool chat_follow_tail_ = false;
+    uint32_t chat_last_append_tick_ = 0;
 
     /* 上一句 assistant 字幕到达的时刻（lv_tick，毫秒）。
      *

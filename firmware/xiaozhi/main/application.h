@@ -88,6 +88,37 @@ private:
     std::string last_error_message_;
     AudioService audio_service_;
 
+    /* ---- 字幕与语音对齐（2026-11-03，用户实报「字幕比声音快 2 秒以上」）----
+     *
+     * 现象：`sentence_start` 一到就把文字画上屏，而它的音频还要排在
+     * 前面若干帧之后，并且设备播放链路里常驻 MAX_PLAYBACK_TASKS_IN_QUEUE
+     * （16 帧 = 960ms）已解码音频 —— 再加上服务端 TTS 首字延迟，
+     * 字幕必然跑在声音前面 1~2 秒。
+     *
+     * 做法：字幕**先入队**，等到「本句第一个字真的出声」再上屏。
+     * 判据是音频帧计数：`sentence_start` 与它的音频帧走同一条 WS 连接、
+     * 同一个任务、按序到达，所以收到字幕时已收 N 帧，就等于本句音频排在
+     * 第 N 帧之后；PlayedFrameCount() 超过 N 的那一刻就是开口的时刻
+     * （见 audio_service.h 的 ReceivedFrameCount 说明）。
+     *
+     * 为什么不在服务端把 `sentence_start` 往后压：那样只能省掉「TTS 首字
+     * 延迟」这一段，设备侧那 960ms 缓冲仍然在；而设备侧这一条判据把两段
+     * 一起吃掉，且**完全不碰音频通路**（用户的硬约束：声音已经正常，
+     * 不许再修出破音/卡顿 —— 所以宁可不缩缓冲）。
+     *
+     * 线程：只在主任务里读写（QueueSubtitle / FlushSubtitles 都经由
+     * Schedule 进来），定时器回调只负责 Schedule，不直接碰这个队列。 */
+    struct PendingSubtitle {
+        std::string text;
+        int frame_mark = 0;      // 收到本句字幕时已收的音频帧数
+        int64_t queued_us = 0;   // 入队时刻（兜底超时用）
+    };
+    std::deque<PendingSubtitle> pending_subtitles_;
+    esp_timer_handle_t subtitle_timer_handle_ = nullptr;
+    void QueueSubtitle(const std::string& text, int frame_mark);
+    void FlushSubtitles(bool force);
+    void ClearPendingSubtitles();
+
     bool has_server_time_ = false;
     bool aborted_ = false;
     int clock_ticks_ = 0;

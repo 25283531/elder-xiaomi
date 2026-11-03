@@ -1297,6 +1297,13 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
  * 太短等于催他，太长他会以为设备卡住了。 */
 #define CHAT_PAGE_DWELL_MS  6000
 
+/* 「回答还在往下长」的判定窗口（见 chat_follow_tail_ 的说明）。
+ * 8 秒内还来过新句 ⇒ 认为这一轮还没说完，**不许翻页**（翻走就让字幕和
+ * 声音分家）；满 8 秒没有新句 ⇒ 说完了，回到第一页从头让老人读。
+ * 为什么不复用 20 秒的跨轮判据：那个判的是"下一轮开始"，这个是
+ * "这一轮结束"，两者不是一回事。 */
+#define CHAT_PAGE_LIVE_MS   8000
+
 int LcdDisplay::ChatLineH() {
     /* 字体行高随主题变（20px 小字库 line_height=25 / 30px 大字库 38），
      * 所以**每次现算**，不能缓存 —— 缓存的话换一次主题，分页就按旧行高切，
@@ -1320,7 +1327,7 @@ int LcdDisplay::ChatPageH() {
     return lines * line_h;
 }
 
-void LcdDisplay::ChatPageLayout() {
+void LcdDisplay::ChatPageLayout(bool follow_newest) {
     if (bottom_bar_ == nullptr || chat_user_label_ == nullptr) return;
 
     const int page_h = ChatPageH();
@@ -1364,11 +1371,31 @@ void LcdDisplay::ChatPageLayout() {
     int pages = (total + page_h - 1) / page_h;
     if (pages < 1) pages = 1;
 
-    chat_page_index_ = 0;
     chat_page_count_ = pages;
     chat_page_h_ = page_h;
     chat_page_max_scroll_ = max_scroll;
-    lv_obj_scroll_to_y(bottom_bar_, 0, LV_ANIM_OFF);
+
+    /* 起始页：跟着最新一句走，还是回到第一页？
+     *
+     * ⚠️ 这一段是「字幕与语音同步」的另一半（2026-11-03 用户第 6 条需求）。
+     * 原来这里无条件 `chat_page_index_ = 0` + 滚到顶部 —— 字幕既然是累积的、
+     * 每句都调本函数，屏就**永远停在第一页**：声音念到第三页，老人看到的
+     * 还是第一页的字，而且每来一句弹回顶部一次（像在闪）。
+     *
+     * 追加 assistant 文字时传 follow_newest=true ⇒ 先贴最后一页，让屏上的字
+     * 和正在念的那句在一起；等这一轮说完（ChatPageStep 判 8 秒无新句）再
+     * 回到第一页，从头让老人读一遍。
+     *
+     * 只有 pages > 1 才谈得上"贴哪一页"，单页时两者等价 —— 所以这里不用
+     * 分支，直接按 pages-1 算（pages==1 时就是 0）。 */
+    chat_follow_tail_ = follow_newest && (pages > 1);
+    if (follow_newest) {
+        chat_last_append_tick_ = lv_tick_get();
+    }
+    chat_page_index_ = chat_follow_tail_ ? (pages - 1) : 0;
+    int start_y = chat_page_index_ * page_h;
+    if (start_y > max_scroll) start_y = max_scroll;   /* 最后一页滚不满 */
+    lv_obj_scroll_to_y(bottom_bar_, start_y, LV_ANIM_OFF);
 
     if (pages > 1) {
         if (chat_page_timer_ == nullptr) {
@@ -1395,6 +1422,27 @@ void LcdDisplay::ChatPageLayout() {
 void LcdDisplay::ChatPageStep() {
     if (bottom_bar_ == nullptr || chat_page_count_ <= 1) {
         if (chat_page_timer_ != nullptr) lv_timer_pause(chat_page_timer_);
+        return;
+    }
+    /* 「跟着最新一句」期间不许翻页（见 chat_follow_tail_ 的说明）：
+     * 声音还在往下念，把屏翻回前面就等于让字幕和声音分家 —— 正是这次要修
+     * 的那个现象。判据用时间而不是"有没有新句"：新句到达本身就会 reset 这个
+     * 定时器，能走到这里说明已经安静了 CHAT_PAGE_DWELL_MS，所以这里再等
+     * 一个 CHAT_PAGE_LIVE_MS 就是从"最后一句"起算的完整静默窗口。 */
+    if (chat_follow_tail_) {
+        if ((uint32_t)(lv_tick_get() - chat_last_append_tick_) < CHAT_PAGE_LIVE_MS) {
+            lv_timer_reset(chat_page_timer_);
+            return;
+        }
+        /* 这一轮说完了：回到第一页，让老人从头读一遍。
+         * 不这样的话，屏会一直停在最后一句上，前面的内容再也看不到。 */
+        chat_follow_tail_ = false;
+        chat_page_index_ = 0;
+        lv_obj_scroll_to_y(bottom_bar_, 0, LV_ANIM_ON);
+        last_ui_change_tick_ = lv_tick_get();
+        lv_timer_reset(chat_page_timer_);
+        ESP_LOGI(TAG, "对话分页：说完 %d 秒，回到第 1/%d 页",
+                 CHAT_PAGE_LIVE_MS / 1000, chat_page_count_);
         return;
     }
     if (chat_page_index_ + 1 >= chat_page_count_) {
@@ -1524,8 +1572,12 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     /* 分页（2026-11-03 用户需求）：两段话放不下一页时，把用户话撑成整页
      * 的整数倍让回答另起一页；页数 > 1 就起定时器自动翻页。
      * 必须在**两段文字都写完之后**量 —— 量在写之前只能看到上一轮的高度，
-     * 判断"放不放得下"必然错。 */
-    ChatPageLayout();
+     * 判断"放不放得下"必然错。
+     *
+     * follow_newest：只有 assistant 追加才跟最新一句走。user / system 到达
+     * 时屏幕本来就该回到开头（用户话是新一轮的第一行，系统提示是瞬时状态），
+     * 跟着"最后一页"反而会把它顶出可视区。 */
+    ChatPageLayout(!is_user && !is_system);
 }
 #endif  /* CONFIG_USE_WECHAT_MESSAGE_STYLE —— 以下两个函数两个分支都要有 */
 

@@ -146,6 +146,15 @@ jobs:
       - name: 长按应答 / 字幕累积 / 多条提醒同屏（静态接线）
         run: python tools/smoke_longpress_subtitle.py
 
+      # 2026-11-03 用户需求第四条：对话状态下字幕比声音快 2 秒以上。
+      #
+      # 修法是"等播放"而不是"缩缓冲"（缩缓冲会重新打开 P2 的断续/破音，
+      # 那是用户的硬约束）。判据依赖两个帧计数必须落在**两个不同的函数**
+      # 里 —— 放错了编译完全不报错，症状分别是「字幕永不显示」和
+      # 「字幕抢跑一帧」，所以只能靠静态定位函数体来守。
+      - name: 字幕与语音同步（帧计数门禁 / 静态接线）
+        run: python tools/smoke_subtitle_sync.py
+
   build:
     name: 编译 ESP32-S3 固件
     runs-on: ubuntu-latest

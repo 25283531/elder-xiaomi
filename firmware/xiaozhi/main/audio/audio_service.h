@@ -2,6 +2,7 @@
 #define AUDIO_SERVICE_H
 
 #include <memory>
+#include <atomic>   // 字幕/语音对齐用的下行帧计数（ReceivedFrameCount/PlayedFrameCount）
 #include <deque>
 #include <condition_variable>
 #include <chrono>
@@ -127,6 +128,26 @@ public:
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
+
+    /* 下行帧计数：**字幕与语音对齐**用（2026-11-03 用户实报"字幕比声音快 2 秒以上"）。
+     *
+     * 两个计数器都是"从开机起的累计值"，调用方只关心**差值**：
+     *   · ReceivedFrameCount() —— 已经**收进**解码队列的帧数（在 PushPacketToDecodeQueue 里 +1）；
+     *   · PlayedFrameCount()   —— 已经**写进 codec**（= 老人真的听到）的帧数。
+     *
+     * 为什么需要它们：`sentence_start` 与它的音频帧在**同一条 WS 连接、同一个任务**
+     * 里按序到达，所以「字幕到达时已收 N 帧」就等于「这句话的音频排在第 N 帧之后」。
+     * 等 PlayedFrameCount() 超过 N，就是这句话第一个字真正出声的时刻。
+     *
+     * 不这么做的话，字幕会在**收到**的那一刻就显示，而设备播放链路里
+     * 常驻约 16 帧（960ms）已解码音频（MAX_PLAYBACK_TASKS_IN_QUEUE），
+     * 再加上 TTS 首帧延迟 —— 字幕必然跑在声音前面 1~2 秒。
+     *
+     * 用 std::atomic 而不是加锁：调用方在协议任务 / 字幕任务里读，
+     * 播放任务里写，都是单次读写，加锁只会给音频通路添无谓的阻塞风险。 */
+    int ReceivedFrameCount() const { return received_frames_.load(std::memory_order_relaxed); }
+    int PlayedFrameCount() const { return played_frames_.load(std::memory_order_relaxed); }
+
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
     void PlaySound(const std::string_view& sound);
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
@@ -145,6 +166,9 @@ private:
     OpusResampler reference_resampler_;
     OpusResampler output_resampler_;
     DebugStatistics debug_statistics_;
+    // 字幕对齐用的累计帧数（见头文件里 ReceivedFrameCount 的说明）。
+    std::atomic<int> received_frames_{0};
+    std::atomic<int> played_frames_{0};
     srmodel_list_t* models_list_ = nullptr;
 
     EventGroupHandle_t event_group_;
