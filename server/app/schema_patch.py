@@ -390,7 +390,7 @@ NEW_COLUMNS: Final[list[tuple[str, str, str, str]]] = [
     # ⚠️ 这一条漏登记 = 生产库永远没有这一列：本仓没有 Alembic，
     #    db.create_all() 只建**缺失的表**，绝不给已存在的表加列。
     ("reminders", "medicines", "TEXT DEFAULT '[]'", "JSON"),
-    # ---- reminders / reminder_events：时区偏差快照（2026-11-04）----
+    # ---- reminders / reminder_events：时区偏差快照（2026-11-03）----
     # 用户定下的存储口径：「服务端记录在数据库的时候记录为北京时间加上时区偏差」。
     # 值是**相对北京时间的偏差分钟**（正 = 比北京早，如 Africa/Lagos = -420）。
     #
