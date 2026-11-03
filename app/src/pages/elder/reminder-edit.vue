@@ -7,8 +7,8 @@
 <script setup lang="ts">
 import { onLoad } from '@dcloudio/uni-app'
 import { computed, ref } from 'vue'
-import { createReminder, listReminders, updateReminder } from '@/api/elder'
-import type { MedicineItem, Reminder } from '@/api/elder'
+import { createReminder, deviceTimezone, listReminders, updateReminder } from '@/api/elder'
+import type { DeviceTimezone, MedicineItem, Reminder } from '@/api/elder'
 
 const devicePk = ref(0)
 const editId = ref(0)
@@ -52,6 +52,35 @@ const form = ref<Partial<Reminder>>({
 const timesText = ref('08:00')
 const monthText = ref('')
 const methods = ref<Record<string, boolean>>({ voice: true, button: true, app: false })
+
+/**
+ * 这台设备按哪个时区提醒（GET /api/devices/{pk}/timezone）。
+ *
+ * 为什么必须显示出来：提醒是**从设备上响出来**的，"早上 8 点吃药"指的是
+ * 老人眼前那个钟的 8 点。家属手机在北美、设备在非洲时，按手机时区理解的
+ * 8 点会整整错 7 小时 —— 这是服药提醒，错小时是安全问题，所以要在保存
+ * **之前**就告诉他这句话会被哪个钟执行。
+ *
+ * `null` = 还没查到（不显示），`ok=false` = 判不出来（显示服务端给的兜底说明）。
+ * **判不出来不是错误**：设备在 NAT 后面、刚出厂还没联过网都会这样。
+ */
+const devTz = ref<DeviceTimezone | null>(null)
+
+/** 用户填的第一个钟点，换算成"相当于北京时间几点"。空串 = 算不出来。 */
+const tzEquiv = computed(() => {
+  const t = devTz.value
+  if (!t || !t.ok) return ''
+  const first = (timesText.value || '').split(/[,，\s]+/).filter(Boolean)[0] || ''
+  const m = /^(\d{1,2}):(\d{2})$/.exec(first)
+  if (!m) return ''
+  // 规则时区钟点 = 北京钟点 + 偏差 ⇒ 北京钟点 = 规则钟点 - 偏差。
+  // 拉各斯 08:00、偏差 -420 ⇒ 08:00 - (-420min) = 15:00。
+  const raw = Number(m[1]) * 60 + Number(m[2]) - t.offset_from_beijing_min
+  const norm = ((raw % 1440) + 1440) % 1440
+  const hh = String(Math.floor(norm / 60)).padStart(2, '0')
+  const mm = String(norm % 60).padStart(2, '0')
+  return `${hh}:${mm}`
+})
 
 /** 服务端限制：一条提醒最多 4 种药。超了接口会 422，所以端侧先拦住。 */
 const MAX_MEDICINES = 4
@@ -194,10 +223,28 @@ async function save() {
   catch { /* 已提示 */ }
 }
 
+/**
+ * 拉「这台设备按哪个时区」。
+ *
+ * 失败**只影响提示条**，绝不影响保存：查不到时区不显示这一块，用户照常能
+ * 建提醒（服务端照样会按设备时区落库）。把一次只读的辅助请求做成保存的
+ * 前置条件，等于让"提示查不到"变成"提醒建不了"。
+ */
+async function loadDevTz() {
+  if (!devicePk.value) return
+  try {
+    devTz.value = await deviceTimezone(devicePk.value)
+  }
+  catch {
+    devTz.value = null
+  }
+}
+
 onLoad((options: any) => {
   devicePk.value = Number(options?.devicePk || 0)
   editId.value = Number(options?.id || 0)
   if (editId.value) load()
+  loadDevTz()
 })
 </script>
 
@@ -211,6 +258,19 @@ onLoad((options: any) => {
     <view class="card notice">
       <text class="notice-t">保存后最多需要 5 分钟才会同步到设备</text>
       <text class="notice-s">提醒时间如果距离现在不足 5 分钟，这一次设备会漏报 —— 请把时间设在 5 分钟以后。</text>
+    </view>
+
+    <!-- 设备时区告知（2026-11-04 用户要求）。
+         场景：手机在北美、设备在非洲、服务器在北京。家属填的"上午 8 点"
+         是按**设备**那个钟执行的，不说清楚他会以为是北美的 8 点。
+         文案 hint 由服务端拼（单一真源），这里只渲染 + 补一句换算。
+         devTz 为 null（还没查到 / 查失败）时整块不显示 —— 不能因此拦住保存。 -->
+    <view v-if="devTz" class="card notice">
+      <text class="notice-t">提醒时间按设备所在时区生效</text>
+      <text class="notice-s">{{ devTz.hint }}</text>
+      <text v-if="tzEquiv && devTz.offset_from_beijing_min !== 0" class="notice-s">
+        您填的 {{ timesText }} 相当于北京时间 {{ tzEquiv }}。
+      </text>
     </view>
 
     <view class="card">

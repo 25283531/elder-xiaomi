@@ -499,6 +499,20 @@
             提醒时间如果距离现在不足 5 分钟，这一次设备会<b>漏报</b>
             —— 请把时间设在 5 分钟以后。
           </div>
+          <!-- 设备时区告知（2026-11-04 用户要求）。
+               场景：手机在北美、设备在非洲、服务器在北京。家属填的"上午 8 点"
+               是按**设备**那个钟执行的，不说清楚他会以为是北美的 8 点。
+               文案 hint 由服务端拼（单一真源），这里只渲染 + 补一句换算。
+               devTz 为 null（还没查到 / 查失败）时整块不显示。 -->
+          <div v-if="devTz" style="margin:10px 0 2px;padding:9px 12px;border-radius:8px;
+                      background:#e6f4ff;border:1px solid #91caff;
+                      color:#003a8c;font-size:12px;line-height:1.7">
+            🌍 <b>提醒时间按设备所在时区生效。</b>
+            {{ devTz.hint }}
+            <template v-if="tzEquiv && devTz.offset_from_beijing_min !== 0">
+              您填的 {{ timesText }} 相当于<b>北京时间 {{ tzEquiv }}</b>。
+            </template>
+          </div>
           <div class="grid g2">
             <div><label>标题</label><input v-model="rForm.title" style="width:100%" /></div>
             <div><label>类型</label>
@@ -1346,6 +1360,15 @@ createApp({
       // 提醒
       curDeviceId: null, reminders: [], events: [],
       rBox: null, rForm: null, timesText:'', weekText:'', monthText:'',
+      // 这台设备按哪个时区提醒（GET /api/devices/{pk}/timezone）。
+      //
+      // 为什么必须显示：提醒是**从设备上响出来**的，"早上 8 点吃药"指的是
+      // 老人眼前那个钟的 8 点。家属手机在北美、设备在非洲时，按手机时区理解的
+      // 8 点会整整错 7 小时 —— 这是服药提醒，错小时是安全问题。
+      //
+      // null = 还没查到 / 查失败（整块不显示）；ok=false = 判不出来（显示
+      // 服务端给的兜底说明）。**判不出来不是错误**，不能因此拦住保存。
+      devTz: null,
       // 提醒操作历史（GET /api/reminders/audits）。提醒是**软删除**，删掉的规则
       // 仍在库里，这个视图就是"删掉的提醒去哪了"的答案。
       //   rView          'list' = 当前提醒 / 'history' = 操作历史
@@ -1450,6 +1473,28 @@ createApp({
     // confirm_method_text，前端不再翻译一遍枚举，避免两边文案漂移。
     confirmedItems(){
       return this.medItems.filter(it => it.state === 2);
+    },
+    // 用户填的第一个钟点换算成"相当于北京时间几点"。空串 = 算不出来 / 不必显示。
+    //
+    // 为什么要有它：提示条说了"按设备时区生效"，但家属脑子里仍是自己那个钟。
+    // 给一个具体的北京时间，他才能判断"这个点老人在不在家、吃没吃饭"。
+    //
+    // ⚠️ 必须是 computed，不能写成 methods：`{{ tzEquiv }}` 里放方法名得到的是
+    // 函数对象（渲染成 function () { [native code] }，v-if 里恒为真），
+    // 而且 timesText 变化不会触发重算。门禁 smoke_frontend_hygiene 的 L1/L1b 就是拦这个。
+    tzEquiv(){
+      const t = this.devTz;
+      if (!t || !t.ok) return '';
+      const first = (this.timesText || '').split(/[,，\s]+/).filter(Boolean)[0] || '';
+      const m = /^(\d{1,2}):(\d{2})$/.exec(first);
+      if (!m) return '';
+      // 规则时区钟点 = 北京钟点 + 偏差 ⇒ 北京钟点 = 规则钟点 - 偏差。
+      // 拉各斯 08:00、偏差 -420 ⇒ 08:00 - (-420min) = 15:00。
+      const raw = Number(m[1]) * 60 + Number(m[2]) - t.offset_from_beijing_min;
+      const norm = ((raw % 1440) + 1440) % 1440;
+      const hh = String(Math.floor(norm / 60)).padStart(2, '0');
+      const mm = String(norm % 60).padStart(2, '0');
+      return hh + ':' + mm;
     }
   },
   methods:{
@@ -1827,6 +1872,21 @@ createApp({
       this.weekText = (this.rForm.weekdays||[]).join(',');
       this.monthText = (this.rForm.month_days||[]).join(',');
       this.rBox = true;
+      // 每次打开弹窗都重拉一次：设备可能刚换过网络（出差、搬家），
+      // 缓存的时区会让提示条说错地方 —— 而这条提示正是给"人不在国内"用的。
+      this.loadDevTz();
+    },
+    // 拉「这台设备按哪个时区」。失败**只影响提示条**，绝不影响保存：
+    // 查不到就不显示这一块，用户照常能建提醒（服务端照样按设备时区落库）。
+    // 把一次只读的辅助请求做成保存的前置条件，等于让"提示查不到"变成
+    // "提醒建不了"。
+    async loadDevTz(){
+      if (!this.curDeviceId){ this.devTz = null; return; }
+      try{
+        this.devTz = await this.api('/api/devices/'+this.curDeviceId+'/timezone');
+      }catch(e){
+        this.devTz = null;
+      }
     },
     async saveReminder(){
       this.rForm.times_of_day = this.timesText.split(/[,，\s]+/).filter(Boolean);
