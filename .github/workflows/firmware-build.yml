@@ -36,6 +36,10 @@ on:
       # **必须单列**：它读的是 firmware/ 下的 .ogg，但"改脚本"这件事本身
       # 不会碰 firmware/，不列进来就会出现「改了校验逻辑但 CI 不跑」。
       - 'tools/verify_elder_clips.py'
+      # AGC / 降噪 生效性（2026-11-04）。同理必须单列：它读的是
+      # afe_audio_processor.cc 与 sdkconfig.defaults，但"改断言本身"不碰
+      # firmware/，不列进来就会「改了断言却没人跑」。
+      - 'tools/smoke_afe_agc_ns.py'
       - '.github/workflows/firmware-build.yml'
   workflow_dispatch:
     inputs:
@@ -154,6 +158,19 @@ jobs:
       # 「字幕抢跑一帧」，所以只能靠静态定位函数体来守。
       - name: 字幕与语音同步（帧计数门禁 / 静态接线）
         run: python tools/smoke_subtitle_sync.py
+
+      # 2026-11-04：用户说「你刚才没有说内容吗？」，ASR 只返回「你刚才没有说。」
+      # 生产留证 wav 实测：上行峰值只有 0.036（-29dBFS），正常该在 -6~-12；
+      # 同一时刻底噪 0.0003 ⇒ SNR ≈ 37dB，**噪声不是问题，电平才是**。
+      #
+      # 这两处都属于"配了但什么都没发生"，而且构建/CI/审查全绿：
+      #   * AGC 自 10-15 起 agc_init = false，从来没过；
+      #   * 降噪 10-31 选了 NSNET2，可分区表没有 model 分区 ⇒ ns_init 恒 false，
+      #     两星期里一帧降噪都没做（唯一证据是开机日志的 AFE 管线串，NS 槽空的）。
+      # 只能靠静态断言守：AGC 必须 true、降噪必须走 WebRTC 算法分支、
+      # 模板与生成物必须一致（手改生成物会被下次 merge 覆盖）。
+      - name: AGC / 降噪 生效性（静态）
+        run: python tools/smoke_afe_agc_ns.py
 
   build:
     name: 编译 ESP32-S3 固件
