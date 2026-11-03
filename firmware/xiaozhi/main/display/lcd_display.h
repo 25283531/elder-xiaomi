@@ -126,16 +126,22 @@ protected:
      * 两张共用同一条 lv_anim（同一个 exec 回调里算两个 x），相位天然同步。 */
     lv_obj_t* idle_marquee_image2_ = nullptr;
     int32_t idle_marquee_size_ = 0;             /* 表情边长，exec 回调算错位用 */
-    /* AdvanceIdleMarqueeImage() 的轮流标志：每次换图只填一张，
-     * 一次回绕（exec 回调里连调两次）正好把两张都换掉。 */
-    bool idle_marquee_second_turn_ = false;
+    /* 第二张「当前处于回绕状态」的标志（见 IdleMarqueeExecCb）。
+     * 它的换图时机**必须**与第一张不同：两张相位差半程，第一张回绕时第二张
+     * 正好在屏幕中间，那一刻换 src 会让老人看到"屏中央那张脸突然变了"。 */
+    bool idle_marquee_image2_wrapped_ = false;
     int32_t idle_marquee_last_x_ = 0;           /* 上一帧的 x，用来判「滚完一轮」 */
+    /* 两张图共用的取图游标：谁先换图谁拿走下一张，因此两张永远不会撞成
+     * 同一个表情（ready 列表 ≥ 2 项时）。 */
     size_t idle_marquee_next_ = 0;              /* 下一张在 ready 列表里的下标 */
     /* 本次启动时校验过"取得到图"的名字（指向静态字面量，无需释放）。
      * 每次启动重建：assets 分区挂载晚于 SetupUI，主题也可能换，缓存会过期。 */
     std::vector<const char*> idle_marquee_ready_;
     static void IdleMarqueeExecCb(void* var, int32_t x);
-    void AdvanceIdleMarqueeImage();
+    /* 只给**一张**换图：调用方决定是谁、以及此刻它是否在屏外。
+     * 取 target 参数而不是内部轮流，是为了让"换图发生在屏外"这件事由调用点
+     * 负责（两张的屏外时刻不同，见 IdleMarqueeExecCb 里的说明）。 */
+    void AdvanceIdleMarqueeImage(lv_obj_t* target);
     // <<< END elder-idle-marquee-internals <<<
 
 protected:

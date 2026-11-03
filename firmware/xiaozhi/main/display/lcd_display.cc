@@ -1609,8 +1609,7 @@ void LcdDisplay::IdleMarqueeExecCb(void* var, int32_t x) {
      * （lv_anim.c 的 anim_completed_handler），而这里是无限循环，永远等不到。
      * 也不用 start_cb：repeat 不走 start_cb，只在首次启动时调。 */
     if (x > self->idle_marquee_last_x_) {
-        self->AdvanceIdleMarqueeImage();
-        self->AdvanceIdleMarqueeImage();   /* 第二张也要跟着换（见下） */
+        self->AdvanceIdleMarqueeImage(self->idle_marquee_image_);
     }
     self->idle_marquee_last_x_ = x;
     lv_obj_set_x(self->idle_marquee_image_, x);
@@ -1627,26 +1626,33 @@ void LcdDisplay::IdleMarqueeExecCb(void* var, int32_t x) {
      * 越界回绕：x2 = x + half，x 从 LV_HOR_RES 走到 -img_w，所以 x2 会跑到
      * 屏幕右侧之外 —— 减一个 track 把它接回左缘外，视觉上就是"前一张还在
      * 屏中、后一张刚从右缘进来"。 */
-    if (self->idle_marquee_image2_ != nullptr) {
-        const int32_t track = LV_HOR_RES + self->idle_marquee_size_;
-        int32_t x2 = x + track / 2;
-        if (x2 > LV_HOR_RES) {
-            x2 -= track;
-        }
-        lv_obj_set_x(self->idle_marquee_image2_, x2);
-    }
-}
-
-void LcdDisplay::AdvanceIdleMarqueeImage() {
-    if (idle_marquee_ready_.empty()) {
+    if (self->idle_marquee_image2_ == nullptr) {
         return;
     }
-    /* 两张图轮流填：一次回绕时 exec 回调会连调本函数两次，
-     * 正好把 image_ 与 image2_ 都换成新的、且两张不是同一个表情。 */
-    lv_obj_t* target = idle_marquee_second_turn_ ? idle_marquee_image2_
-                                                 : idle_marquee_image_;
-    idle_marquee_second_turn_ = !idle_marquee_second_turn_;
-    if (target == nullptr) {
+    const int32_t track = LV_HOR_RES + self->idle_marquee_size_;
+    int32_t x2 = x + track / 2;
+    const bool wrapped = (x2 > LV_HOR_RES);
+    if (wrapped) {
+        x2 -= track;
+    }
+    /* ⚠️ 第二张**自己**走到右缘外的那一刻才换图，绝不跟第一张共用一个时刻。
+     *
+     * 两张相位差半程 ⇒ 第一张回绕（x 从 -img_w 一下跳回 LV_HOR_RES）的那一帧，
+     * 第二张正好停在屏幕中间（x2 = x + half ≈ half - img_w）。跟着第一张一起
+     * 换 src，老人看到的就是"屏中央那张脸突然变成了另一个表情"——
+     * 而换图本来的含义是"上一张已经走出去了，新的从右边进来"，全程该发生在屏外。
+     *
+     * wrapped 由 true 变 false 就是"刚从右缘外接回来"的那一帧（x 跨过
+     * LV_HOR_RES - track/2），此刻 x2 == LV_HOR_RES ⇒ 整张在屏外，换图看不见。 */
+    if (self->idle_marquee_image2_wrapped_ && !wrapped) {
+        self->AdvanceIdleMarqueeImage(self->idle_marquee_image2_);
+    }
+    self->idle_marquee_image2_wrapped_ = wrapped;
+    lv_obj_set_x(self->idle_marquee_image2_, x2);
+}
+
+void LcdDisplay::AdvanceIdleMarqueeImage(lv_obj_t* target) {
+    if (target == nullptr || idle_marquee_ready_.empty()) {
         return;
     }
     auto* theme = static_cast<LvglTheme*>(current_theme_);
@@ -1756,7 +1762,7 @@ bool LcdDisplay::StartIdleMarquee() {
     idle_marquee_size_ = img_sz;
 
     idle_marquee_next_ = 0;
-    idle_marquee_second_turn_ = false;
+    idle_marquee_image2_wrapped_ = false;
     const LvglImage* first = collection->GetEmojiImage(idle_marquee_ready_[0]);
     if (first == nullptr) {
         /* 上面刚校验过，走到这里说明这一瞬间主题换了 —— 交给下一轮兜底 */
@@ -1867,7 +1873,7 @@ void LcdDisplay::StopIdleMarquee() {
     }
     idle_marquee_last_x_ = 0;
     idle_marquee_next_ = 0;
-    idle_marquee_second_turn_ = false;
+    idle_marquee_image2_wrapped_ = false;
 }
 
 /* 进入待机：立即开播待机跑马灯，**不**等防烧屏的 60 秒。
