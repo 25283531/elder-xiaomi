@@ -1479,6 +1479,42 @@ esp_err_t elder_reminder_confirm_server(uint32_t server_id,
     return confirm_ex_inner((uint8_t)idx, confirm_method, true);
 }
 
+/* 日程类「播报即完成」。为什么**不走 set_state()** 见头文件的长注释：
+ * 它会闪「药吃完了」的绿灯（还会顺带停掉同分钟里服药提醒的闪灯）、
+ * 会重入 OnReminder(DONE) 把刚推上去的屏立刻收掉、还会多报一条 CONFIRMED。
+ * 这里只做「状态 + 位图」两件事，与 restore_daily_state() 同一路数。 */
+esp_err_t elder_reminder_auto_done(uint8_t id)
+{
+    if (id >= g.table.count || id >= ELDER_REMINDER_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (g.state[id] == (uint8_t)ELDER_RMD_DONE) {
+        return ESP_ERR_INVALID_STATE;   /* 幂等：已完成后重复调用不算错 */
+    }
+    /* 只对非服药类开放。服药提醒必须老人确认 —— 这条闸门放在引擎里而不是
+     * 调用侧，是因为"顺手给服药也自动完成"会让依从率统计立刻失真，
+     * 而那个后果要到家属看报表时才暴露。 */
+    if (g.table.items[id].type == ELDER_RMD_TYPE_MEDICINE) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_LOGI(TAG, "[%s] 日程类播报即完成（不闪完成灯、不回调、不额外上报）",
+             g.table.items[id].label);
+
+    g.state[id] = (uint8_t)ELDER_RMD_DONE;
+    g.table.done_today |= (uint16_t)(1u << id);
+    g.table.pending_today &= (uint16_t)~(1u << id);
+    /* fired_today 必须置位：tick() 的触发条件是 `!fired_today[i] && IDLE`，
+     * 重启后 restore_daily_state() 靠 done_today 反推出 DONE，这里保持同一口径。 */
+    g.table.fired_today |= (uint16_t)(1u << id);
+    g.fired_today[id] = true;
+    g.confirm_deadline_us[id] = 0;
+    g.pending_since_us[id] = 0;
+    g.half_since_us[id] = 0;
+    g.dirty = true;
+    return ESP_OK;
+}
+
 void elder_reminder_arm_confirm(uint8_t id)
 {
     if (id >= g.table.count) return;
