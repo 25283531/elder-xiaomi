@@ -48,9 +48,15 @@ void Protocol::SendAbortSpeaking(AbortReason reason) {
     SendText(message);
 }
 
-void Protocol::SendWakeWordDetected(const std::string& wake_word) {
+void Protocol::SendWakeWordDetected(const std::string& wake_word, bool greet) {
     std::string json = "{\"session_id\":\"" + session_id_ + 
-                      "\",\"type\":\"listen\",\"state\":\"detect\",\"text\":\"" + wake_word + "\"}";
+                      "\",\"type\":\"listen\",\"state\":\"detect\",\"text\":\"" + wake_word + "\"";
+    /* 只在**不要**应答时加这个字段：老服务端看到未知字段无害，但让默认
+     * 路径的报文与升级前逐字节一致，出问题时少一个变量。 */
+    if (!greet) {
+        json += ",\"greet\":false";
+    }
+    json += "}";
     SendText(json);
 }
 

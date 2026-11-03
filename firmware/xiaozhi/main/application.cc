@@ -988,7 +988,11 @@ void Application::SetDeviceState(DeviceState state) {
              * 只是解冷却 + 清缓冲。 */
             if (previous_state == kDeviceStateIdle &&
                 protocol_ != nullptr && protocol_->IsAudioChannelOpened()) {
-                protocol_->SendWakeWordDetected("按键唤醒");
+                /* greet=false：这条 detect 只用来解服务端的待机冷却，
+                 * **不要**唤醒应答。老人按下键就是在等自己说话被听见，
+                 * 一句「你好，要聊点什么？」会让设备转成 Speaking、上行
+                 * 音频被丢弃 —— 他刚开口的字正好没了。 */
+                protocol_->SendWakeWordDetected("按键唤醒", false);
             }
 
             // Make sure the audio processor is running

@@ -68,7 +68,18 @@ public:
     virtual void CloseAudioChannel() = 0;
     virtual bool IsAudioChannelOpened() const = 0;
     virtual bool SendAudio(std::unique_ptr<AudioStreamPacket> packet) = 0;
-    virtual void SendWakeWordDetected(const std::string& wake_word);
+    /* 唤醒通知（``listen/detect``）。
+     *
+     * ``greet`` = false 时消息里带 ``"greet":false``，服务端据此**不排唤醒
+     * 应答**。2026-11-03 起按键唤醒也发这条（它同时是解除服务端 180 秒
+     * 待机冷却的唯一出口），而那种场合老人按下键就是要说话 —— 一句
+     * 「你好，要聊点什么？」会把设备推成 Speaking、上行音频被丢弃，
+     * 他刚开口的几个字正好没了。
+     *
+     * 默认 true：唤醒词那条路保持原样（老服务端不认识这个字段也不会出错，
+     * 它只看 ``state``）。 */
+    virtual void SendWakeWordDetected(const std::string& wake_word,
+                                      bool greet = true);
     virtual void SendStartListening(ListeningMode mode);
     virtual void SendStopListening();
     virtual void SendAbortSpeaking(AbortReason reason);

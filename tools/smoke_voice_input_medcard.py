@@ -316,6 +316,30 @@ def t5_wake_clears_cooldown() -> None:
     check("self._dismissed_until = 0.0" in listen,
           "detect 会清掉冷却", "")
 
+    # ---- 但按键唤醒不许触发唤醒应答 ----
+    #
+    # 「你好，要聊点什么？」会让设备转成 Speaking、上行音频被丢弃 ——
+    # 老人刚开口的字正好没了，就是用户报的「前面两个字没识别到」。
+    check('obj.get("greet") is False' in listen,
+          "服务端按 greet 字段决定是否应答",
+          "判成 `not obj.get(...)` ⇒ 老固件不带该字段，所有唤醒都不应答且不报错")
+    check("if not no_greet:" in listen,
+          "greet=false 时跳过唤醒应答", "跳过这一判 ⇒ 按键唤醒也念一句寒暄，吃掉老人开口")
+    check("SendWakeWordDetected(\"按键唤醒\", false)" in body,
+          "固件按键唤醒带 greet=false",
+          "不带 ⇒ 新服务端会念寒暄；这条链路的失败形态只有耳朵能发现")
+
+    proto_h = strip_comments((MAIN / "protocols" / "protocol.h")
+                             .read_text(encoding="utf-8"))
+    proto_c = strip_comments((MAIN / "protocols" / "protocol.cc")
+                             .read_text(encoding="utf-8"))
+    check("bool greet = true" in proto_h,
+          "SendWakeWordDetected 的 greet 默认 true（唤醒词那条路不变）",
+          "默认 false ⇒ 真唤醒词也不应答了，老人以为没唤醒")
+    check('"\\,\\"greet\\":false"' in proto_c or '\\"greet\\":false' in proto_c,
+          "greet=false 时才在报文里加这个字段",
+          "无条件加 ⇒ 默认报文与升级前不再逐字节一致，排查多一个变量")
+
 
 def t6_workflow() -> None:
     print("\n── 6. 这个脚本必须在 CI 里真的被执行 ──")
