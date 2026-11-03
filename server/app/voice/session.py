@@ -2489,6 +2489,7 @@ class VoiceSession:
                         "round": round_no,
                         "name": str((call.get("function") or {}).get("name") or ""),
                         "ok": bool(outcome.get("ok")),
+                        "message": str(outcome.get("message") or "")[:160],
                     })
                     # ---- 假成功闸门的燃料 ----
                     # 提醒类工具失败 ⇒ 记下名字与人话，_speak_sentence 靠它
@@ -2496,6 +2497,21 @@ class VoiceSession:
                     # 同轮里天气查询失败不该顺带拦掉正常的天气播报。
                     _tname = str((call.get("function") or {}).get("name") or "")
                     if not outcome.get("ok"):
+                        # 失败原因必须进日志（2026-11-03）。
+                        #
+                        # "老人说了时间、设备一直回没听懂"这类投诉，只看
+                        # failed_tools=create_reminder 是查不动的：
+                        #   · 没解析出时间（parse_when 返回 ok=False）
+                        #   · 标题为空 / 是占位词（_is_placeholder_title）
+                        #   · 落库出错
+                        # 三种对老人是**同一句**"没听懂"，对排查是三条完全不同
+                        # 的路。args 也要打 —— 模型把 when 填成什么，决定了该改
+                        # 提示词还是改解析器。
+                        log.warning(
+                            "工具失败 name=%s args=%s reason=%s",
+                            _tname,
+                            str((call.get("function") or {}).get("arguments") or "")[:200],
+                            str(outcome.get("message") or "")[:200])
                         if _tname in _REMINDER_TOOLS:
                             speaker.failed_tools.add(_tname)
                             speaker._fail_message = str(
