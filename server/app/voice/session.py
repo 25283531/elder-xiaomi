@@ -1053,6 +1053,37 @@ def _pcm_fingerprint(pcm: "bytes | list[bytes]", speech_ms: int) -> tuple[str, f
     return summary, peak
 
 
+# 未裁剪音频至少要是裁剪后的这么多倍，重试才有意义。
+#
+# 1.5 这个口径来自 2026-11-04 12:43 的生产现场（三次连续空识别）：
+#   366 帧 → 30 帧（12.2×）、244 帧 → 62 帧（3.9×）、114 帧 → 27 帧（4.2×）
+# 都远超 1.5。反过来，只裁掉头尾几十毫秒时比值≈1.0，重试等于把**同一段**
+# 音频再送一遍 —— 白花一次调用、白等一个来回，还一定还是空。
+_ASR_RETRY_MIN_RATIO: Final[float] = 1.5
+
+# 重试的时长上限：超过这个长度就不再重试。
+# 理由不是"太长会错"，而是"太长会慢"——老人等 60 秒音频跑完 ASR 才听到
+# 「我没听清」，比立刻听到更糟；而且多数厂商对单段时长本来就有硬上限。
+_ASR_RETRY_MAX_SEC: Final[float] = 60.0
+
+
+def _should_retry_asr_untrimmed(untrimmed: "bytes | None",
+                                trimmed_len: int) -> bool:
+    """ASR 空识别后，要不要拿**未裁剪**的原始音频再试一次。
+
+    只判"有没有更多东西可听"，不判业务状态：冷却期 / 已待机 / 连续空识别
+    阈值全部由 ``_handle_empty_asr`` 自己管（那是唯一出口，见那里的说明）。
+    """
+    if not untrimmed:
+        return False
+    if len(untrimmed) > int(_ASR_RETRY_MAX_SEC * 32000):
+        return False
+    if trimmed_len <= 0:
+        # 裁剪把整段都判成静音了 —— 恰恰是"最该拿原音频再试一次"的情形。
+        return True
+    return len(untrimmed) >= trimmed_len * _ASR_RETRY_MIN_RATIO
+
+
 def _save_dump(pcm: "bytes | list[bytes]", tag: str, session_id: str) -> str:
     """落一个 ``asr_<tag>_<时间>_<会话8位>.wav``，返回文件名；失败返回空串。
 
@@ -1203,6 +1234,11 @@ class VoiceSession:
         # 为真的是防止随后那次 _rearm_listening 把 _pcm 里老人刚说的话
         # 当"新一轮"清掉 —— 链条见 _rearm_listening 里的注释。
         self._barge_handover: bool = False
+
+        # 「裁剪把话切没了」的兜底素材：本轮的**未裁剪** PCM（bytes）。
+        # 只有真的裁剪过才非 None（没裁就等于重试同一段音频，纯浪费一次调用）。
+        # ASR 返回空时用它重试一次，见 _resolve_empty_asr 的说明。
+        self._pcm_untrimmed: bytes | None = None
 
         # 设备上报的收听模式（realtime/auto/manual）。连续对话模式下
         # 设备播完后继续听、不再喊唤醒词，服务端必须能自己重新武装监听
@@ -2544,7 +2580,23 @@ class VoiceSession:
         self._pcm.clear()
 
         started = time.monotonic()
-        pcm = self._trim_silence_edges(pcm)
+        pcm_trimmed = self._trim_silence_edges(pcm)
+        # ---- 留一份**未裁剪**的音频给「ASR 返回空」时的重试 ----
+        #
+        # 2026-11-04 12:43 现场（生产日志三次连续空识别，随后被判定待机）：
+        #   366 帧（22.0s）→ 裁成 30 帧（1.8s）→ ASR 空，rms=0.0030
+        #   244 帧 → 裁成 62 帧 → ASR 空，rms=0.0036
+        #   114 帧 → 裁成 27 帧（1.6s）→ ASR 空，rms=0.0110 peak=0.163
+        # 三条的共同点不是"老人没说话"，而是**VAD 只认出了几百毫秒**，
+        # 于是 90% 的音频被当成静音扔掉，剩下的碎片当然认不出来。
+        # 老人听到的是「说了话设备没反应」。
+        #
+        # 所以：裁剪照旧（它省的是首句延迟），但把原音频留一份；一旦 ASR
+        # 返回空，就用原音频**再试一次**。重试只发生在失败路径上，正常轮次
+        # 一次调用都不多花。
+        self._pcm_untrimmed = (b"".join(pcm)
+                               if len(pcm_trimmed) != len(pcm) else None)
+        pcm = pcm_trimmed
         # 交接音频已被本轮消费（或本就没有交接）：标志必须在这里清。
         # barge 后正常路径是 rearm 保留交接、看门狗再来一次 finalize；
         # 若旧轮走的是 close() 路径（LLM 失败，不发 tts stop、没有
@@ -2678,6 +2730,74 @@ class VoiceSession:
                  n, len(window))
         return window
 
+    def _asr_with_usage(self, audio: bytes) -> str:
+        """跑一次 ASR 并记一次用量（**同步**，由线程池调起来）。
+
+        记账必须在**线程池里**做（本函数就是被 run_in_threadpool 调起来的），
+        不在事件循环上；失败也要落一行（ok=False），否则"识别过但失败"
+        与"从没识别过"在用量页上无法区分。
+
+        抽成方法而不是留在 ``_run_turn`` 里的闭包：空识别之后要用**另一段**
+        音频再调一次，而闭包只认自己捕获的那一段 —— 重试就得把记账再抄
+        一份，两份记账必然分叉（本仓踩过：同一事实两处实现）。
+        """
+        started = time.monotonic()
+        with SessionLocal() as db:
+            try:
+                text = asr_tts.asr(db, audio)
+            except Exception as exc:
+                _record_voice_call(
+                    db, usage="asr", device_id=self.dev.id,
+                    user_id=self.dev.owner_id, agent_id=self.dev.agent_id,
+                    session_id=self.session_id, ok=False,
+                    error=f"{type(exc).__name__}: {exc}",
+                    elapsed_ms=int((time.monotonic() - started) * 1000))
+                raise
+            _record_voice_call(
+                db, usage="asr", device_id=self.dev.id,
+                user_id=self.dev.owner_id, agent_id=self.dev.agent_id,
+                session_id=self.session_id,
+                elapsed_ms=int((time.monotonic() - started) * 1000))
+            return text
+
+    async def _resolve_empty_asr(self, pcm_all: bytes,
+                                 untrimmed: "bytes | None",
+                                 started: float) -> str:
+        """ASR 返回空后的处置：先拿**未裁剪**音频重试一次，仍空才走退避。
+
+        为什么值得多花一次调用（2026-11-04 12:43 生产现场，用户原话
+        「好像又听不到我说的话了」）：
+        VAD 只认出几百毫秒就把整段当成静音裁掉（22.0s → 1.8s），剩下的碎片
+        ASR 当然认不出来；老人听到的是「说了话设备没反应」，接着连空三次被
+        判待机 —— 而设备那边屏幕还挂着待办事项。重试只发生在**失败路径**
+        上，正常轮次一次调用都不多花。
+
+        返回重试识别出的文本（空串 = 重试也没认出来，退避已经执行过）。
+        """
+        if untrimmed and _should_retry_asr_untrimmed(untrimmed, len(pcm_all)):
+            log.info("[%s] 裁剪切得太狠（%.1fs → %.1fs），改用未裁剪音频"
+                     "重试一次", self.session_id,
+                     len(untrimmed) / 32000.0, len(pcm_all) / 32000.0)
+            try:
+                retry_text = await run_in_threadpool(
+                    self._asr_with_usage, untrimmed)
+            except asr_tts.VoiceConfigMissingError:
+                log.warning("[%s] 重试时发现未配置 ASR", self.session_id)
+                retry_text = ""
+            except Exception as exc:  # noqa: BLE001
+                # 重试失败不额外打扰老人（下面照旧走"没听清"的退避），
+                # 但**必须留一行**：否则"重试没救回来"与"根本没重试"
+                # 在日志里长得一模一样（本仓踩过：静默吞异常 = 无从排查）。
+                log.warning("[%s] 未裁剪音频重试失败：%s: %s",
+                            self.session_id, type(exc).__name__, exc)
+                retry_text = ""
+            if retry_text:
+                log.info("[%s] 未裁剪音频重试成功：%s",
+                         self.session_id, retry_text)
+                return retry_text
+        await self._handle_empty_asr(started)
+        return ""
+
     async def _maybe_confirm_fallback(self, tool_trace: list[dict[str, Any]]) -> None:
         """模型漏调 ``confirm_reminder`` 时，服务端补一刀设备确认。
 
@@ -2718,29 +2838,11 @@ class VoiceSession:
         self._pending_reminder = ""
         t_asr = _now_ms()
         pcm_all = b"".join(pcm)
-
-        def _asr() -> str:
-            # 记账在**线程池里**（本函数就是被 run_in_threadpool 调起来的），
-            # 不在事件循环上；失败也要落一行（ok=False），否则"识别过但失败"
-            # 与"从没识别过"在用量页上无法区分。
-            started = time.monotonic()
-            with SessionLocal() as db:
-                try:
-                    text = asr_tts.asr(db, pcm_all)
-                except Exception as exc:
-                    _record_voice_call(
-                        db, usage="asr", device_id=self.dev.id,
-                        user_id=self.dev.owner_id, agent_id=self.dev.agent_id,
-                        session_id=self.session_id, ok=False,
-                        error=f"{type(exc).__name__}: {exc}",
-                        elapsed_ms=int((time.monotonic() - started) * 1000))
-                    raise
-                _record_voice_call(
-                    db, usage="asr", device_id=self.dev.id,
-                    user_id=self.dev.owner_id, agent_id=self.dev.agent_id,
-                    session_id=self.session_id,
-                    elapsed_ms=int((time.monotonic() - started) * 1000))
-                return text
+        # 未裁剪音频由 ``_finalize`` 备好，**在这里取走并清空**：全仓只有
+        # 这一个消费者，清空保证它不会残留到下一轮（下一轮若没裁剪，
+        # 重试就等于把同一段音频再送一遍，纯浪费一次调用）。
+        untrimmed = self._pcm_untrimmed
+        self._pcm_untrimmed = None
 
         # ---- F3 声纹：与 ASR **并行**发起（复刻上游 connection.py 的并行触发）
         # 为什么并行而不是串在 ASR 后面：声纹服务按设计在局域网，通常比 ASR
@@ -2767,7 +2869,8 @@ class VoiceSession:
                 # return_exceptions=True：声纹那边的异常不外溢，ASR 的异常
                 # 照旧走下面的分支（拿不到第一个结果就直接 raise 它）。
                 asr_res, vp_res = await asyncio.gather(
-                    run_in_threadpool(_asr), run_in_threadpool(_identify),
+                    run_in_threadpool(self._asr_with_usage, pcm_all),
+                    run_in_threadpool(_identify),
                     return_exceptions=True)
                 if isinstance(asr_res, BaseException):
                     raise asr_res
@@ -2782,7 +2885,8 @@ class VoiceSession:
                 else:
                     speaker_hit = vp_res
             else:
-                utterance = await run_in_threadpool(_asr)
+                utterance = await run_in_threadpool(
+                    self._asr_with_usage, pcm_all)
                 speaker_hit = (None, 0.0)
         except asr_tts.VoiceConfigMissingError:
             log.warning("[%s] 未配置 ASR", self.session_id)
@@ -2818,8 +2922,13 @@ class VoiceSession:
             # 说明服务本身好的，问题在送进去的音频。
             log.info("[%s] ASR 返回空，音频指纹：%s", self.session_id,
                      _dump_empty_asr(pcm_all, self._speech_ms, self.session_id))
-            await self._handle_empty_asr(started)
-            return ""
+            # 先拿**未裁剪**的原始音频重试一次（裁剪切掉的话都在里面）；
+            # 重试也空才进退避 —— 念一句/保持安静/待机三档全在
+            # _handle_empty_asr 里判，这里不复制第二份判据。
+            utterance = await self._resolve_empty_asr(pcm_all, untrimmed,
+                                                      started)
+            if not utterance:
+                return ""
 
         # ---- 「结束对话」意图（2026-10-22 改：关键词 → 分档 → 必要时大模型复核）----
         # 不调 LLM 直接待机的老路只留给**强判据**：模型会在告别上客套三四句，

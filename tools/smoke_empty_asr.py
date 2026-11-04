@@ -38,6 +38,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "server"))
 
 from app.voice.prompts import EMPTY_UTTERANCE_REPLY  # noqa: E402
+from app.voice import session as vs  # noqa: E402
 from app.voice.session import (  # noqa: E402
     _EMPTY_ASR_STANDBY_STREAK,
     _DISMISS_STRONG_RE,
@@ -264,11 +265,144 @@ def _reset_on_real_content_wired() -> None:
           "未在任何 _last_active_at 赋值之后找到 _empty_asr_streak = 0")
 
 
+# ------------- 6. 「裁剪把话切没了」→ 拿未裁剪音频重试一次
+def _retry_decision_table() -> None:
+    """``_should_retry_asr_untrimmed`` 的判据表（纯函数，逐格断言）。
+
+    这张表的每一格都对应一个**真实出现过的**情形：
+      · None            —— 这一轮压根没裁剪，重试 = 再送同一段，纯浪费；
+      · 比值 < 1.5      —— 只裁掉头尾几十毫秒，同上；
+      · 比值 ≥ 1.5      —— 2026-11-04 12:43 现场（366→30、244→62、114→27）；
+      · 裁剪后为 0      —— 整段被判成静音，最该重试；
+      · 超过时长上限    —— 让老人等 60 秒才听到"没听清"比立刻听到更糟。
+    """
+    f = vs._should_retry_asr_untrimmed
+    check(f(None, 32000) is False, "未裁剪音频为 None：不重试", repr(f(None, 32000)))
+    check(f(b"", 32000) is False, "未裁剪音频为空：不重试", repr(f(b"", 32000)))
+    check(f(b"\x00" * 100000, 100000) is False,
+          "没裁掉东西（比值 1.0）：不重试", "同一段音频重送没有意义")
+    check(f(b"\x00" * 149999, 100000) is False,
+          "只裁掉一丁点（比值 1.49）：不重试")
+    check(f(b"\x00" * 150000, 100000) is True,
+          "比值刚好 1.5：重试（判据是 ≥）")
+    check(f(b"\x00" * 960000, 96000) is True,
+          "现场比值 10×（22.0s → 3.0s）：重试")
+    check(f(b"\x00" * 32000, 0) is True,
+          "裁剪后一帧不剩：必须重试（整段被判成静音）")
+    check(f(b"\x00" * int(61 * 32000), 32000) is False,
+          "未裁剪超过 60 秒：不重试（等太久比没听清更糟）")
+    check(f(b"\x00" * int(59 * 32000), 32000) is True,
+          "未裁剪 59 秒：仍在上限内，重试")
+
+
+async def _retry_paths() -> None:
+    """``_resolve_empty_asr`` 三条路：重试成功 / 重试也空 / 根本没得重试。
+
+    断言口径是**退避有没有被执行**（``_empty_asr_streak`` 与
+    ``_speak_reply`` 的调用），而不是"返回值等于什么" —— 后者能靠
+    return 一句话糊过去，前者才证明老人到底听到了什么。
+    """
+    # ---- 6a. 重试成功：不许进退避（否则老人还是听到「我没听清」）----
+    rec = _Recorder()
+    sess = _make_session(rec)
+    calls: list[bytes] = []
+
+    def _fake_asr(audio: bytes) -> str:
+        calls.append(audio)
+        return "我吃过药了"
+
+    sess._asr_with_usage = _fake_asr        # type: ignore[method-assign]
+    trimmed = b"\x01" * 64000
+    raw = b"\x02" * 640000
+    got = await sess._resolve_empty_asr(trimmed, raw, 0.0)
+    check(got == "我吃过药了", "重试成功：返回重试识别出的文本", repr(got))
+    check(calls == [raw], "重试成功：送给 ASR 的是**未裁剪**那一段",
+          f"送进去 {[len(c) for c in calls]} 字节")
+    check(not rec.spoken, "重试成功：不念「我没听清」", f"spoken={rec.spoken}")
+    check(sess._empty_asr_streak == 0, "重试成功：连续空识别计数不增加",
+          f"streak={sess._empty_asr_streak}")
+
+    # ---- 6b. 重试也空：退避照旧执行（第 1 次念固定回复）----
+    rec2 = _Recorder()
+    sess2 = _make_session(rec2)
+    sess2._asr_with_usage = lambda audio: ""   # type: ignore[method-assign]
+    got2 = await sess2._resolve_empty_asr(trimmed, raw, 0.0)
+    check(got2 == "", "重试也空：返回空串", repr(got2))
+    check(len(rec2.spoken) == 1 and rec2.spoken[0] == EMPTY_UTTERANCE_REPLY,
+          "重试也空：照旧念一次 EMPTY_UTTERANCE_REPLY", f"spoken={rec2.spoken}")
+    check(sess2._empty_asr_streak == 1, "重试也空：计数 = 1（只算一次）",
+          f"streak={sess2._empty_asr_streak}")
+
+    # ---- 6c. 没裁剪过（untrimmed is None）：一次多余调用都不许发 ----
+    rec3 = _Recorder()
+    sess3 = _make_session(rec3)
+    sent: list[bytes] = []
+
+    def _never(audio: bytes) -> str:  # pragma: no cover - 不该被调用
+        sent.append(audio)
+        return "不该出现"
+
+    sess3._asr_with_usage = _never       # type: ignore[method-assign]
+    got3 = await sess3._resolve_empty_asr(trimmed, None, 0.0)
+    check(got3 == "", "没裁剪过：直接走退避", repr(got3))
+    check(sent == [], "没裁剪过：**不发**第二次 ASR 调用（不白花配额）",
+          f"发了 {len(sent)} 次")
+    check(sess3._empty_asr_streak == 1, "没裁剪过：计数 = 1",
+          f"streak={sess3._empty_asr_streak}")
+
+    # ---- 6d. 重试自己抛异常：不许把这一轮打崩，仍要走退避 ----
+    rec4 = _Recorder()
+    sess4 = _make_session(rec4)
+
+    def _boom(audio: bytes) -> str:
+        raise RuntimeError("厂商 502")
+
+    sess4._asr_with_usage = _boom         # type: ignore[method-assign]
+    got4 = await sess4._resolve_empty_asr(trimmed, raw, 0.0)
+    check(got4 == "", "重试抛异常：按「还是没听清」处理，不外溢", repr(got4))
+    check(len(rec4.spoken) == 1, "重试抛异常：退避仍然执行（老人听到回应）",
+          f"spoken={rec4.spoken}")
+
+
+def _retry_wired() -> None:
+    """接线断言：空识别分支必须**经过**重试，不许直接掉进退避。
+
+    这段没有可直调的纯函数（它在一轮对话的中段，前置依赖一整个会话与
+    数据库），所以按源码相邻性断言，宁可变脆也不放任 —— 一旦有人把
+    ``_handle_empty_asr(started)`` 直接写回空识别分支，重试就被绕过，
+    而所有单元断言仍然全绿（这正是 2026-11-04 那三次空识别能连红的原因：
+    "写了不跑"比"没写"更坏）。
+    """
+    import inspect
+
+    src = inspect.getsource(VoiceSession._run_turn)
+    check("untrimmed = self._pcm_untrimmed" in src,
+          "_run_turn 取用未裁剪音频（接线）")
+    check("self._pcm_untrimmed = None" in src,
+          "_run_turn 取走后清空（不许残留到下一轮）")
+    idx = src.find("ASR 返回空，音频指纹")
+    check(idx > 0, "_run_turn 仍有空识别分支")
+    window = src[idx: idx + 900] if idx > 0 else ""
+    check("self._resolve_empty_asr(" in window,
+          "空识别分支调用 _resolve_empty_asr（重试入口）")
+    check("self._handle_empty_asr(" not in window,
+          "空识别分支**不直接**调 _handle_empty_asr（否则绕过重试）")
+
+    fin = inspect.getsource(VoiceSession._finalize)
+    check("self._pcm_untrimmed = (" in fin,
+          "_finalize 在裁剪处留一份未裁剪音频（接线）")
+    check("_should_retry_asr_untrimmed" not in fin,
+          "_finalize 只负责留素材，判据留在 _resolve_empty_asr（单一真源）")
+
+
 def main() -> int:
     asyncio.run(_three_empties())
     asyncio.run(_quiet_while_dismissed())
     asyncio.run(_rearm_keeps_streak())
     _reset_on_real_content_wired()
+    _retry_decision_table()
+    asyncio.run(_retry_paths())
+    _retry_wired()
 
     passed = sum(1 for ok, _, _ in results if ok)
     failed = len(results) - passed
