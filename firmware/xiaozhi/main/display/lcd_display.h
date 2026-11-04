@@ -82,7 +82,7 @@ protected:
     lv_timer_t* anti_burn_timer_ = nullptr;
     uint32_t last_ui_change_tick_ = 0;      /* lv_tick 毫秒 */
 
-    /* ---- 对话分页（2026-11-03 用户需求）----
+    /* ---- 对话分页（2026-11-03 起，2026-11-04 重做落点）----
      *
      * 「用户说的话和 AI 说的话放在不同的两页，如果一页显示不全，自动翻页」。
      * 实现是**按页滚动**左列容器 bottom_bar_，不是两个 label 轮显：
@@ -95,33 +95,25 @@ protected:
      * 调用），所以不需要 atomic。 */
     int ChatLineH();        /* 一行多少像素：字体行高 + 行间距，现算不缓存 */
     int ChatPageH();        /* 一页多少像素：整行倍数 */
-    /* `follow_newest=true` 表示「这一屏要跟着最新一句走」——回答还在往下长时
-     * 用最后一页，别把屏停在开头。详见 lcd_display.cc 里 chat_follow_tail_ 的
-     * 说明。 */
-    void ChatPageLayout(bool follow_newest = false);
-    void ChatPageStep();    /* 定时器回调：滚到下一页，最后一页停住 */
+    /* `anchor_px` = 本次追加的那一句，第一行在设备字幕 label 内的起始像素。
+     * 传 >= 0 ⇒ 屏停到**这一句第一行所在的那一页**（语音念到哪、字从哪开始）；
+     * 传默认 -1 ⇒ 回第 1 页（user / system 覆盖、换主题重排时用）。
+     * 详见 lcd_display.cc 里 ChatPageLayout 的落点说明。 */
+    void ChatPageLayout(int anchor_px = -1);
+    void ChatPageStep();    /* 定时器回调：每 6 秒前进一页，最后一页停住 */
     lv_timer_t* chat_page_timer_ = nullptr;
     int chat_page_index_ = 0;       /* 当前页号，0 起 */
     int chat_page_count_ = 0;       /* 总页数 */
     int chat_page_h_ = 0;           /* 页高（像素） */
     int chat_page_max_scroll_ = 0;  /* 内容高 - 容器高，最后一页可能滚不到整页 */
 
-    /* ---- 「跟着最新一句」状态（2026-11-03，用户第 6 条需求：字幕要和语音同步）----
+    /* ---- 为什么删掉了 chat_follow_tail_（2026-11-04）----
      *
-     * 问题：字幕是累积的，每来一句都调 ChatPageLayout()，而它原来无条件把
-     * 页号归零滚到顶部。于是长回答里**屏永远停在第一页**，声音却已经念到
-     * 第三页 —— 老人看到的是"字幕和声音对不上"，而且每来一句就弹回顶部
-     * 一次，看起来像在闪。
-     *
-     * 做法：追加 assistant 文字时 follow_newest=true ⇒ 先贴最后一页；
-     * ChatPageStep 在「8 秒内还有新句」时**不翻页**（翻走就等于让字幕和
-     * 声音分家），等回答说完满 8 秒再回到第一页，从头让老人读一遍。
-     *
-     * 为什么是 8 秒：一句回答内部相邻两句间隔 1~4 秒（TTS 语速），取 8 秒
-     * 能容下一次 TTS 抖动而不误判"说完了"；比 20 秒的跨轮判据短，是因为
-     * 这里等的是"这一轮结束"，不是"下一轮开始"。 */
-    bool chat_follow_tail_ = false;
-    uint32_t chat_last_append_tick_ = 0;
+     * 上一版是"追加时贴最后一页 + follow 期间不许翻页 + 8 秒后回第 1 页"。
+     * 真机上这三条叠起来正好是用户投诉的「多行显示不完整」：
+     * 屏停在句子末尾，前面的行永远轮不到，而翻页又被 follow 挡住。
+     * 现在改成「落点 = 本句起始页 + 每 6 秒往后翻一页 + 最后一页停住」，
+     * 不需要这两个成员 —— 别再加回来，加了就是退回旧行为。 */
 
     /* 上一句 assistant 字幕到达的时刻（lv_tick，毫秒）。
      *
