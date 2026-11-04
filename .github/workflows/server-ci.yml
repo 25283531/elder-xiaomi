@@ -597,6 +597,15 @@ jobs:
       # LLM 话术」三层一次跑通，不连真设备、不占端口。
       - name: MCP 工具通道 + 服药确认
         run: python tools/run_smoke.py logs/smoke_mcp_confirm.log python tools/test_mcp_confirm.py
+      # LLM 首字超时（厂商卡住 ⇒ 别让老人干等）。
+      # 为什么必须进 CI：2026-11-04 生产日志里 9 轮对话有 3 轮首事件 > 20 秒
+      # （最大 94 秒），而**没有任何断言会红** —— 功能全对，只是老人干等半分钟。
+      # 连带后果才是用户实报的那些症状：思考期丢弃上行音频（老人说的话没进
+      # ASR）、他自己长按按键把提醒确认掉、服务端 65 秒后才去确认于是回一句
+      # 「请让老人按一下按键」。这条链路一旦退化成"没有超时"，表现同样是
+      # **一切正常、只是很慢**，所以只能靠这个脚本守。
+      - name: LLM 首字超时（厂商卡住 20 秒即放弃本轮）
+        run: python tools/run_smoke.py logs/llm_first_event_timeout.log python tools/test_llm_first_event_timeout.py
       # 和风天气：按需缓存 + 降级 + 预热。用假 client，不消耗真实 API 次数、
       # 不需要任何凭据（缺 PyJWT/cryptography 时脚本会明确"跳过"而不是假绿）。
       # 为什么必须进 CI：这个子系统的核心承诺是「60 分钟内同一城市只调一次上游」，

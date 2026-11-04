@@ -332,6 +332,36 @@ UNSPEAKABLE_REPLY_FALLBACK: Final[str] = "这个我一时没说明白，您再�
 #:    调大只是让首句更晚开口 —— 所以只许往大调，不许往小调。
 _TOOL_ROUND_HOLD_CHARS: Final[int] = 40
 
+#: 一轮 LLM 从发请求到**第一个事件**最多等多久（秒）。超过就放弃这一轮，
+#: 改说一句兜底话术并重新武装监听。
+#:
+#: 为什么必须有（2026-11-04 生产日志实测）：那天的 9 轮对话里
+#:   最小 723ms / 中位 1023ms / 最大 **94007ms**，其中 **3 轮 > 20 秒**。
+#: 也就是说三分之一的轮次会让老人干等半分钟以上，而这段时间里：
+#:   · 设备一直在推上行音频，服务端在忙 ⇒ 整段被丢弃
+#:     （同一份日志：`思考期丢弃上行音频 1160 帧（69600ms）`）；
+#:   · 老人以为设备坏了，自己长按按键把提醒确认掉；
+#:   · 等他终于等到回应，服务端才去确认 —— 而那条已经是 CONFIRMED 了，
+#:     于是回一句「请让老人按一下按键」（他 6 秒前刚按完）。
+#: 这条因果链就是用户实报「按键按了不能确认」的真正来源。
+#:
+#: 取值 20 秒：中位 1 秒、P 值上看 20 秒已经远超正常波动，再等只会让老人
+#: 更慌；同时比"厂商偶发慢一档"（3~5 秒）留足余量，不会误杀正常轮次。
+_FIRST_EVENT_TIMEOUT_SEC: Final[float] = 20.0
+
+#: 首字超时后念给老人的话。**必须说人话、必须短、必须把球抛回去**：
+#: 老人此刻已经等了 20 秒，任何解释（"模型"、"网络"、"服务"）他都听不懂，
+#: 也不关心；他只需要知道"现在该再说一遍"。
+LLM_SLOW_FALLBACK: Final[str] = "我这边有点慢，您再说一遍好吗？"
+
+#: ``_chat_round`` 的首字超时哨兵。
+#:
+#: 为什么不用 ``None``：``None`` 的语义已经被"被 abort 叫停"占用了（调用方
+#: 靠它区分"老人抢话"和"正常收尾"）。两者混成一个，会让超时被当成打断
+#: 处理 —— 既不清 `_dismiss_candidate` 也不播任何话，老人听到的是静音，
+#: 而且日志里一个字都不会有。
+_FIRST_EVENT_TIMEOUT: Final[object] = object()
+
 #: 只有**像要调工具**的话才值得为了防抢跑多等那几个字（见 _chat_round 的
 #: ``hold_chars``）。这道闸门对每一句话都生效的话，等于给所有闲聊都加上
 #: "攒够 40 字才开口"的代价 —— smoke 第 13 组直接量出来首帧 400ms → 500ms。
@@ -3002,6 +3032,14 @@ class VoiceSession:
                     break
                 result = await self._chat_round(messages, speaker, round_no,
                                                 timing)
+                if result is _FIRST_EVENT_TIMEOUT:
+                    # 厂商卡住：这一轮一个事件都没来。别让老人继续干等 ——
+                    # 说一句短话把球抛回去，并让 speaker 正常收尾（发配对的
+                    # tts start/stop），否则设备侧会一直停在"设备在说话"。
+                    reply = LLM_SLOW_FALLBACK
+                    await speaker.push_text(reply)
+                    await speaker.flush_rest()
+                    break
                 if result is not None:
                     results.append(result)
                     # 每轮真实耗时：来自 llm_gateway 的 ChatResult.elapsed_ms，
@@ -3258,7 +3296,26 @@ class VoiceSession:
                 # 边界会被 Python 转成 RuntimeError（见 llm_gateway.chat_stream
                 # 的 docstring）。chat_stream 恒以 ("done", ChatResult) 收尾，
                 # None 只可能是生成器被异常关闭。
-                event = await run_in_threadpool(next, gen, None)
+                #
+                # 首事件加超时（见 _FIRST_EVENT_TIMEOUT_SEC 的实测数据）：
+                # 只给**第一个**事件设限。中途卡住时 speaker 可能已经在念了，
+                # 那时掐断比继续等更糟（老人听到半句就断）。第一个事件之前
+                # 什么都还没出声，放弃的代价只有"这句话没答"。
+                try:
+                    event = await asyncio.wait_for(
+                        run_in_threadpool(next, gen, None),
+                        None if got_first else _FIRST_EVENT_TIMEOUT_SEC)
+                except (asyncio.TimeoutError, TimeoutError):
+                    if timing is not None:
+                        timing["ttft_ms"].append(_now_ms() - t_round)
+                    log.warning("[%s] 第 %d 轮 %g 秒内没有收到任何事件"
+                                "（厂商卡住）⇒ 放弃本轮，改说兜底话术",
+                                self.session_id, round_no,
+                                _FIRST_EVENT_TIMEOUT_SEC)
+                    # 不调 gen.close()：那个生成器还被卡在线程池的
+                    # next() 里，从别的线程关它会和读线程打架。直接放手，
+                    # 线程自己会在底层读超时后结束（有界泄漏，不是无界的）。
+                    return _FIRST_EVENT_TIMEOUT
                 if event is None:
                     return None
                 if not got_first:
