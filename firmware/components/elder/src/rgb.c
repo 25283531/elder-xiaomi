@@ -162,10 +162,14 @@ typedef struct {
 
 /* ---- 第 1 颗灯：按键指示灯（取值理由见 elder_rgb.h） ---- */
 #define ELDER_RGB_BTN_ATTRACT_COLOR 0xFF8C00u  /* 深橙：有待确认提醒 */
-#define ELDER_RGB_BTN_GRAD_FROM     0x90EE90u  /* 浅绿：刚按下 */
-#define ELDER_RGB_BTN_GRAD_TO       0x006400u  /* 深绿：按住够 3 秒 */
-#define ELDER_RGB_BTN_OK_COLOR      0x00CED1u  /* 深蓝绿：确认完成 */
-#define ELDER_RGB_BTN_FAIL_COLOR    0xFF1493u  /* 深粉红：中途松开没确认 */
+/* 天青（需求原词「天青色」）：按住期间**同一色相由暗变亮**，
+ * 不再从浅绿插值到深绿 —— 插值会改色相，老人看到的是"换了个颜色"而不是"进度"。 */
+#define ELDER_RGB_BTN_GRAD_COLOR    0x00E5FFu
+/* 渐变起点亮度（0..255 感知亮度）。不从 0 起：按下瞬间必须有一点反馈，
+ * 否则老人以为没按上，会松手重按 —— 那一次就变成"中途松开"的失败闪。 */
+#define ELDER_RGB_BTN_GRAD_MIN_LEVEL 20u
+#define ELDER_RGB_BTN_OK_COLOR      0x00BFFFu  /* 天蓝（需求原词「天蓝色」）：3 秒达标全亮闪 3 次 */
+#define ELDER_RGB_BTN_FAIL_COLOR    0xFF69B4u  /* 粉红（需求原词「粉红色」）：中途松开全亮闪 5 次 */
 #define ELDER_RGB_BTN_BREATH_MS     3000u      /* 吸引注意的呼吸周期 */
 /* 亮 250ms / 灭 250ms：慢到老人看得清次数，一次结果共 1.25s（3 次）/
  * 2.5s（5 次）。再快就数不清，再慢就以为灯坏了。 */
@@ -188,7 +192,7 @@ typedef struct {
 typedef enum {
     BTN_OFF = 0,     /* 常态：不亮 */
     BTN_ATTRACT,     /* 有待确认提醒：橙色呼吸 */
-    BTN_GRADIENT,    /* 按住中：浅绿 → 深绿 */
+    BTN_GRADIENT,    /* 按住中：天青由暗变亮 */
     BTN_FLASH        /* 结果闪烁（成功 3 次 / 失败 5 次） */
 } btn_mode_t;
 
@@ -415,7 +419,9 @@ static uint32_t scale_color(uint32_t c, uint32_t lvl)
     return dim_color(c, level_to_linear(lvl));
 }
 
-/* 线性插值：num/den 为进度。den==0 时直接给终点色，避免除零。 */
+/* 线性插值：num/den 为进度。den==0 时直接给终点色，避免除零。
+ * 当前四态已不再用它（#1 的渐变改成同一色相走 scale_color），保留是因为
+ * "两种颜色之间过渡"仍可能用在别的灯效上，且删掉后 diff 会牵扯无关代码。 */
 static uint32_t lerp_color(uint32_t a, uint32_t b, uint32_t num, uint32_t den)
 {
     if (den == 0u || num >= den) return b;
@@ -677,7 +683,7 @@ static void btn_enter_flash(uint32_t color, uint8_t times)
     g.btn_flash_times = times;
     g.btn_resolved = true;   /* 这一轮已经有结果了，松开时不能再补一次粉色闪 */
     ESP_LOGI(TAG, "按键结果灯：%s，闪 %u 次（每次 %ums 亮 / %ums 灭）",
-             (color == ELDER_RGB_BTN_OK_COLOR) ? "成功（深蓝绿）" : "未完成（深粉红）",
+             (color == ELDER_RGB_BTN_OK_COLOR) ? "成功（天蓝）" : "未完成（粉红）",
              (unsigned)times,
              (unsigned)ELDER_RGB_BTN_FLASH_ON_MS,
              (unsigned)ELDER_RGB_BTN_FLASH_OFF_MS);
@@ -739,14 +745,21 @@ static uint32_t btn_step(uint32_t t_ms)
                                       : ((ELDER_RGB_BTN_BREATH_MS - phase) * 255u / half);
         return scale_color(ELDER_RGB_BTN_ATTRACT_COLOR, lvl);
     }
-    case BTN_GRADIENT:
-        /* 进度条语义：3 秒走完，走完就是最深绿。
+    case BTN_GRADIENT: {
+        /* 进度条语义：3 秒走完，走完就是天青全亮。
          * 这里**必须**用墙上时钟：它要和 input.c 判"按住够 3 秒"的时长
-         * 严格对齐，动画时钟一旦落后，灯还在浅绿、按键却已经算确认了
-         * —— 灯在骗人。 */
-        return lerp_color(ELDER_RGB_BTN_GRAD_FROM, ELDER_RGB_BTN_GRAD_TO,
-                          t_ms - g.btn_phase_ms,
-                          (uint32_t)ELDER_BTN_CONFIRM_HOLD_MS);
+         * 严格对齐，动画时钟一旦落后，灯还没亮满、按键却已经算确认了
+         * —— 灯在骗人。
+         * 亮度走 scale_color（过 gamma 表）：同一色相只改亮度，感知上均匀变亮。
+         * 不用 lerp_color（会改色相，变成"换颜色"而不是"进度"），
+         * 也不用 dim_color（线性衰减，暗端死黑、看不出渐变）。 */
+        uint32_t el = t_ms - g.btn_phase_ms;
+        const uint32_t hold = (uint32_t)ELDER_BTN_CONFIRM_HOLD_MS;
+        if (el > hold) el = hold;
+        uint32_t lvl = ELDER_RGB_BTN_GRAD_MIN_LEVEL
+                     + (255u - ELDER_RGB_BTN_GRAD_MIN_LEVEL) * el / hold;
+        return scale_color(ELDER_RGB_BTN_GRAD_COLOR, lvl);
+    }
     case BTN_FLASH: {
         uint32_t period = ELDER_RGB_BTN_FLASH_ON_MS + ELDER_RGB_BTN_FLASH_OFF_MS;
         uint32_t el = g.btn_anim_ms - g.btn_flash_start_ms;
@@ -1292,22 +1305,24 @@ void elder_rgb_button_confirmed(void)
     xSemaphoreGive(g.lock);
 }
 
-/* 「受理了、但还没有结果」—— 见 elder_rgb.h 里 2026-11-03 的那段说明。
+/* 「按压已受理」—— 3 秒达标即闪天蓝 3 次，含追问路径。
+ *
+ * 用户 2026-11-04 的要求是「3 秒钟的时候直接切换为天蓝色全亮闪烁 3 次」，
+ * 追问路径同样是按满 3 秒达标，所以灯效必须和 confirmed() 完全一致；
+ * 原来"退回橙色呼吸、不闪结果色"的做法让老人按够了却看不到任何回执。
+ *
+ * 原 2026-11-03 的粉色误报（松开时补一次"失败"闪）由 btn_enter_flash 置
+ * btn_resolved=true 保证不再出现：release 看到已出结果就直接忽略。
  *
  * 只对**正在渐变**的那一轮生效：不在渐变里（没按过、或本轮已经出过结果）
  * 时调它必须完全没有副作用，否则会把别人正在放的结果闪烁掐掉。 */
 void elder_rgb_button_acknowledged(void)
 {
     if (!g.ready) return;
-    uint32_t t_ms = now_ms();
 
     xSemaphoreTake(g.lock, portMAX_DELAY);
     if (g.btn_mode == BTN_GRADIENT) {
-        g.btn_resolved = true;   /* 松开时不再补粉色闪（那正是用户实报的错误灯） */
-        g.btn_mode = g.btn_pending ? BTN_ATTRACT : BTN_OFF;
-        g.btn_phase_ms = t_ms;
-        ESP_LOGI(TAG, "按键已受理但未出结果（追问中）⇒ #1 回到%s，不闪结果色",
-                 g.btn_pending ? "橙色呼吸" : "熄灭");
+        btn_enter_flash(ELDER_RGB_BTN_OK_COLOR, ELDER_RGB_BTN_OK_TIMES);
     }
     xSemaphoreGive(g.lock);
 }
