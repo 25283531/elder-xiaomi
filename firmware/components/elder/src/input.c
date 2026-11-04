@@ -13,6 +13,22 @@ static const char *TAG = "elder.input";
 #define LONG_HOLD_MS        ELDER_BTN_CONFIRM_HOLD_MS  /* 3s，真源在 elder_board.h */
 #define CONFIRM_WINDOW_MS   30000   /* 松开后 30s 内短按有效（用户指定） */
 #define DEBOUNCE_MS         30
+/* 松开用**更长**的消抖（2026-11-04 用户实报「长按服药确认按键依然不能触发确认…
+ * 按键超过 1 秒就开始进行粉红色闪烁」）。
+ *
+ * 按下与松开原来是同一个 30ms 阈值，而机械按键在**长按过程中**会出现几十毫秒
+ * 的接触抖动。30ms 的抖动就足够被采信成"松手" ⇒ input.c 发一次 RELEASE ⇒
+ * rgb.c 的 elder_rgb_button_release() 把渐变掐掉、改闪粉红 5 次（= 你没按够）。
+ * 老人明明按着，灯却在报错。
+ *
+ * 为什么松手要等更久、按下不用：两者的代价完全不对称。
+ *   · 松手多等 50ms，老人**完全感知不到**（他松手后本来也不会立刻再按）；
+ *   · 误判成松手的代价是"按对了却提示失败"，还会让渐变中断、3 秒永远走不满 ——
+ *     这正是用户两次投诉的现象。
+ * 所以按下仍用 DEBOUNCE_MS(30)，松开要连续 80ms 高电平才采信。
+ * ⚠️ 这两个值**必须不同**：tools/smoke_longpress_subtitle.py 第 7 组守这一条，
+ *    改回同一个值等于把这次的 bug 原样装回去。 */
+#define RELEASE_DEBOUNCE_MS 80
 #define POLL_MS             20
 #define STUCK_MS            20000   /* 连续低电平超过 20s ⇒ 判为引脚被拉低/按键卡住 */
 
@@ -118,14 +134,33 @@ static void input_task(void *arg)
     while (1) {
         bool raw = key_down();
 
-        /* 消抖：连续 DEBOUNCE_MS 同电平才认可 */
+        /* 消抖：连续同电平才认可。
+         *
+         * 阈值按**目标电平**选，不是一个常量通吃（2026-11-04）：
+         * 按下用 DEBOUNCE_MS(30)，松开用 RELEASE_DEBOUNCE_MS(80)。
+         * 理由见文件头那个 #define 的注释 —— 长按过程中的接触抖动只有几
+         * 十毫秒，30ms 就会把它当成"松手"，灯立刻闪粉红"失败"。
+         * `raw == true` 即目标电平是按下，`raw == false` 是松开。 */
         if (raw == stable_down) {
             stable_cnt = 0;
         } else {
             stable_cnt += POLL_MS;
-            if (stable_cnt >= DEBOUNCE_MS) {
+            const uint32_t need_ms = raw ? DEBOUNCE_MS : RELEASE_DEBOUNCE_MS;
+            if (stable_cnt >= need_ms) {
                 stable_down = raw;
                 stable_cnt = 0;
+                /* 采信日志：下次再查"到底有没有按到/松手"，不用再靠猜。
+                 * 松开那行带本轮按压时长 —— 它是判断"是不是被抖动骗了"的
+                 * 唯一直接证据（时长明显小于实际按住时间 = 抖动）。 */
+                if (raw) {
+                    ESP_LOGI(TAG, "按键按下（消抖 %d ms 采信）", DEBOUNCE_MS);
+                } else {
+                    const int held_ms = (g.pressed && g.press_start_us != 0)
+                                        ? (int)((now_us() - g.press_start_us) / 1000)
+                                        : 0;
+                    ESP_LOGI(TAG, "按键松开（消抖 %d ms 采信，按压 %d ms）",
+                             RELEASE_DEBOUNCE_MS, held_ms);
+                }
             } else {
                 vTaskDelay(pdMS_TO_TICKS(POLL_MS));
                 continue;

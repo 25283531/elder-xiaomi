@@ -177,6 +177,16 @@ typedef struct {
 #define ELDER_RGB_BTN_FLASH_OFF_MS  250u
 #define ELDER_RGB_BTN_OK_TIMES      3
 #define ELDER_RGB_BTN_FAIL_TIMES    5
+/* "抖动"与"真的松手"的分界（ms）。
+ *
+ * 2026-11-04 用户实报「按键超过 1 秒就开始进行粉红色闪烁」：机械按键在长按
+ * 过程中抖了几十毫秒，就被判成松手 ⇒ 渐变掐掉 + 粉红闪 5 次。老人明明按着，
+ * 灯却在报"你没按够"。
+ *
+ * 判据是**本轮按压总时长**：没人会按住 300ms 就主动放弃，那一段里的"松开"
+ * 只可能是接触抖动。⚠️ 这不是放宽标准 —— 3 秒才算确认的判据一个字没动，
+ * 300ms 之后的松手照样闪粉红。见 elder_rgb_button_release() 里的注释。 */
+#define ELDER_RGB_BTN_DEBOUNCE_MIN_MS 300u
 /* 单次"动画步进"的时间上限（ms）。
  *
  * 闪烁用的是**渲染时钟**而不是墙上时钟，这是 2026-10-27 真机事故的直接产物：
@@ -1274,6 +1284,12 @@ void elder_rgb_button_press(void)
         g.btn_mode = BTN_GRADIENT;
         g.btn_phase_ms = t_ms;
         g.btn_resolved = false;
+        ESP_LOGI(TAG, "#1 进入渐变（有待确认=%d）", (int)g.btn_pending);
+    } else {
+        /* 这条日志是"按了没亮"的第一现场证据：有待确认=0 ⇒ 灯本来就该灭；
+         * mode=FLASH ⇒ 上一轮结果还在放，按下被有意忽略。 */
+        ESP_LOGI(TAG, "#1 按下不进渐变（有待确认=%d，mode=%d）",
+                 (int)g.btn_pending, (int)g.btn_mode);
     }
     xSemaphoreGive(g.lock);
 }
@@ -1285,13 +1301,49 @@ void elder_rgb_button_release(void)
 
     xSemaphoreTake(g.lock, portMAX_DELAY);
     if (g.btn_mode == BTN_GRADIENT) {
-        if (!g.btn_resolved) {
-            /* 渐变还没走完就松手 ⇒ 没完成确认 */
-            btn_enter_flash(ELDER_RGB_BTN_FAIL_COLOR, ELDER_RGB_BTN_FAIL_TIMES);
-        } else {
+        /* 本轮按压总时长，用**墙上时钟**算（g.btn_phase_ms 是按下时刻，
+         * 与 input.c 判 3 秒同源，见 elder_rgb.h）。 */
+        const uint32_t held_ms = t_ms - g.btn_phase_ms;
+
+        if (g.btn_resolved) {
+            /* 已经出过结果（天蓝闪已放 / 追问路径已 acknowledged）：
+             * 松开只是把灯交还给"吸引注意"，绝不补一次粉红。 */
             g.btn_mode = g.btn_pending ? BTN_ATTRACT : BTN_OFF;
             g.btn_phase_ms = t_ms;
+            ESP_LOGI(TAG, "#1 松开：本轮已出结果（按压 %lu ms），回 %s",
+                     (unsigned long)held_ms,
+                     g.btn_pending ? "橙色呼吸" : "熄灭");
+        } else if (held_ms < ELDER_RGB_BTN_DEBOUNCE_MIN_MS) {
+            /* ---- 抖动兜底：300ms 以内的"松开"不是老人的真实意图 ----
+             *
+             * 2026-11-04 用户实报「按键超过 1 秒就开始进行粉红色闪烁」——
+             * 老人按着不动，机械按键中途抖了几十毫秒，input.c 就采信了一次
+             * 松开（松手消抖已改成 80ms，这是第二道防线）。
+             *
+             * ⚠️ 这**不是**放宽标准：3 秒才算确认的判据（LONG_HOLD_MS）
+             *    一个字都没动，300ms 之后的松手照样粉红闪 5 次。
+             *    它只是把"接触抖动"和"真的松手"分开 —— 没人会按住
+             *    300ms 就主动放弃，那一段时长的"松开"只可能是抖动。
+             *    不给它闪粉红，是因为老人看到的是"我按对了却报错"，
+             *    比没有反馈更糟。
+             * 置 btn_resolved 是为了让这一轮就此收尾：后续真正的松开
+             * 不会再补一次失败闪。 */
+            g.btn_mode = g.btn_pending ? BTN_ATTRACT : BTN_OFF;
+            g.btn_phase_ms = t_ms;
+            g.btn_resolved = true;
+            ESP_LOGW(TAG, "#1 松开：按压仅 %lu ms（< %u ms）判为抖动，"
+                          "不闪粉红，回 %s",
+                     (unsigned long)held_ms,
+                     (unsigned)ELDER_RGB_BTN_DEBOUNCE_MIN_MS,
+                     g.btn_pending ? "橙色呼吸" : "熄灭");
+        } else {
+            /* 渐变还没走完就松手 ⇒ 没完成确认 */
+            ESP_LOGW(TAG, "#1 松开：按压 %lu ms 未走完渐变 ⇒ 粉红闪 %u 次",
+                     (unsigned long)held_ms, (unsigned)ELDER_RGB_BTN_FAIL_TIMES);
+            btn_enter_flash(ELDER_RGB_BTN_FAIL_COLOR, ELDER_RGB_BTN_FAIL_TIMES);
         }
+    } else {
+        ESP_LOGI(TAG, "#1 松开：不在渐变态（mode=%d），无需处理", (int)g.btn_mode);
     }
     xSemaphoreGive(g.lock);
 }

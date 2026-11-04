@@ -42,6 +42,8 @@ UI_C = ROOT / "firmware" / "components" / "elder" / "src" / "ui.c"
 LCD = ROOT / "firmware" / "xiaozhi" / "main" / "display" / "lcd_display.cc"
 #: #1 按键灯的真源（`firmware/xiaozhi/components/elder` 是 merge 生成的副本，不读它）
 RGB_C = ROOT / "firmware" / "components" / "elder" / "src" / "rgb.c"
+#: 按键消抖的真源（第 7 组：按下与松开的消抖阈值必须不同）
+INPUT_C = ROOT / "firmware" / "components" / "elder" / "src" / "input.c"
 BOARD_H = ROOT / "firmware" / "components" / "elder" / "include" / "elder_board.h"
 
 results: list[tuple[bool, str, str]] = []
@@ -401,6 +403,121 @@ def t6_actionable_gate() -> None:
           f"实际 {raw or '缺失'} ⇒ 用户明确要求 4 小时")
 
 
+def t7_press_debounce_and_listen_after_clip() -> None:
+    """长按 1 秒就闪粉红 + 播完问句不进聆听（2026-11-04 用户第二条的后半）。
+
+    用户原话：「长按服药确认按键依然不能触发确认…按键超过1秒就开始进行粉红色
+    闪烁。但是2分钟之后，再按确认键颜色就正常了…也触发了『您确认已经完成这次
+    服药了吗』的语音提醒，但是没有进入聆听状态，而是进入了待机状态。」
+
+    两件事都只能在真机上复现，本机守的是**代码位**：
+      · 松开的消抖阈值必须**不等于**按下（同一个值 = 长按过程中的接触抖动会被
+        采信成"松手" ⇒ rgb.c 把渐变掐掉、改闪粉红 5 次 = "按对了却报错"）；
+      · elder_rgb_button_release() 里必须有时长兜底（<300ms 不闪粉红），而且
+        那条分支**不能**调 btn_enter_flash —— 否则兜底等于没做；
+      · ListenAfterClipTask 必须是"等 + 轮询"，不能再是一次 vTaskDelay 之后
+        一次性 if/else —— 那正是"播完回待机、没人开麦"的结构性原因；
+      · 长按分支必须有 idx/type/med_n/CanPlayClip 的决定性日志（用户两次投诉
+        都只能靠猜，日志是下次还能查得动的唯一保证）。
+
+    「改坏 → 变红」验证记录（2026-11-04，每次只改一处、跑完还原）：
+      · RELEASE_DEBOUNCE_MS 30→80 改回 30（与 DEBOUNCE_MS 同值）
+            ⇒ 7.1「松开阈值 ≠ 按下阈值」红
+      · input_task 里 `raw ? DEBOUNCE_MS : RELEASE_DEBOUNCE_MS` 改回裸
+        DEBOUNCE_MS ⇒ 7.1「按目标电平选阈值」红
+      · release 里把 `held_ms < …` 判据改成 `false`
+            ⇒ 7.2「有按压时长判据」红，连带「阈值」「兜底不闪粉红」共 3 条红
+      · 兜底阈值 300→0 ⇒ 7.2「兜底阈值 == 300ms」红
+      · 把 btn_enter_flash 补进 <300ms 兜底分支
+            ⇒ 7.2「兜底分支不闪粉红」红
+      · ListenAfterClipTask 的 `for (;;)` 改成 `if (true)`
+            ⇒ 7.3「是循环」「循环里 StartListening」2 条红
+      · extra_max_ms 4000→0 ⇒ 7.3「4000ms 上限」红
+      · 长按日志里删掉 `CanPlayClip=%d` ⇒ 7.4 红
+      · 所有「长按确认结论：」改回「长按：」 ⇒ 7.4 结论行数红（实际 0 行）
+    """
+    print("\n── 7. 松手消抖 / 抖动兜底 / 播完轮询开麦 / 长按决定性日志 ──")
+    inp = strip_comments(INPUT_C.read_text(encoding="utf-8"))
+    rgb = strip_comments(RGB_C.read_text(encoding="utf-8"))
+    b = strip_comments(BRIDGE.read_text(encoding="utf-8"))
+
+    # 7.1 按下与松开用**不同**的消抖阈值。
+    #     同一个值就等于没修：长按中的几十毫秒接触抖动照样会被当成松手。
+    press_deb = _define_value(inp, "DEBOUNCE_MS")
+    rel_deb = _define_value(inp, "RELEASE_DEBOUNCE_MS")
+    check(rel_deb != "", "input.c 定义了 RELEASE_DEBOUNCE_MS",
+          "缺失 ⇒ 松开仍与按下共用 30ms，长按中抖动一次就闪粉红")
+    check(rel_deb != "" and press_deb != "" and rel_deb != press_deb,
+          f"松开消抖({rel_deb or '缺失'}) ≠ 按下消抖({press_deb or '缺失'})",
+          "两个阈值相等 ⇒ 这次要修的 bug 原样装回去了")
+    ipos = inp.find("static void input_task(void *arg)")
+    itask = _brace_body(inp, ipos) if ipos >= 0 else ""
+    check(bool(itask), "能定位 input_task() 函数体", "函数签名被改过？")
+    check(bool(re.search(r"raw\s*\?\s*DEBOUNCE_MS\s*:\s*RELEASE_DEBOUNCE_MS",
+                         itask)),
+          "input_task 按目标电平选阈值（raw ? DEBOUNCE_MS : RELEASE_DEBOUNCE_MS）",
+          "只定义不引用 ⇒ 松开还是 30ms；改回裸 DEBOUNCE_MS 也一样")
+    check("按键松开（消抖 %d ms 采信" in itask and
+          "按键按下（消抖 %d ms 采信）" in itask,
+          "按下/松开采信各有一行日志（带消抖值，松开带按压时长）",
+          "没日志 ⇒ 下次还是只能猜有没有采信到")
+
+    # 7.2 release 的时长兜底：<300ms 的"松开"不闪粉红。
+    rpos = rgb.find("void elder_rgb_button_release(void)")
+    rel = _brace_body(rgb, rpos) if rpos >= 0 else ""
+    check(bool(rel), "能定位 elder_rgb_button_release() 函数体",
+          "函数被改名/挪走了？")
+    m = re.search(r"held_ms\s*<\s*([A-Za-z_][A-Za-z_0-9]*|\d+u?)", rel)
+    check(bool(m), "release 里有「本轮按压时长 < 阈值」的判据",
+          "删了它 ⇒ 一次抖动就闪粉红 5 次，老人看到的是「按对了却报错」")
+    if m:
+        tok = m.group(1)
+        raw_val = tok if tok[0].isdigit() else _define_value(rgb, tok)
+        val = re.sub(r"(?i)(?<=\d)(?:ull|ll|ul|u|l)\b", "", raw_val or "")
+        check(val == "300", f"兜底阈值 == 300ms（实际 {raw_val or '缺失'}）",
+              "用户要求：300ms 以内的「松开」只可能是抖动，不是老人的真实意图")
+        guard = _brace_body(rel, m.start())
+        check("btn_enter_flash" not in guard,
+              "兜底分支**不调用** btn_enter_flash（不闪粉红）",
+              "兜底里还闪粉红 ⇒ 等于什么都没改，老人照样看到「失败」")
+    else:
+        check(False, "兜底阈值 == 300ms", "判据没定位到")
+        check(False, "兜底分支**不调用** btn_enter_flash（不闪粉红）", "判据没定位到")
+
+    # 7.3 播完问句：轮询到能开麦为止，不再是"到点看一眼"。
+    lpos = b.find("static void ListenAfterClipTask(void *arg)")
+    ltask = _brace_body(b, lpos) if lpos >= 0 else ""
+    check(bool(ltask), "能定位 ListenAfterClipTask() 函数体", "函数被改名/挪走了？")
+    i_delay = ltask.find("vTaskDelay")
+    i_del = ltask.find("vTaskDelete")
+    loop = -1
+    if i_delay >= 0:
+        for kw in ("for (", "while ("):
+            j = ltask.find(kw, i_delay + 1)
+            if j >= 0 and (loop < 0 or j < loop):
+                loop = j
+    check(0 <= i_delay < loop < i_del,
+          "vTaskDelay 之后到 vTaskDelete 之间是循环（不再一次性 if/else）",
+          "回到一次性判定 ⇒ 片段起播被队列推后时只打一条 WARN 就结束，"
+          "老人听完问句设备却回待机")
+    check(loop >= 0 and "StartListening" in ltask[loop:i_del],
+          "循环体里会 StartListening（等不到就继续等，等到了就开麦）",
+          "循环里没有开麦 ⇒ 轮询没有意义")
+    check(re.search(r"\b4000\b", ltask) is not None,
+          "有 4000ms 的等待上限（不能无限等）",
+          "没有上限 ⇒ 状态卡在配网/连接时这个任务永远不退出")
+
+    # 7.4 长按分支的决定性日志。
+    norm = re.sub(r"\s+", " ", b)
+    check("长按确认：idx=%d type=%d med_n=%u CanPlayClip=%d" in norm,
+          "长按分支打 idx/type/med_n/CanPlayClip 决定性日志",
+          "缺这一行 ⇒ 下次「长按不能确认」还是只能靠猜")
+    n_concl = len(re.findall(r"长按确认结论：", norm))
+    check(n_concl >= 4,
+          f"每个分支走完都有结论日志（≥4 行，实际 {n_concl}）",
+          "只有入口日志、没有结论 ⇒ 分不清走到哪条分支")
+
+
 def main() -> int:
     t1_clip_ids()
     t2_long_press_wiring()
@@ -408,6 +525,7 @@ def main() -> int:
     t4_reminder_list()
     t5_button_led()
     t6_actionable_gate()
+    t7_press_debounce_and_listen_after_clip()
 
     passed = sum(1 for ok, _, _ in results if ok)
     failed = len(results) - passed

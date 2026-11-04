@@ -917,21 +917,67 @@ static void ListenAfterClipTask(void *arg)
     const uint32_t wait_ms = elder_clip_duration_ms(id) + 400;
     vTaskDelay(pdMS_TO_TICKS(wait_ms));
 
-    if (app.GetDeviceState() == kDeviceStateIdle) {
-        app.StartListening();
-        ESP_LOGI(TAG, "预录问句播完（%lu ms），进入聆听", (unsigned long)wait_ms);
-    } else if (app.GetDeviceState() == kDeviceStateListening) {
-        /* 连续对话下设备本来就在听（长按前就停在 Listening）。
-         * 这时**不需要**再 StartListening —— 那会先 AbortSpeaking，
-         * 而此刻并没有人在说话，白白把音频通道重开一次。 */
-        ESP_LOGI(TAG, "预录问句播完（%lu ms），设备已在聆听态",
-                 (unsigned long)wait_ms);
-    } else {
-        /* 这 2~4 秒里老人可能已经用别的方式开了对话（或设备被 APP 抢占）。
-         * 此时**不抢**：StartListening 会 AbortSpeaking，把正在说的话掐断。 */
-        ESP_LOGW(TAG, "预录问句播完，但设备不在待机（state=%d），不进聆听",
-                 (int)app.GetDeviceState());
+    /* ---- 等片段播完之后，**轮询**到能开麦为止（2026-11-04 用户实报）----
+     *
+     * 用户原话：「也触发了『您确认已经完成这次服药了吗』的语音提醒，但是没有
+     * 进入聆听状态，而是进入了待机状态。」
+     *
+     * 根因：PlaySound 只是把包推进解码队列，队列里若还压着前面的提醒播报，
+     * 片段**实际起播**会比 elder_clip_duration_ms() 晚。原来这里是一次性判定
+     * —— 到点看一眼状态，不是 Idle/Listening 就只打一条 WARN 走人，于是
+     * 老人听完问句、设备却回待机，没有任何人开麦。
+     *
+     * 改成轮询：每 100ms 看一次，最多再等 4000ms。
+     *   · 见到 Idle      ⇒ StartListening()（Application 在 ManualStop 模式下
+     *                       播完会回 Idle，这是唯一需要主动开麦的时刻）；
+     *   · 见到 Listening ⇒ 连续对话下本来就在听，**不要**再 StartListening
+     *                       （那会先 AbortSpeaking，白重开一次音频通道）；
+     *   · 其余状态（Speaking/Connecting/配网中）⇒ 继续等，不抢。
+     * 只有超时才报 ERROR —— 那是真的没开麦，必须能从日志里看出来。
+     *
+     * 只做 vTaskDelay + GetDeviceState + StartListening，不引入 std::string/JSON，
+     * 所以栈仍然是 4096（见 ListenAfterClip 的 xTaskCreate）。 */
+    const uint32_t poll_ms = 100;
+    const uint32_t extra_max_ms = 4000;
+    uint32_t extra_ms = 0;
+    DeviceState last_st = app.GetDeviceState();
+
+    for (;;) {
+        const DeviceState st = app.GetDeviceState();
+
+        /* 只在**状态变化**时打日志，别每 100ms 刷一行。 */
+        if (st != last_st) {
+            ESP_LOGI(TAG, "预录问句等待开麦：状态 %d -> %d（已等 %lu ms）",
+                     (int)last_st, (int)st,
+                     (unsigned long)(wait_ms + extra_ms));
+            last_st = st;
+        }
+
+        if (st == kDeviceStateIdle) {
+            app.StartListening();
+            ESP_LOGI(TAG, "预录问句播完（共等 %lu ms），进入聆听",
+                     (unsigned long)(wait_ms + extra_ms));
+            break;
+        }
+        if (st == kDeviceStateListening) {
+            ESP_LOGI(TAG, "预录问句播完（共等 %lu ms），设备已在聆听态",
+                     (unsigned long)(wait_ms + extra_ms));
+            break;
+        }
+        if (extra_ms >= extra_max_ms) {
+            /* 必须带**最后一次看到的状态值**：没有它就无法区分"还在播"
+             * 和"卡在配网/连接"，下次还是只能靠猜。 */
+            ESP_LOGE(TAG, "预录问句播完，又等了 %lu ms 仍未进待机/聆听"
+                          "（最后状态=%d，共等 %lu ms），本次不开麦",
+                     (unsigned long)extra_ms, (int)st,
+                     (unsigned long)(wait_ms + extra_ms));
+            break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(poll_ms));
+        extra_ms += poll_ms;
     }
+
     vTaskDelete(nullptr);
 }
 
@@ -1139,6 +1185,23 @@ void OnKey(elder_key_event_t ev, void *ctx)
          *    唯一的例外是"药数未知且开不了麦"（离线）—— 那时直接确认，
          *    否则老人会按了没反应。 */
         int idx = FirstUndoneReminder();
+        /* ---- 进入本分支的第一现场日志（2026-11-04）----
+         *
+         * 用户两次报「长按不能确认」，两次都只能靠猜：日志里既没有选中了哪一条，
+         * 也没有当时"能不能播片段 / 能不能开麦"。这一行把决定后续走向的
+         * 全部输入一次打全 —— idx 选中了谁、type 是什么（日程还是服药）、
+         * 几味药、两个能力判据、设备状态。idx<0 时 type 打 -1。
+         *
+         * ⚠️ 只增日志，不改任何判据。 */
+        {
+            const elder_rmd_item_t *dbg_item = (idx >= 0) ? ItemAt(idx) : nullptr;
+            ESP_LOGI(TAG, "长按确认：idx=%d type=%d med_n=%u CanPlayClip=%d "
+                          "CanStartDialog=%d state=%d",
+                     idx, (dbg_item != nullptr) ? (int)dbg_item->type : -1,
+                     (idx >= 0) ? (unsigned)elder_reminder_med_count((uint8_t)idx) : 0u,
+                     (int)CanPlayClip(), (int)CanStartDialog(),
+                     (int)Application::GetInstance().GetDeviceState());
+        }
         if (idx >= 0) {
             /* ---- 日程/待办类：播预录应答并**退回对话状态**（2026-11-03 用户需求）----
              *
@@ -1167,8 +1230,8 @@ void OnKey(elder_key_event_t ev, void *ctx)
                      * "按不动的卡片"。 */
                     elder_ui_speak("日程已确认完成，我就不在屏幕显示了");
                 }
-                ESP_LOGI(TAG, "长按：日程类提醒 #%d 已确认，播预录应答并退回对话态",
-                         idx);
+                ESP_LOGI(TAG, "长按确认结论：日程类提醒 #%d 已确认"
+                              "（播预录应答并退回对话态）", idx);
                 break;
             }
             /* ---- 多药提醒（2026-11-03 用户需求）----
@@ -1191,8 +1254,8 @@ void OnKey(elder_key_event_t ev, void *ctx)
             if (med_n == 0 && !CanPlayClip()) {
                 elder_rgb_button_confirmed();
                 ConfirmMedicine(idx, ELDER_CFM_BUTTON);
-                ESP_LOGW(TAG, "长按：药数未知且此刻播不了片段（离线/忙）⇒ 直接确认 #%d",
-                         idx);
+                ESP_LOGW(TAG, "长按确认结论：药数未知且此刻播不了片段（离线/忙）"
+                              "⇒ 直接确认 #%d", idx);
                 break;
             }
 
@@ -1263,11 +1326,13 @@ void OnKey(elder_key_event_t ev, void *ctx)
              *
              * 片段不可用 / 开不了麦 ⇒ 逐字退回原来的 TTS 追问（下面那段）。 */
             if (CanPlayClip() && elder_clip_play(ELDER_CLIP_MED_CONFIRM)) {
-                ListenAfterClip(ELDER_CLIP_MED_CONFIRM);
-                ESP_LOGI(TAG, "长按：播预录问句「您确认已经完成这次服药了吗？」"
-                              "（%u 味药，提醒 #%d，state=%d），播完进聆听",
-                         (unsigned)med_n, idx,
+                ESP_LOGI(TAG, "长按确认：开始播预录问句并排队开麦"
+                              "（clip=%d，%u 味药，提醒 #%d，state=%d）",
+                         (int)ELDER_CLIP_MED_CONFIRM, (unsigned)med_n, idx,
                          (int)Application::GetInstance().GetDeviceState());
+                ListenAfterClip(ELDER_CLIP_MED_CONFIRM);
+                ESP_LOGI(TAG, "长按确认结论：进追问（预录片段已排队，"
+                              "开麦任务已建，播完由任务自己打状态）");
                 break;
             }
 
@@ -1284,8 +1349,9 @@ void OnKey(elder_key_event_t ev, void *ctx)
              * 任务自己再判一次并静默 return —— 那正是"按了没声音"的第二个
              * 静默出口。现在在**建任务之前**就判，判不过就明说。 */
             if (!CanStartDialog()) {
-                ESP_LOGE(TAG, "长按：既播不了片段、也不在待机（state=%d），"
-                              "本次无法追问；提醒仍挂在屏上，可再按一次",
+                ESP_LOGE(TAG, "长按确认结论：进追问失败 —— 既播不了片段、"
+                              "也不在待机（state=%d），本次无法追问；"
+                              "提醒仍挂在屏上，可再按一次",
                          (int)Application::GetInstance().GetDeviceState());
                 break;
             }
@@ -1300,7 +1366,7 @@ void OnKey(elder_key_event_t ev, void *ctx)
                 elder_ui_speak(prompt);
                 delete payload;
             }
-            ESP_LOGI(TAG, "长按追问（%u 味药，提醒 #%d）：%s",
+            ESP_LOGI(TAG, "长按确认结论：进追问（退回 TTS，%u 味药，提醒 #%d）：%s",
                      (unsigned)med_n, idx, prompt);
         } else {
             /* 诊断：这是 2026-10-29「屏幕挂着提醒但按什么都没反应」的现场
@@ -1326,9 +1392,10 @@ void OnKey(elder_key_event_t ev, void *ctx)
                 if (!elder_clip_play(ELDER_CLIP_SCHED_DONE)) {
                     elder_ui_speak("日程已确认完成，我就不在屏幕显示了");
                 }
-                ESP_LOGI(TAG, "长按：日程卡已收（引擎无待确认项），播预录应答");
+                ESP_LOGI(TAG, "长按确认结论：日程卡已收（引擎无待确认项），"
+                              "播预录应答");
             } else {
-                ESP_LOGI(TAG, "长按 3 秒：当前没有待确认的提醒，不确认");
+                ESP_LOGI(TAG, "长按确认结论：无待确认项 —— 长按 3 秒不确认");
             }
         }
         break;
