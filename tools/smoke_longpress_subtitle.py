@@ -172,7 +172,36 @@ def t3_subtitle_accumulate() -> None:
 
 
 def t4_reminder_list() -> None:
-    print("\n── 4. 多条提醒逐条列出（不再只写「还有 N 条」）──")
+    """多条提醒逐条列出 + 多味药一味一行 + 明细换行不裁字。
+
+    2026-11-04 追加（用户第 3 条）：「两种药是按照一行显示的，所以第二种药只
+    显示了前几个字。」
+      根因在上游：sync.c 把同一时刻的多味药拼成一行「降压药1片、降脂药1片」，
+      而 183px / 30px 字号一行只放 6 个汉字 —— 第二味药必然只剩前几个字。
+      修法分两层，两层都要守：
+        · reminder.c（文案层）：输出给屏幕的那一段把全角顿号还原成换行；
+        · lcd_display.cc（显示层）：明细用 LV_LABEL_LONG_WRAP（折行不裁字），
+          放不下时先压 text_line_space，压到底再纵向滚动，**不截断行**。
+
+    本组新增的每条断言都做过「改坏 → 变红 → 还原」验证（2026-11-04，逐条跑、
+    每次只改一处、跑完还原；括号里是变红的那一条）：
+      · `med[used++] = '\\n';` 改成 `med[used++] = ' ';`（拼成一行）
+            ⇒ 「多味药之间用 \\n 分隔」
+      · `sep_mark = "、"` 改成 `","`（不再按真分隔符切）
+            ⇒ 「按 UTF-8 子串切分」
+      · 脏数据三元式改回 `med[used++] = c;`
+            ⇒ 「脏数据仍换成空格」
+      · ShowReminder 的明细改回 LV_LABEL_LONG_DOT
+            ⇒ 「明细 label 是 LV_LABEL_LONG_WRAP」
+      · 加回 `if (item_lines > fit_lines) item_lines = fit_lines;`
+            ⇒ 「明细不再按可用行数截断」
+      · 压行距循环的条件改成 `ls >= 0`（等于不压）
+            ⇒ 「放不下先压 text_line_space」
+      · 删掉 `lv_obj_add_flag(reminder_items_, LV_OBJ_FLAG_SCROLLABLE);`
+            ⇒ 「压到底仍放不下 ⇒ 纵向滚动」
+    结果：7 条改坏点全部按预期变红，每次只红预期的那一条。
+    """
+    print("\n── 4. 多条提醒逐条列出 + 多味药一味一行 ──")
     src = strip_comments(REMINDER_C.read_text(encoding="utf-8"))
     check("（还有 %u 条）" not in src,
           "旧的「（还有 N 条）」已删除",
@@ -183,6 +212,36 @@ def t4_reminder_list() -> None:
     check("pending_same_minute(item->fired_due_at)" in src,
           "明细与条数用**同一个**判据（pending_same_minute）",
           "两套判据会漂移：屏幕写 3 条、实际只列 2 条")
+
+    # ---- 多味药：一味一行（2026-11-04 用户第 3 条）----
+    check("med[used++] = '\\n';" in src,
+          "多味药之间用 \\n 分隔（一味药一行），不再用「、」拼成一句",
+          "拼成一句 ⇒ 183px 一行 6 个汉字，第二味药只剩前几个字")
+    check('const char *sep_mark = "、";' in src and "strstr(q, sep_mark)" in src,
+          "按 UTF-8 子串切分（「、」是 3 字节，不能按字节替换）",
+          "按字节替换会把一个汉字切成两半，屏上是乱码方块")
+    check("(c == '\\r' || c == '\\n' || c == '\\t') ? ' ' : c" in src,
+          "脏数据（家属输入的 \\r\\n\\t）仍换成空格 —— 「一行一件事」契约不被破坏",
+          "删掉它 ⇒ 药名里的换行会被显示层当成新的明细项")
+    check('snprintf(med, sizeof(med), "%s", med_line_of(item));' not in src,
+          "不再整串拷进 med（那正是「拼成一行」的写法）",
+          "整串拷贝 ⇒ 顿号原样留在屏上")
+
+    # ---- 显示层：换行而不是裁字 ----
+    lcd = strip_comments(LCD.read_text(encoding="utf-8"))
+    check("lv_label_set_long_mode(reminder_items_, LV_LABEL_LONG_WRAP);" in lcd,
+          "ShowReminder 的明细 label 是 LV_LABEL_LONG_WRAP（折行，不打点裁字）",
+          "LONG_DOT ⇒ 一行写不下就在末尾打点，正是用户报的「只显示前几个字」")
+    check("item_lines = fit_lines" not in lcd,
+          "明细不再按可用行数截断（item_lines 保持真实行数）",
+          "截断 = 后面的药直接不显示，老人漏服")
+    check("lv_obj_set_style_text_line_space(reminder_items_, item_line_space, 0);" in lcd
+          and "ls >= -6" in lcd,
+          "放不下时先压 text_line_space（最多 -6px）",
+          "不压 ⇒ 3 行以上直接进滚动，老人要多滚一次才看得全")
+    check("lv_obj_add_flag(reminder_items_, LV_OBJ_FLAG_SCROLLABLE);" in lcd,
+          "压到底仍放不下 ⇒ 该区域纵向滚动（一行都不裁）",
+          "不滚 ⇒ 第 4 行起被容器裁掉，屏上还是「只显示前几个字」")
 
 
 def _define_value(src: str, name: str) -> str:

@@ -49,19 +49,29 @@ protected:
     lv_obj_t* container_ = nullptr;
     lv_obj_t* side_bar_ = nullptr;
     lv_obj_t* bottom_bar_ = nullptr;
+    /* 用户话的**独立**容器（2026-11-04 用户第 1 条）。
+     *
+     * 与 bottom_bar_ 位置、尺寸逐像素相同，内部只装 chat_user_label_。
+     * 两个容器**互斥显示**（UpdateChatBoxes）：同一时刻屏上只有一段文字，
+     * 这是"用户字幕与设备字幕不可能同屏"的结构性保证 —— 上一版把两段放在
+     * 同一个滚动容器里，靠"凑整页边界"分开，任何一个环节算错就退回同屏。
+     * 详见 lcd_display.cc 里 UpdateChatBoxes() / ChatPageLayout() 的说明。 */
+    lv_obj_t* user_box_ = nullptr;
     lv_obj_t* preview_image_ = nullptr;
     lv_obj_t* emoji_label_ = nullptr;
     lv_obj_t* emoji_image_ = nullptr;
     std::unique_ptr<LvglGif> gif_controller_ = nullptr;
     lv_obj_t* emoji_box_ = nullptr;
     lv_obj_t* chat_message_label_ = nullptr;
-    /* 左列第二行：用户刚说的话（设计稿里是蓝色 #4982FC 那一行）。
+    /* 用户刚说的话（设计稿里是蓝色 #4982FC 那一行）。
      *
-     * 为什么需要第二个 label：设计稿的对话态是「上面一行用户问话（蓝）+
-     * 下面一段小安回答（深色）」。而 SetChatMessage(role, content) 每来一条
-     * 就把 label 整段覆盖，只留一个 label 的话，回答一出现用户的话就没了。
+     * 为什么需要第二个 label：SetChatMessage(role, content) 每来一条就把
+     * label 整段覆盖，只留一个 label 的话，回答一出现用户的话就没了。
      * 两块 label 分工：user → chat_user_label_，assistant/system →
-     * chat_message_label_，互不覆盖。 */
+     * chat_message_label_，互不覆盖。
+     *
+     * 2026-11-04 起它挂在 **user_box_** 下（不是 bottom_bar_）：两段文字各占
+     * 一个容器、互斥显示，见 user_box_ 的说明。 */
     lv_obj_t* chat_user_label_ = nullptr;
     /* 状态栏右上角的日期「10月29日 周三」。时钟走 SetStatusClock()，
      * 日期跟它一起刷（同一个入口，避免两处各算一遍时间）。 */
@@ -82,11 +92,11 @@ protected:
     lv_timer_t* anti_burn_timer_ = nullptr;
     uint32_t last_ui_change_tick_ = 0;      /* lv_tick 毫秒 */
 
-    /* ---- 对话分页（2026-11-03 起，2026-11-04 重做落点）----
+    /* ---- 对话分页（2026-11-03 起，2026-11-04 改成双容器）----
      *
      * 「用户说的话和 AI 说的话放在不同的两页，如果一页显示不全，自动翻页」。
-     * 实现是**按页滚动**左列容器 bottom_bar_，不是两个 label 轮显：
-     * 一段话本身就可能跨页，轮显只能二选一，翻不了页内。
+     * 实现是**两个容器各自按页滚动**：bottom_bar_ 只装设备字幕、user_box_ 只装
+     * 用户话，两者互斥显示。一段话本身可能跨页，所以每段各滚各的。
      *
      * 页高 = 整行文字的整数倍（不是容器高度）：188px 的容器按 42px 行高只
      * 放得下 4 行（168px），按 188 滚会把交界处那一行切成半截字。
@@ -95,13 +105,21 @@ protected:
      * 调用），所以不需要 atomic。 */
     int ChatLineH();        /* 一行多少像素：字体行高 + 行间距，现算不缓存 */
     int ChatPageH();        /* 一页多少像素：整行倍数 */
-    /* `anchor_px` = 本次追加的那一句，第一行在设备字幕 label 内的起始像素。
+    /* 当前该分页的容器：有设备字幕 → bottom_bar_，否则有用户话 → user_box_。 */
+    lv_obj_t* ChatActiveBox();
+    /* 两个容器的**互斥**显隐（有设备字幕就显示 bottom_bar_、藏 user_box_，
+     * 反之亦然；两者都空 / 藏字幕开关打开时都藏）。 */
+    void UpdateChatBoxes();
+    /* `anchor_px` = 本次追加的那一句，第一行在当前容器 label 内的起始像素。
      * 传 >= 0 ⇒ 屏停到**这一句第一行所在的那一页**（语音念到哪、字从哪开始）；
      * 传默认 -1 ⇒ 回第 1 页（user / system 覆盖、换主题重排时用）。
      * 详见 lcd_display.cc 里 ChatPageLayout 的落点说明。 */
     void ChatPageLayout(int anchor_px = -1);
     void ChatPageStep();    /* 定时器回调：每 6 秒前进一页，最后一页停住 */
     lv_timer_t* chat_page_timer_ = nullptr;
+    /* 分页正在滚的那个容器（bottom_bar_ 或 user_box_）。ChatPageStep 必须
+     * 滚**同一个**容器 —— 换容器时不更新它，翻页会滚到看不见的那个上去。 */
+    lv_obj_t* chat_page_box_ = nullptr;
     int chat_page_index_ = 0;       /* 当前页号，0 起 */
     int chat_page_count_ = 0;       /* 总页数 */
     int chat_page_h_ = 0;           /* 页高（像素） */
@@ -246,7 +264,7 @@ public:
      * 文案仍然只有一个来源：ShowReminder(text) 收到的字符串。约定是
      * **一行一件事**（见 reminder.c 的 elder_reminder_screen_text）：
      *   第 0 行 标题
-     *   第 1..n 行 明细（每行一条；超过 4 行截断，屏上放不下）
+     *   第 1..n 行 明细（每行一条；放不下时压行距、再纵向滚动，不裁字）
      *   最后一行若以「请」开头 ⇒ 当橙色提示语，不当明细
      * 这个约定写在两边的注释里 —— 改一边必须改另一边。 */
     lv_obj_t* reminder_title_ = nullptr;     /* 标题行（带红色药丸图标） */

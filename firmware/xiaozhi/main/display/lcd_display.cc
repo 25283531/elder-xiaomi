@@ -79,26 +79,6 @@ inline int AvatarTop()   { return StatusBarH() + LV_VER_RES * 44 / 240; }
 /* 左列文字顶边距状态栏底边 14px（实测首行文字 y≈44，比头像高 30px） */
 inline int TextTop()     { return StatusBarH() + LV_VER_RES * 14 / 240; }
 
-/* ---- 对话态专用：文字优先（2026-11-04 用户第 2 条需求）----
- *
- * 「多行的时候显示不完整」的根因之一是每行只放得下 6 个汉字：30px 字号 +
- * 183px 列宽，一段 4 句的回答要翻 4 页，老人还没读完就被翻走。
- *
- * 扩容量只有两种不改字号的手段（30px 是刻意选的：20px 汉字只有 2mm 高，
- * 老人看不清；本仓也只有 14/16/20/30 四套 cbin，没有 24px）：
- *   ① 缩对话态头像换列宽；
- *   ② 压 pad_row —— 实测无效：容器 188 ÷ 42 本来就是 4 行，压行距只会让行
- *      更挤，不会多出一行。
- * 取 ①，但**不整块藏掉头像**：表情是小安唯一的"脸"，说话时老人正看着它。
- * 缩到 52px 仍看得清表情，同时把列宽从 183 换到 242。
- *
- * 242 ÷ 30 = 8 个汉字/行（原 6），4 行/页 ⇒ 32 字/页（原 24，+33%）。
- * 提醒卡片（ShowReminder）仍用 AvatarSize() 的 90px：那是另一套版式，
- * 文字只有 3 行、不参与分页，没有扩宽需求，不动它。 */
-inline int ChatAvatarSize()  { return LV_VER_RES * 52 / 240; }
-inline int ChatAvatarRight() { return LV_HOR_RES * 8 / 320; }
-inline int ChatPadX()        { return LV_HOR_RES * 10 / 320; }
-
 /* 待机跑马灯的表情直径 60px（mock-3 实测 60x60，纵向居中于主区） */
 inline int MarqueeSize() { return LV_VER_RES * 60 / 240; }
 
@@ -427,6 +407,14 @@ LcdDisplay::~LcdDisplay() {
     if (chat_message_label_ != nullptr) {
         lv_obj_del(chat_message_label_);
     }
+    /* user_box_ 是 chat_user_label_ 的父对象：label 已删，这里只删空容器。
+     * 与 bottom_bar_ 同一写法（见下面那段），别漏 —— 漏了就是析构后仍有一个
+     * 挂着空 label 的容器留在屏上。 */
+    if (user_box_ != nullptr) {
+        lv_obj_del(user_box_);
+        user_box_ = nullptr;
+    }
+    chat_page_box_ = nullptr;
     if (emoji_label_ != nullptr) {
         lv_obj_del(emoji_label_);
     }
@@ -903,8 +891,8 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
 //    ┌──────────────────────────────────┐
 //    │ 上午 08:30            (wifi)10月29日 周三 │ ← top_bar_ 藏青 30px
 //    ├──────────────────────────────────┤
-//    │ 用户的话（蓝 #4982FC）      ╭────╮ │ ← bottom_bar_（左列 x10 宽242）
-//    │ 小安的回答（深 #232F54）    │头像│ │    emoji_box_（右侧 52x52 圆）
+//    │ 用户的话（蓝 #4982FC）      ╭────╮ │ ← bottom_bar_ / user_box_（左列 x18 宽183）
+//    │ 小安的回答（深 #232F54）    │头像│ │    emoji_box_（右侧 90x90 圆）
 //    │                            ╰────╯ │
 //    └──────────────────────────────────┘
 //
@@ -1011,13 +999,12 @@ void LcdDisplay::SetupUI() {
      *   · 圆角改成 LV_RADIUS_CIRCLE + 圆底 #7B93E8，表情图裁在圆内。
      *
      * ⚠️ 待机跑马灯**不再**挂在这个对象下面（见 StartIdleMarquee）：
-     * 跑马灯要横跨整屏，而这个圆只有 52px 宽，挂在里面就只能在圆内滚 ——
+     * 跑马灯要横跨整屏，而这个圆只有 90px 宽，挂在里面就只能在圆内滚 ——
      * 这正是 2026-11-03 用户实报「没有从全屏右侧进入、左侧出」的成因。
      *
-     * 尺寸 90 → 52（2026-11-04）：设计稿的 90px 让左列只剩 183px、一行 6 个
-     * 汉字，字幕永远显示不全。缩到 52 换回 242px 列宽（8 字/行），表情仍看得清
-     * —— 取舍见文件头 ChatAvatarSize() 的说明。 */
-    const int avatar_sz = ChatAvatarSize();
+     * 2026-11-04：曾把它缩到 52px 换 242px 列宽，用户实报「表情图标变小了，
+     * 位置也变了」⇒ **已全部撤销**，回到设计稿的 90px / 右边距 21px。 */
+    const int avatar_sz = AvatarSize();
     emoji_box_ = lv_obj_create(screen);
     lv_obj_set_size(emoji_box_, avatar_sz, avatar_sz);
     lv_obj_set_style_radius(emoji_box_, LV_RADIUS_CIRCLE, 0);
@@ -1029,7 +1016,7 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_pad_all(emoji_box_, 0, 0);
     lv_obj_set_style_border_width(emoji_box_, 0, 0);
     lv_obj_clear_flag(emoji_box_, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_align(emoji_box_, LV_ALIGN_TOP_RIGHT, -ChatAvatarRight(), AvatarTop());
+    lv_obj_align(emoji_box_, LV_ALIGN_TOP_RIGHT, -AvatarRight(), AvatarTop());
 
     emoji_label_ = lv_label_create(emoji_box_);
     lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
@@ -1047,7 +1034,7 @@ void LcdDisplay::SetupUI() {
     preview_image_ = lv_image_create(screen);
     lv_obj_set_size(preview_image_, avatar_sz, avatar_sz);
     lv_image_set_inner_align(preview_image_, LV_IMAGE_ALIGN_CONTAIN);
-    lv_obj_align(preview_image_, LV_ALIGN_TOP_RIGHT, -ChatAvatarRight(), AvatarTop());
+    lv_obj_align(preview_image_, LV_ALIGN_TOP_RIGHT, -AvatarRight(), AvatarTop());
     lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
 
     /* Layer 1: Top bar —— 藏青状态栏（2026-11-03 设计稿）
@@ -1175,7 +1162,7 @@ void LcdDisplay::SetupUI() {
     /* Layer 3: bottom_bar_ —— 左列对话区（2026-11-03 设计稿）
      *
      * 设计稿的聆听/对话态是「左边一列文字 + 右边一个头像圆」的**左右分栏**：
-     *   左列  x 10 起，宽到头像左边再留 8px（320 屏上是 242px）
+     *   左列  x 18 起，宽到头像左边再留 8px（320 屏上是 183px）
      *   上行  用户刚说的话，蓝色 #4982FC
      *   下行  小安的回答，深色 #232F54
      *
@@ -1183,18 +1170,29 @@ void LcdDisplay::SetupUI() {
      *   · 位置：贴底 → 主区左上（设计稿首行 y≈44）
      *   · 对齐：居中 → 左对齐（老人的视线从左往右扫，居中会让他找不到
      *     "从哪儿开始读"，而且每换一句起点都变）
-     *   · 宽度：整屏 → 242px（右侧让给头像圆；2026-11-04 从 183 加宽，见
-     *     ChatAvatarSize() 的说明：一行从 6 个汉字变成 8 个）
+     *   · 宽度：整屏 → 183px（右侧让给头像圆）
+     *
+     * ⚠️ 2026-11-04（用户第 1 条）：两段文字**不再共用一个容器**。
+     *   `bottom_bar_` 从此只装设备字幕（chat_message_label_），用户话搬进
+     *   同位置同尺寸的 `user_box_`，两个容器**互斥显示**（见 UpdateChatBoxes）。
+     *   为什么必须这样：只要两段在同一个滚动容器里，只要滚动偏移不是精确的
+     *   整页边界，就一定会同屏 —— 上一版靠"把用户话撑成整页整数倍 + 补尾部
+     *   留白"去凑边界，任何一个环节算错（尤其是追加前量到的高度已被补过留白）
+     *   就退回用户报的那个现象：第 2 页顶端露出用户话、设备字幕只剩一行半。
+     *   拆成两个容器 + 互斥显示，是**结构性**地让它们不可能同屏。
      *
      * 成员名仍叫 bottom_bar_（基类清理逻辑与 SetHideSubtitle 都按这个名字
-     * 引用），语义已变成「左列容器」。
+     * 引用），语义已变成「设备字幕容器」。
      */
-    const int col_x = ChatPadX();
-    const int col_w = LV_HOR_RES - ChatAvatarRight() - ChatAvatarSize() - col_x
+    const int col_x = MainPadX();
+    const int col_w = LV_HOR_RES - AvatarRight() - AvatarSize() - col_x
                       - LV_HOR_RES * 8 / 320;
+    const int col_y = TextTop();
+    const int col_h = LV_VER_RES - TextTop() - LV_VER_RES * 8 / 240;
+
     bottom_bar_ = lv_obj_create(screen);
-    lv_obj_set_pos(bottom_bar_, col_x, TextTop());
-    lv_obj_set_size(bottom_bar_, col_w, LV_VER_RES - TextTop() - LV_VER_RES * 8 / 240);
+    lv_obj_set_pos(bottom_bar_, col_x, col_y);
+    lv_obj_set_size(bottom_bar_, col_w, col_h);
     lv_obj_set_style_radius(bottom_bar_, 0, 0);
     /* 透明底：主区底色 #D3DBFC 由 screen/container_ 提供。这里再刷一层
      * 同色不透明底会和圆角/边框叠出接缝，而且 SetTheme 里那段 50% 透明度
@@ -1215,31 +1213,9 @@ void LcdDisplay::SetupUI() {
      * 两张图（它们的包围盒故意超出屏幕），见 SetupUI 开头的说明。 */
     lv_obj_set_scroll_dir(bottom_bar_, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(bottom_bar_, LV_SCROLLBAR_MODE_OFF);
-    /* 纵向 flex：用户话在上、回答在下，行高由内容决定，不写死 y。
-     * 两行文字的起点必须跟着上一行的高度走 —— 用户说了 1 句还是 2 句，
-     * 回答的起始 y 是不一样的，绝对定位做不到。
-     *
-     * 行间距（pad_row）保留 6px 的视觉留白，但页高换算时必须把它算进去：
-     * "回答另起一页"要求 (用户话高 + 行间距) 恰好落在页边界上，所以撑高的
-     * 目标是 `pages * page_h - 行间距`，而不是 `pages * page_h`。写错这 6px
-     * 的后果是回答的每一行都相对页边界错位 6px，翻到第 3 页时正好把一行
-     * 切成上下两半。 */
-    lv_obj_set_flex_flow(bottom_bar_, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(bottom_bar_, LV_FLEX_ALIGN_START,
-                          LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_set_style_pad_row(bottom_bar_, LV_VER_RES * 6 / 240, 0);
-
-    /* 用户话（蓝）。空串时**隐藏**而不是留空 label：flex 会跳过隐藏子对象，
-     * 这样"只有回答"时文字自然顶到列首，不会凭空多出一行空白。 */
-    chat_user_label_ = lv_label_create(bottom_bar_);
-    lv_obj_set_width(chat_user_label_, lv_pct(100));
-    lv_label_set_long_mode(chat_user_label_, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(chat_user_label_, LV_TEXT_ALIGN_LEFT, 0);
-    lv_obj_set_style_text_color(chat_user_label_, lv_color_hex(kColorTextUser), 0);
-    lv_obj_set_style_text_font(chat_user_label_, chat_font, 0);
-    lv_obj_set_style_text_line_space(chat_user_label_, LV_VER_RES * 4 / 240, 0);
-    lv_label_set_text(chat_user_label_, "");
-    lv_obj_add_flag(chat_user_label_, LV_OBJ_FLAG_HIDDEN);
+    /* 容器里**只放一个** label（设备字幕），所以不需要 flex、也不需要
+     * pad_row：上一版那 6px 行间距是"用户话 + 回答同容器"才需要的，现在
+     * 两段各在自己的容器里，页高换算里也不该再出现第二段的高度。 */
 
     /* 小安的回答（深色）。SetChatMessage 的 assistant / system 都写这里。 */
     chat_message_label_ = lv_label_create(bottom_bar_);
@@ -1250,6 +1226,45 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_font(chat_message_label_, chat_font, 0);  /* 显式设，不靠继承 */
     lv_obj_set_style_text_line_space(chat_message_label_, LV_VER_RES * 4 / 240, 0);
     lv_label_set_text(chat_message_label_, "");
+
+    /* ---- user_box_：用户话的**独立**容器（2026-11-04 用户第 1 条）----
+     *
+     * 位置、尺寸、滚动方式与 bottom_bar_ **逐像素相同**（同一块左列区域），
+     * 只是里面装的是另一个 label。两个容器互斥显示（UpdateChatBoxes），
+     * 所以同一时刻屏上只有一段文字 —— 这是"用户字幕与设备字幕不可能同屏"
+     * 的**结构性**保证，不再依赖"把高度凑成整页边界"那种算术。
+     *
+     * 为什么用户话（蓝）要单独一个容器，而不是继续和回答共用一个：
+     *   共用时只能靠滚动偏移把两段分开，而偏移只要差一像素，第 2 页顶端就会
+     *   露出上一段的最后一行；上一版为此补了"撑高 + 尾部留白"两层算术，
+     *   仍然被"追加前量到的高度已被补过留白"打穿（见 ChatPageLayout 的说明）。
+     *
+     * 用户话空串时**隐藏整个容器**：留一个空 label 会让 flex/滚动余量多算
+     * 一截，翻页时多出一次"什么都没变"的空白页。 */
+    user_box_ = lv_obj_create(screen);
+    lv_obj_set_pos(user_box_, col_x, col_y);
+    lv_obj_set_size(user_box_, col_w, col_h);
+    lv_obj_set_style_radius(user_box_, 0, 0);
+    lv_obj_set_style_bg_opa(user_box_, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_text_color(user_box_, lvgl_theme->text_color(), 0);
+    lv_obj_set_style_pad_all(user_box_, 0, 0);
+    lv_obj_set_style_border_width(user_box_, 0, 0);
+    lv_obj_set_scroll_dir(user_box_, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(user_box_, LV_SCROLLBAR_MODE_OFF);
+
+    /* 用户话（蓝）。 */
+    chat_user_label_ = lv_label_create(user_box_);
+    lv_obj_set_width(chat_user_label_, lv_pct(100));
+    lv_label_set_long_mode(chat_user_label_, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(chat_user_label_, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_set_style_text_color(chat_user_label_, lv_color_hex(kColorTextUser), 0);
+    lv_obj_set_style_text_font(chat_user_label_, chat_font, 0);
+    lv_obj_set_style_text_line_space(chat_user_label_, LV_VER_RES * 4 / 240, 0);
+    lv_label_set_text(chat_user_label_, "");
+    lv_obj_add_flag(chat_user_label_, LV_OBJ_FLAG_HIDDEN);
+    /* 初始两个容器都藏起来：开机时没有任何字幕，露出空容器没有意义。 */
+    lv_obj_add_flag(user_box_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
 
     low_battery_popup_ = lv_obj_create(screen);
     lv_obj_set_scrollbar_mode(low_battery_popup_, LV_SCROLLBAR_MODE_OFF);
@@ -1303,18 +1318,30 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     ESP_ERROR_CHECK(esp_timer_start_once(preview_timer_, PREVIEW_IMAGE_DURATION_MS * 1000));
 }
 
-/* ================= 对话分页（2026-11-03 起，2026-11-04 重做落点） =================
+/* ================= 对话分页（2026-11-03 起，2026-11-04 改成双容器） =================
  *
  * 用户原话（2026-11-03）：「对话状态中，用户说的话和 AI 说的话文字放在同一页，
  * 一屏显示不完全。把用户说的话和 AI 说的话放在不同的两页，如果一页显示不全，
  * 自动翻页」。
  * 用户原话（2026-11-04）：「多行的时候显示不完整，也没有把用户说的字幕和设备的
  * 字幕分到不同页面，字幕刷新率很低，完全跟不上语音」。
+ * 用户原话（2026-11-04，第二版实测）：「字幕在第一屏显示的时候是分屏的，但是
+ * 当播报的语音超出一屏，第二屏显示的时候就又变成了上面是用户的，下面是语音的
+ * 字幕，而且只显示语音字幕的前一行半。」
  *
- * 为什么是"按页滚动"而不是"两个 label 轮着显示"：
- *   轮显只能解决"两块话挤在一屏"，解决不了"一块话本身就超一屏"（回答经常
- *   三四行，320x240 上 30px 字体一屏只有 4 行）。滚动才能把一段话按页翻完，
- *   两种"显示不全"用同一套机制覆盖。
+ * 为什么上一版"凑整页边界"必然失败（记下来，别再走回头路）：
+ *   上一版两段文字在**同一个**滚动容器里，靠"把用户话撑成 page_h 的整数倍 +
+ *   给最后一段补尾部留白 + 滚到 idx*page_h"去保证第 2 页顶端正好是回答的第一
+ *   行。这是纯算术保证，任何一处偏差都会塌：SetChatMessage 里量"已有几行"时
+ *   量的是 label 高度，而那个高度上一轮已被 ChatPageLayout 补过尾部留白 ⇒
+ *   行数偏大、落点算到后面去；视口 188 与页高 168 差 20px 又让滚动上限夹住
+ *   最后一页。现象就是用户描述的那一屏：顶端露出用户话，设备字幕只剩 1.5 行。
+ *
+ * 现在的结构（结构性保证，不再依赖算术）：
+ *   · bottom_bar_ 只装 chat_message_label_（设备字幕）；
+ *   · user_box_   只装 chat_user_label_（用户话），位置尺寸与 bottom_bar_ 相同；
+ *   · 两者**互斥显示**（UpdateChatBoxes）：同一时刻屏上只有一段文字。
+ *   · 分页按**各自容器**算：页数只用一个 label 的高度，滚动位置 = 页号 × 页高。
  *
  * 页高为什么取"整行倍数"：容器高 188px，行高 42px，只能放 4 行（168px）。
  * 按 188 滚，第二页顶端会从第 5 行的中间切开 —— 老人看到半截字。
@@ -1339,6 +1366,7 @@ int LcdDisplay::ChatLineH() {
 
 int LcdDisplay::ChatPageH() {
     if (bottom_bar_ == nullptr) return 0;
+    /* 两个容器尺寸逐像素相同（见 SetupUI），用哪个量都一样。 */
     const int avail = (int)lv_obj_get_height(bottom_bar_);
     const int line_h = ChatLineH();
     if (avail <= 0 || line_h <= 0) return 0;
@@ -1347,78 +1375,114 @@ int LcdDisplay::ChatPageH() {
     return lines * line_h;
 }
 
+/* 当前该分页的那个容器。
+ *
+ * 设备字幕优先：老人在等答案，回答一出就该占屏；用户话只在"还没有回答"的
+ * 那段时间单独占屏（他刚说完、设备在想）。两者都空时返回 bottom_bar_（空
+ * 容器，分页算法在上面退化成 1 页，无副作用）。 */
+lv_obj_t* LcdDisplay::ChatActiveBox() {
+    if (chat_message_label_ != nullptr) {
+        const char* m = lv_label_get_text(chat_message_label_);
+        if (m != nullptr && m[0] != '\0') return bottom_bar_;
+    }
+    if (chat_user_label_ != nullptr) {
+        const char* u = lv_label_get_text(chat_user_label_);
+        if (u != nullptr && u[0] != '\0') return user_box_;
+    }
+    return bottom_bar_;
+}
+
+/* 两个容器**互斥显示** —— 这是"用户字幕与设备字幕不可能同屏"的唯一保证。
+ *
+ * 三条分支，缺一不可：
+ *   ① 有设备字幕 ⇒ 显示 bottom_bar_、隐藏 user_box_（设备字幕优先：老人正在
+ *      等答案，用户话留在屏上会把答案挤走 —— 上一版的"同屏"就是这么来的）；
+ *   ② 只有用户话 ⇒ 显示 user_box_、隐藏 bottom_bar_；
+ *   ③ 都空 ⇒ 两个都藏（露出空容器等于屏上凭空多一块可滚区域）。
+ * 另外 hide_subtitle_（设置项）为真时一律两个都藏 —— 否则"关了字幕"之后
+ * 用户话还挂在屏上（SetHideSubtitle 的注释里记着这条）。 */
+void LcdDisplay::UpdateChatBoxes() {
+    if (bottom_bar_ == nullptr || user_box_ == nullptr) return;
+    if (hide_subtitle_) {
+        lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(user_box_, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    const char* u = (chat_user_label_ != nullptr) ? lv_label_get_text(chat_user_label_) : nullptr;
+    const char* m = (chat_message_label_ != nullptr) ? lv_label_get_text(chat_message_label_) : nullptr;
+    const bool has_user = (u != nullptr && u[0] != '\0');
+    const bool has_msg = (m != nullptr && m[0] != '\0');
+    if (has_msg) {
+        lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(user_box_, LV_OBJ_FLAG_HIDDEN);
+    } else if (has_user) {
+        lv_obj_remove_flag(user_box_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(user_box_, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 void LcdDisplay::ChatPageLayout(int anchor_px) {
-    if (bottom_bar_ == nullptr || chat_user_label_ == nullptr) return;
+    if (bottom_bar_ == nullptr || user_box_ == nullptr) return;
+    if (chat_user_label_ == nullptr || chat_message_label_ == nullptr) return;
 
     const int page_h = ChatPageH();
     if (page_h <= 0) return;
 
-    /* 两个 label 都先回到自然高度再量 —— 上一轮它们可能被撑成了整页。 */
-    lv_obj_set_height(chat_user_label_, LV_SIZE_CONTENT);
-    if (chat_message_label_ != nullptr) {
-        lv_obj_set_height(chat_message_label_, LV_SIZE_CONTENT);
+    /* 先定"这一屏给谁"，再给这个容器分页 —— 顺序不能反：容器还藏着的时候
+     * 量出来的高度不可信（隐藏对象不参与布局刷新）。 */
+    UpdateChatBoxes();
+    if (hide_subtitle_) {
+        if (chat_page_timer_ != nullptr) lv_timer_pause(chat_page_timer_);
+        return;
     }
-    lv_obj_update_layout(bottom_bar_);
 
-    const bool user_vis = !lv_obj_has_flag(chat_user_label_, LV_OBJ_FLAG_HIDDEN);
-    const bool bot_vis = (chat_message_label_ != nullptr) &&
-                         !lv_obj_has_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);
-    const int user_h = user_vis ? (int)lv_obj_get_height(chat_user_label_) : 0;
-    const int bot_h = bot_vis ? (int)lv_obj_get_height(chat_message_label_) : 0;
+    lv_obj_t* box = ChatActiveBox();
+    lv_obj_t* label = (box == user_box_) ? chat_user_label_ : chat_message_label_;
+    if (box == nullptr || label == nullptr) return;
 
-    /* 两段**都有内容**就一定分页（2026-11-04 用户第 1 条需求）。
-     *
-     * 旧判据是"合起来放不下才分"，于是「今天几号 / 11 月 3 号」这种短问答
-     * 仍然同页：老人看着两行不同颜色的字，分不清哪句是自己说的。现在用户话
-     * 独占第 1 页、回答从第 2 页起 —— 颜色 + 页位双重区分，短问答也一样。
-     * 代价是短问答要多一次翻页，但那次翻页由 ChatPageStep 在 6 秒后自动完成，
-     * 而且答案本来也要等 TTS 念完，不是白等。 */
-    const int gap = LV_VER_RES * 6 / 240;
-    const bool split = (user_h > 0 && bot_h > 0);
-    int user_block = 0;   /* 用户话占掉的整页高度（含它后面的行间距） */
-    if (split) {
-        /* 把用户话撑成整页的整数倍 ⇒ 回答**必然**从下一页的第一行开始。
-         * 撑的是 label 高度（不另插空白对象）：flex 列里一个定高 label 就是
-         * 一段留白，而下一轮改文案时高度会被重新量过，不会累积。
-         *
-         * 目标高度要减掉行间距：flex 会在两个子对象之间插 pad_row，
-         * 回答的起点 = 用户话高 + 行间距，必须恰好是 page_h 的整数倍。 */
-        const int user_pages = (user_h + gap + page_h - 1) / page_h;
-        user_block = user_pages * page_h;
-        lv_obj_set_height(chat_user_label_, user_block - gap);
-        lv_obj_update_layout(bottom_bar_);
-    }
+    /* 先回到自然高度再量 —— 上一轮它可能被补过尾部留白（见下面的 pad_target）。 */
+    lv_obj_set_height(label, LV_SIZE_CONTENT);
+    lv_obj_update_layout(box);
 
     /* 页数 + 尾部留白，必须按**同一个口径**算（这里踩过一次）。
      *
      * 视口 188px 比一页 168px 高 20px ⇒ LVGL 的滚动上限是
      * "内容高 - 视口高"，最后一页只要内容比它少 20px 就滚不到页边界，
-     * 滚动位置被夹住，第 2 页顶端于是露出上一段最后一行的一小截 ——
-     * 两段文字又出现在同一屏上，分页白做。
-     * 所以：页数按 (内容 - 20) 算，再给最后一段补足这 20px 空白
+     * 滚动位置被夹住，屏上就会露出上一页的尾巴。
+     * 所以：页数按 (内容 - 20) 算，再给这一段补足这 20px 空白
      * （label 背景透明，屏上什么也看不见，只是把内容撑够）。
-     * 补完的内容高恰好 = (pages-1)*page_h + 视口高 ⇒ 每个页起点都能精确滚到。 */
-    const int avail = (int)lv_obj_get_height(bottom_bar_);
+     * 补完的内容高恰好 = (pages-1)*page_h + 视口高 ⇒ 每个页起点都能精确滚到。
+     *
+     * ⚠️ 这里的 natural 只含**一个** label 的高度。上一版是 user_block + bot_h
+     * （两段相加），那正是"同屏"的来源 —— 两段一旦在同一个容器里，无论怎么
+     * 相加都只是把误差挪个位置。 */
+    const int avail = (int)lv_obj_get_height(box);
     const int excess = (avail > page_h) ? (avail - page_h) : 0;
-    const int natural = user_block + bot_h;
-    int pages = (natural - excess + page_h - 1) / page_h;
-    if (pages < 1) pages = 1;
-    const int pad_target = (pages - 1) * page_h + avail;
-    if (bot_vis && pad_target > natural) {
-        lv_obj_set_height(chat_message_label_, bot_h + (pad_target - natural));
-        lv_obj_update_layout(bottom_bar_);
+    const int natural = (int)lv_obj_get_height(label);
+    int pages = 1;
+    if (natural > 0) {
+        pages = (natural - excess + page_h - 1) / page_h;
+        if (pages < 1) pages = 1;
+        const int pad_target = (pages - 1) * page_h + avail;
+        if (pad_target > natural) {
+            lv_obj_set_height(label, pad_target);
+            lv_obj_update_layout(box);
+        }
     }
 
     /* 滚动余量由 LVGL 现算：get_scroll_bottom() = 内容高 - 容器高（还能往下
-     * 滚多少像素）。自己累加各 label 高度会在"隐藏的 label / 换主题改行距"
-     * 这些情况下算错。 */
-    int max_scroll = (int)lv_obj_get_scroll_bottom(bottom_bar_);
+     * 滚多少像素）。自己累加高度会在"换主题改行距"这些情况下算错。 */
+    int max_scroll = (int)lv_obj_get_scroll_bottom(box);
     if (max_scroll < 0) max_scroll = 0;
-    const int total = (int)lv_obj_get_height(bottom_bar_) + max_scroll;
+    const int total = (int)lv_obj_get_height(box) + max_scroll;
 
     chat_page_count_ = pages;
     chat_page_h_ = page_h;
     chat_page_max_scroll_ = max_scroll;
+    chat_page_box_ = box;
 
     /* 落点 = **本句第一行所在的那一页**，不是最后一页（2026-11-04 用户第 2、3 条）。
      *
@@ -1428,20 +1492,18 @@ void LcdDisplay::ChatPageLayout(int anchor_px) {
      * anchor_px 换算：语音念到哪一句，屏就从那一句的第一行开始，之后每
      * CHAT_PAGE_DWELL_MS 往下翻一页，翻到最后一页停住。
      *
-     * anchor_px 是"本句第一行在设备字幕 label 内的 y"；label 之上还可能压着
-     * 一整页的用户话（split 时它被撑成 page_h 的整数倍，即 user_block），
-     * 所以要先加上 user_block 才是内容坐标系里的绝对位置。 */
+     * anchor_px 是"本句第一行在该 label 内的 y"。容器里只有这一个 label，
+     * 所以不再需要加"上一段占掉的高度"（user_block 已随双容器一起删除）。 */
     int idx = 0;
     if (anchor_px >= 0) {
-        const int abs_y = user_block + anchor_px;
-        idx = abs_y / page_h;
+        idx = anchor_px / page_h;
         if (idx >= pages) idx = pages - 1;   /* 越界只可能来自取整，夹住 */
         if (idx < 0) idx = 0;
     }
     chat_page_index_ = idx;
     int start_y = chat_page_index_ * page_h;
     if (start_y > max_scroll) start_y = max_scroll;   /* 最后一页滚不满 */
-    lv_obj_scroll_to_y(bottom_bar_, start_y, LV_ANIM_OFF);
+    lv_obj_scroll_to_y(box, start_y, LV_ANIM_OFF);
 
     if (pages > 1) {
         if (chat_page_timer_ == nullptr) {
@@ -1458,15 +1520,16 @@ void LcdDisplay::ChatPageLayout(int anchor_px) {
             lv_timer_resume(chat_page_timer_);
         }
         ESP_LOGI(TAG, "对话分页：共 %d 页（页高 %d / 内容 %d / 视口 %d），停在第 %d 页%s",
-                 pages, page_h, total, (int)lv_obj_get_height(bottom_bar_),
-                 chat_page_index_ + 1, split ? "（用户话独占第 1 页）" : "");
+                 pages, page_h, total, (int)lv_obj_get_height(box),
+                 chat_page_index_ + 1,
+                 (box == user_box_) ? "（用户话，设备字幕未到）" : "（设备字幕）");
     } else if (chat_page_timer_ != nullptr) {
         lv_timer_pause(chat_page_timer_);
     }
 }
 
 void LcdDisplay::ChatPageStep() {
-    if (bottom_bar_ == nullptr || chat_page_count_ <= 1) {
+    if (chat_page_box_ == nullptr || chat_page_count_ <= 1) {
         if (chat_page_timer_ != nullptr) lv_timer_pause(chat_page_timer_);
         return;
     }
@@ -1491,7 +1554,7 @@ void LcdDisplay::ChatPageStep() {
     chat_page_index_++;
     int y = chat_page_index_ * chat_page_h_;
     if (y > chat_page_max_scroll_) y = chat_page_max_scroll_;   /* 最后一页滚不满 */
-    lv_obj_scroll_to_y(bottom_bar_, y, LV_ANIM_ON);
+    lv_obj_scroll_to_y(chat_page_box_, y, LV_ANIM_ON);
     /* 界面确实在变 ⇒ 推迟屏保。只在真正翻页时重置，停住之后不再动，
      * 于是 60 秒静止后防烧屏能正常接管。 */
     last_ui_change_tick_ = lv_tick_get();
@@ -1578,13 +1641,22 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
             /* 追加前先量"已有内容占了几行" —— 新句的第一行就从那里开始，
              * 这就是"屏跟着语音走"的落点（2026-11-04 用户第 2 条需求）。
              *
+             * ⚠️ 必须**先把这个 label 复位成 LV_SIZE_CONTENT** 再量。
+             * ChatPageLayout 会给最后一段补尾部留白（把 label 撑到
+             * (pages-1)*page_h + 视口高），量到的是**撑过的高度** ⇒ 行数偏大、
+             * 落点算到后面去，屏停在本句后面那一页，于是第 2 页顶端露出上一段
+             * 的尾巴、设备字幕只剩一行半 —— 正是用户 2026-11-04 报的那个现象。
+             * 这一条是"落点永远偏"的根因，别为了省一次 update_layout 删掉。
+             *
              * label 高度 = 行数*行高 - 行间距（最后一行后面没有行距），
-             * 所以先补回一个行距再按整行取整；少补这 4px 会少算一行，
-             * 把落点算到上一页去 —— 正是"屏停在句子末尾"的老毛病。 */
+             * 所以先补回一个行距再按整行取整；少补这 4px 会少算一行。 */
+            lv_obj_set_height(chat_message_label_, LV_SIZE_CONTENT);
+            lv_obj_update_layout(bottom_bar_);
             const int line_h = ChatLineH();
             const int line_space = LV_VER_RES * 4 / 240;
+            const int prev_h = (int)lv_obj_get_height(chat_message_label_);
             const int prev_lines =
-                (line_h > 0) ? (((int)lv_obj_get_height(target) + line_space) / line_h) : 0;
+                (line_h > 0) ? ((prev_h + line_space) / line_h) : 0;
             anchor_px = prev_lines * line_h;
             std::string merged(prev);
             merged += "\n";
@@ -1597,10 +1669,9 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     } else {
         lv_label_set_text(target, text);
     }
-    /* 空串 ⇒ 隐藏：flex 跳过隐藏子对象，另一行会自动顶上去。
-     * 不隐藏的话会留一行空白，看着像"屏幕上多了一条横线"。
-     * 判据看的是 **label 当前的内容**而不是本次入参：assistant 走追加分支时，
-     * 入参为空不代表屏上是空的。 */
+    /* 空串 ⇒ 隐藏：留空 label 会让容器里多出一行空白，看着像"屏幕上多了一条
+     * 横线"。判据看的是 **label 当前的内容**而不是本次入参：assistant 走追加
+     * 分支时，入参为空不代表屏上是空的。 */
     const char* shown = lv_label_get_text(target);
     if (shown == nullptr || shown[0] == '\0') {
         lv_obj_add_flag(target, LV_OBJ_FLAG_HIDDEN);
@@ -1621,11 +1692,15 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
         lv_obj_add_flag(other, LV_OBJ_FLAG_HIDDEN);
     }
 
+    /* 两个容器互斥显示（2026-11-04 用户第 1 条）：文字写完之后才能决定
+     * "这一屏给谁" —— 判据就是两段文字此刻非不为空。 */
+    UpdateChatBoxes();
+
     ESP_LOGI(TAG, "SetChatMessage role=%s len=%d", role ? role : "(null)",
              (int)strlen(text));
-    /* 分页（2026-11-04 重做落点）：两段都有内容就把用户话撑成整页、回答另起
-     * 一页；页数 > 1 就起定时器自动往后翻。
-     * 必须在**两段文字都写完之后**量 —— 量在写之前只能看到上一轮的高度。
+    /* 分页（2026-11-04 双容器版）：只给"当前显示的那个容器"分页，页数只看它
+     * 自己那一个 label 的高度 —— 两段文字不再相加，也就不存在"凑边界"。
+     * 必须在**文字写完 + 容器定好**之后量，否则量到的是上一轮的高度。
      *
      * anchor_px：assistant 追加时传"本句第一行的起始像素"，屏就停在这一句
      * 开头所在的那一页（语音念到哪、字从哪开始）；user / system 到达时传
@@ -2605,12 +2680,17 @@ void LcdDisplay::SetTheme(Theme* theme) {
         lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
     }
     
-    /* 左列对话区（bottom_bar_）保持**全透明**：主区底色由 screen/container_
-     * 提供。旧代码这里是「主题底色 + 50% 不透明度」，换到 #D3DBFC 之后
-     * 会变成一层灰蓝色的半透明块盖在同样颜色的底上，视觉上是"文字背后
-     * 有一块更深的方框"—— 设计稿里没有这个框。 */
+    /* 左列对话区（bottom_bar_ / user_box_）保持**全透明**：主区底色由
+     * screen/container_ 提供。旧代码这里是「主题底色 + 50% 不透明度」，换到
+     * #D3DBFC 之后会变成一层灰蓝色的半透明块盖在同样颜色的底上，视觉上是
+     * "文字背后有一块更深的方框"—— 设计稿里没有这个框。
+     * 两个容器是同一块区域的两种内容，样式必须一起刷，漏一个就是"换主题后
+     * 用户话那一屏多出一个色块"。 */
     if (bottom_bar_ != nullptr) {
         lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_TRANSP, 0);
+    }
+    if (user_box_ != nullptr) {
+        lv_obj_set_style_bg_opa(user_box_, LV_OPA_TRANSP, 0);
     }
 #endif
     
@@ -2624,17 +2704,26 @@ void LcdDisplay::SetTheme(Theme* theme) {
 void LcdDisplay::SetHideSubtitle(bool hide) {
     DisplayLockGuard lock(this);
     hide_subtitle_ = hide;
-    
+
     // Immediately update UI visibility based on the setting
-    if (bottom_bar_ != nullptr) {
-        if (hide) {
+    if (hide) {
+        /* ⚠️ 两个容器都要藏（2026-11-04）。只藏 bottom_bar_ 的话，用户话
+         * （user_box_）还挂在屏上 —— 老人以为"字幕没关掉"，或者更糟：他刚说的
+         * 那句话一直留在屏上，看起来像设备卡住了。 */
+        if (bottom_bar_ != nullptr) {
             lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
-            /* 藏了字幕就必须停分页：定时器还在滚一个看不见的容器，白白
-             * 重置 last_ui_change_tick_ ⇒ 防烧屏永远接管不了。 */
-            if (chat_page_timer_ != nullptr) lv_timer_pause(chat_page_timer_);
-        } else {
-            lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
         }
+        if (user_box_ != nullptr) {
+            lv_obj_add_flag(user_box_, LV_OBJ_FLAG_HIDDEN);
+        }
+        /* 藏了字幕就必须停分页：定时器还在滚一个看不见的容器，白白
+         * 重置 last_ui_change_tick_ ⇒ 防烧屏永远接管不了。 */
+        if (chat_page_timer_ != nullptr) lv_timer_pause(chat_page_timer_);
+    } else {
+        /* 放开时按内容重新决定谁可见（两者仍然互斥），再重排一次页 ——
+         * 藏字幕期间来过的字可能已经超一屏了。 */
+        UpdateChatBoxes();
+        ChatPageLayout();
     }
 }
 
@@ -2659,7 +2748,8 @@ void LcdDisplay::SetHideSubtitle(bool hide) {
  * ⚠️ 文案契约（与 reminder.c 的 elder_reminder_screen_text() 一一对应）：
  *     第 0 行（第一个非空行）  标题
  *     以「请」开头的行          橙色提示语
- *     其余行                    明细，逐行列出（最多 3 行，多的截断）
+ *     其余行                    明细，**逐行**列出（放不下时压行距、再滚动，
+ *                               不裁字 —— 见下面"明细行数 → 高度"那段）
  *   解析放在显示层、而不是让 reminder.c 传结构体：elder_ui_hooks_t 只能在
  *   末尾追加，改签名要同时动 elder 组件、xiaozhi 的 merge 副本和两处调用点；
  *   而这段文案本来就是"给人看的一小段话"，按行拆是最小改动。
@@ -2742,9 +2832,14 @@ void LcdDisplay::ShowReminder(const char* text) {
          * 原来是固定 88px 高、行距 4px ⇒ 30px 字体只能放 2 行，第 3 条起被裁掉；
          * 而橙色提示语又从下面压上来（BOTTOM -52），实际只剩 1.7 行。
          *
-         * 现在按**可用带宽**算行数：从标题下沿到橙色按钮上沿，行距归零。
+         * 现在按**可用带宽**算：从标题下沿到橙色按钮上沿，行距从 0 起按需
+         * 压到 -6，压到底仍放不下就纵向滚动（见 ShowReminder 里那段说明）。
          * 320x240 上是 (166-52)/38 = 3 行 —— 正好覆盖"同分钟三条"这个真实场景
-         * （降压药 + 降糖药 + 喝水）。行数不写死，换字体/换屏自动跟着变。 */
+         * （降压药 + 降糖药 + 喝水）。行数不写死，换字体/换屏自动跟着变。
+         *
+         * ⚠️ 必须是 LONG_WRAP 而不是 LONG_DOT（2026-11-04 用户第 3 条）：
+         * 药名/剂量是家属自由输入，一行写不下时要**折行**，不能像 LONG_DOT
+         * 那样在末尾打点 —— 那正是"第二种药只显示了前几个字"的观感来源。 */
         reminder_items_ = lv_label_create(reminder_overlay_);
         lv_obj_set_pos(reminder_items_, col_x, LV_VER_RES * 52 / 240);
         lv_obj_set_width(reminder_items_, col_w);
@@ -2752,8 +2847,8 @@ void LcdDisplay::ShowReminder(const char* text) {
         lv_label_set_long_mode(reminder_items_, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_align(reminder_items_, LV_TEXT_ALIGN_LEFT, 0);
         lv_obj_set_style_text_color(reminder_items_, lv_color_hex(kColorTextDark), 0);
-        /* 行距 0：明细是"一行一件事"，靠换行分行，不需要额外留白；
-         * 留 4px 会让 3 行变成 126px，超出 114px 的可用带宽，第 3 行被切掉半截。 */
+        /* 行距初值 0：明细是"一行一件事"，靠换行分行，默认不加额外留白。
+         * 放不下时 ShowReminder 会临时压成负值（见那里的 ①②③）。 */
         lv_obj_set_style_text_line_space(reminder_items_, 0, 0);
         if (text_font != nullptr) {
             lv_obj_set_style_text_font(reminder_items_, text_font, 0);
@@ -2872,9 +2967,21 @@ void LcdDisplay::ShowReminder(const char* text) {
     } else {
         lv_obj_remove_flag(reminder_items_, LV_OBJ_FLAG_HIDDEN);
     }
-    /* 明细行数 → 高度。**必须按行数设高**：label 默认高度是内容高，
-     * 内容超 3 行时会自己长到 4、5 行，把橙色按钮整块盖住（按钮是唯一
-     * 的行动指引，被盖住等于这台机器没法操作）。 */
+    /* 明细行数 → 高度（2026-11-04 用户第 3 条：**换行不裁字**）。
+     *
+     * 用户原话：「两种药是按照一行显示的，所以第二种药只显示了前几个字。」
+     * 根因是文案层把多味药拼成了一行（见 reminder.c 的 elder_reminder_screen_text），
+     * 183px / 30px 字号一行只放 6 个汉字，第二味药自然只剩前几个字。文案层已
+     * 改成"每味药一行"，这里负责**把每一行都显示出来**：
+     *
+     *   ① 明细 label 是 LV_LABEL_LONG_WRAP（见创建处）—— 一行太长时换行，
+     *      不是用 LONG_DOT 在末尾打点（那才是"裁字"）；
+     *   ② 放不下时**优先压 text_line_space**（最多压到 -6px：30px 字形本身
+     *      只占 30px，行高 38 里的 8px 是留白，压掉几像素不会让字叠在一起）；
+     *   ③ 压到底仍放不下 ⇒ 该区域纵向滚动，行一行都不少（宁可老人滚一下，
+     *      也不能让他看到半截药名 —— 吃错药的代价远大于多滚一次）。
+     * 上一版是 `if (item_lines > fit_lines) item_lines = fit_lines;` 直接截断，
+     * 表现正是"第二种药只显示了前几个字"。 */
     int item_lines = 0;
     if (items_buf[0] != '\0') {
         item_lines = 1;
@@ -2887,10 +2994,40 @@ void LcdDisplay::ShowReminder(const char* text) {
                                 : (LV_VER_RES * 38 / 240);
     const int items_top = LV_VER_RES * 52 / 240;
     const int items_bottom = card_h - LV_VER_RES * 44 / 240;   /* 橙色按钮上沿 */
-    int fit_lines = (item_line_h > 0) ? (items_bottom - items_top) / item_line_h : 1;
-    if (fit_lines < 1) fit_lines = 1;
-    if (item_lines > fit_lines) item_lines = fit_lines;         /* 兜底裁剪，防盖按钮 */
-    lv_obj_set_height(reminder_items_, item_lines * item_line_h);
+    const int items_avail = items_bottom - items_top;
+    /* 每次进来先把行距复位：上一次可能压过，不复位就会一直累积。 */
+    int item_line_space = 0;
+    lv_obj_set_style_text_line_space(reminder_items_, item_line_space, 0);
+    if (item_lines > 0 && item_line_h > 0 && items_avail > 0) {
+        /* ① 先按原始行距试；② 放不下就一行一行地压行距（最多 -6）。 */
+        int fit_lines = items_avail / item_line_h;
+        for (int ls = -1; fit_lines < item_lines && ls >= -6; ls--) {
+            const int h = item_line_h + ls;
+            if (h <= 0) break;
+            fit_lines = items_avail / h;
+            item_line_space = ls;
+        }
+        if (fit_lines < item_lines) {
+            item_line_space = 0;      /* 压到底也没用，回到原始行距再滚动 */
+            fit_lines = items_avail / item_line_h;
+        }
+        lv_obj_set_style_text_line_space(reminder_items_, item_line_space, 0);
+        const int row_h = item_line_h + item_line_space;
+        const int need_h = item_lines * row_h;
+        if (need_h <= items_avail) {
+            /* 全部放得下：高度贴内容，不滚动（滚动条/可滚标志一起清掉，
+             * 否则 LVGL 会为"内容刚好等于视口"的容器留一个滚动状态）。 */
+            lv_obj_set_height(reminder_items_, need_h);
+            lv_obj_clear_flag(reminder_items_, LV_OBJ_FLAG_SCROLLABLE);
+        } else {
+            /* 压到底仍放不下：区域固定为可用高度，**纵向滚动**，一行不裁。 */
+            lv_obj_set_height(reminder_items_, items_avail);
+            lv_obj_add_flag(reminder_items_, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_scroll_dir(reminder_items_, LV_DIR_VER);
+            lv_obj_set_scrollbar_mode(reminder_items_, LV_SCROLLBAR_MODE_OFF);
+            lv_obj_scroll_to_y(reminder_items_, 0, LV_ANIM_OFF);
+        }
+    }
 
     /* 橙色提示语只在一行明细时出现（2026-11-03）：
      * 它固定在 BOTTOM -52（y≈120），与 2 行以上的明细是**同一块**空间。
