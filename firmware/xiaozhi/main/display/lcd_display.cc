@@ -1650,6 +1650,12 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
              *
              * label 高度 = 行数*行高 - 行间距（最后一行后面没有行距），
              * 所以先补回一个行距再按整行取整；少补这 4px 会少算一行。 */
+            /* ⚠️ 量之前先把"这一屏给谁"定下来：上一轮结束时 bottom_bar_ 可能
+             * 是藏着的（只有用户话时它被 UpdateChatBoxes 藏了），而隐藏对象
+             * 不参与布局刷新 —— 量到的高度会是上一轮补过留白的旧值，落点又
+             * 偏了。此刻设备字幕已经有内容（prev 非空），UpdateChatBoxes 会
+             * 选中 bottom_bar_ 并把它显示出来。 */
+            UpdateChatBoxes();
             lv_obj_set_height(chat_message_label_, LV_SIZE_CONTENT);
             lv_obj_update_layout(bottom_bar_);
             const int line_h = ChatLineH();
