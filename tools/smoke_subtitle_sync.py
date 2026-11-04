@@ -263,16 +263,41 @@ def t3_gate_and_teardown() -> None:
 
 
 def t4_paging_anchor_and_rate() -> None:
-    """2026-11-04 重做：分页判据、追加落点、翻页不再被 follow 挡住。
+    """2026-11-04 第二轮：双容器互斥 + 各自分页 + 头像恢复 90px。
 
-    每条断言都做过「改坏 → 变红」验证（临时改坏、跑本脚本、确认红、还原）：
-      · split 判据改回 `(user_h + bot_h + gap) > page_h`  ⇒ 第 2 条红
-      · `chat_page_index_ = idx;` 改回 `= pages - 1;`      ⇒ 第 4、5 条红
-      · ChatPageStep 开头插 `if (chat_page_index_ >= 0) return;` ⇒ 第 6、8 条红
-      · `kSubtitleMaxWaitUs` 改回 6 秒                    ⇒ 第 3 组红
-      · `ChatPageLayout(anchor_px)` 改回 `ChatPageLayout()` ⇒ 第 10 条红
+    这一组守的是用户 2026-11-04 实测后报的第 1、4 条：
+      「字幕在第一屏显示的时候是分屏的，但是当播报的语音超出一屏，第二屏显示
+        的时候就又变成了上面是用户的，下面是语音的字幕，而且只显示语音字幕的
+        前一行半。」
+      「对话状态的表情图标变小了，位置也变了。」
+
+    根因（写在 lcd_display.cc 的对话分页大注释里）：上一版两段文字在**同一个**
+    滚动容器里，靠"把用户话撑成整页整数倍 + 补尾部留白 + 滚到 idx*page_h"去凑
+    页边界 —— 而 SetChatMessage 里量"已有几行"时量到的是被补过留白的高度，
+    行数偏大、落点算到后面，于是第 2 页顶端露出用户话、设备字幕只剩 1.5 行。
+    现在改成两个容器**互斥显示**，结构性不可能同屏。
+
+    每条断言都做过「改坏 → 变红 → 还原」验证（2026-11-04，逐条跑、每次只改
+    一处、跑完还原；括号里是变红的那一条）：
+      · `chat_user_label_ = lv_label_create(user_box_)` 改回挂在 bottom_bar_ 下
+            ⇒ 「两个 label 分别挂在各自容器下」
+      · UpdateChatBoxes 的 has_user 分支删掉 `lv_obj_remove_flag(user_box_, …)`
+            ⇒ 「互斥方向一」（方向二仍绿 —— 所以必须双向各断一条）
+      · has_msg 分支删掉 `lv_obj_add_flag(user_box_, LV_OBJ_FLAG_HIDDEN)`
+            ⇒ 「互斥方向二」
+      · natural 改成 `label 高 + chat_user_label_ 高`（两段相加）
+            ⇒ 「natural 只取当前容器里那一个 label 的高度」
+      · SetChatMessage 里删掉 `lv_obj_set_height(chat_message_label_, LV_SIZE_CONTENT)`
+            ⇒ 「追加前先把 label 复位成 LV_SIZE_CONTENT 再量行数」
+      · SetHideSubtitle 的 hide 分支删掉 user_box_ 那条 add_flag
+            ⇒ 「SetHideSubtitle 同时隐藏 user_box_」
+      · AvatarSize() 的 90 改成 52
+            ⇒ 「AvatarSize() 仍是 LV_VER_RES * 90 / 240」
+      · emoji_box_ 的 `-AvatarRight()` 改成 `-LV_HOR_RES * 8 / 320`
+            ⇒ 「头像圆与预览图都用 -AvatarRight() / AvatarTop() 定位」
+    结果：15 条改坏点全部按预期变红，且每次只红预期的那一条（没有连带假红）。
     """
-    print("\n── 4. 分页：两段必分页 + 落点跟语音 + 翻页不被挡住 ──")
+    print("\n── 4. 分页：双容器互斥 + 各自分页 + 头像恢复 90px ──")
     src = strip_comments((MAIN / "display" / "lcd_display.cc").read_text(encoding="utf-8"))
     hdr = strip_comments((MAIN / "display" / "lcd_display.h").read_text(encoding="utf-8"))
 
@@ -281,39 +306,58 @@ def t4_paging_anchor_and_rate() -> None:
     layout = last_func_body(src, "void LcdDisplay::ChatPageLayout")
     step = last_func_body(src, "void LcdDisplay::ChatPageStep")
     scm = last_func_body(src, "void LcdDisplay::SetChatMessage")
+    boxes = last_func_body(src, "void LcdDisplay::UpdateChatBoxes")
+    hide = last_func_body(src, "void LcdDisplay::SetHideSubtitle")
 
-    check(bool(layout) and bool(step) and bool(scm),
-          "找到生效的 ChatPageLayout / ChatPageStep / SetChatMessage（#else 分支）",
+    check(bool(layout) and bool(step) and bool(scm) and bool(boxes) and bool(hide),
+          "找到生效的 ChatPageLayout / ChatPageStep / SetChatMessage / "
+          "UpdateChatBoxes / SetHideSubtitle（#else 分支）",
           "函数被改名，或只剩 WECHAT 分支那一份（那份本板不编译）")
 
-    # 1) 两段都有内容就分页 —— 不再看"合起来放不放得下"
-    m = re.search(r"const bool split = \(([^\n]*)\);", layout)
-    cond = m.group(1) if m else ""
-    check(m is not None and "user_h > 0" in cond and "bot_h > 0" in cond
-          and "page_h" not in cond,
-          "split 判据只看「两段都有内容」（不再看合起来放不放得下）",
-          "回到 (user_h + bot_h + gap) > page_h 就是老行为："
-          "「今天几号 / 11 月 3 号」这种短问答仍然同页，老人分不清哪句是自己说的")
+    # 1) 两个**独立**容器，各自只装一个 label —— 结构性不同屏的前提。
+    check("user_box_ = lv_obj_create(screen);" in src and
+          "bottom_bar_ = lv_obj_create(screen);" in src,
+          "user_box_ 与 bottom_bar_ 是两个独立的 lv_obj_create(screen)",
+          "共用一个容器 ⇒ 只要滚动偏移不精确就必然同屏（上一版就是这么塌的）")
+    check("chat_user_label_ = lv_label_create(user_box_);" in src and
+          "chat_message_label_ = lv_label_create(bottom_bar_);" in src,
+          "两个 label 分别挂在各自容器下（各装一个）",
+          "用户话挂在 bottom_bar_ 下 ⇒ 设备字幕一出现又回到同屏")
 
-    # 2) 用户话被撑成整页 ⇒ 设备字幕必然落到下一页
-    check(re.search(r"lv_obj_set_height\(chat_user_label_,\s*user_block - gap\)",
-                    layout) is not None
-          and "user_block = user_pages * page_h;" in layout,
-          "用户话撑成整页（user_block = user_pages * page_h）",
-          "不撑 ⇒ 设备字幕从用户话下面接着排，两段仍在同一页")
-    check("lv_obj_update_layout(bottom_bar_);" in layout,
-          "撑高后重新 update_layout 再算页数",
-          "不重算 ⇒ 页数按旧布局算，落点和页数都对不上")
-    check(re.search(r"lv_obj_set_height\(chat_message_label_,\s*bot_h \+ \(pad_target - natural\)\)",
-                    layout) is not None,
-          "给最后一段补足尾部留白（pad_target），保证每个页起点都能精确滚到",
-          "不补 ⇒ 内容比 (pages-1)*page_h + 视口高 少一截，滚动位置被夹住，"
-          "第 2 页顶端露出上一段最后一行的半截，两段又出现在同一屏")
+    # 2) 互斥显示：显示一个就必须藏另一个，**两个方向都要有**。
+    #    只断一个方向等于没断：另一个分支漏了照样同屏。
+    def mutex(show: str, hidden: str) -> bool:
+        pat = (r"lv_obj_remove_flag\(" + show + r",\s*LV_OBJ_FLAG_HIDDEN\);"
+               r"[^}]*?"
+               r"lv_obj_add_flag\(" + hidden + r",\s*LV_OBJ_FLAG_HIDDEN\);")
+        return re.search(pat, boxes, re.S) is not None
+
+    check(mutex("user_box_", "bottom_bar_"),
+          "有用户话 ⇒ 显示 user_box_ 并隐藏 bottom_bar_（互斥方向一）",
+          "同一分支里没有把设备容器藏起来 ⇒ 两段文字又出现在同一屏")
+    check(mutex("bottom_bar_", "user_box_"),
+          "有设备字幕 ⇒ 显示 bottom_bar_ 并隐藏 user_box_（互斥方向二）",
+          "用户话留在屏上会把答案挤走 —— 用户报的「上面是用户的」正是这个")
+
+    # 3) 页数只按**一个**容器算，不再两段相加。
+    check("user_block" not in layout and "bot_h" not in layout,
+          "页数计算里没有 user_block / bot_h（不再两段相加）",
+          "两段相加 = 上一版的老口径，任何一处偏差都会把两段挤进同一屏")
+    check("const int natural = (int)lv_obj_get_height(label);" in layout,
+          "natural 只取当前容器里那一个 label 的高度",
+          "取两段之和 ⇒ 页数与实际内容对不上")
+    check("pages = (natural - excess + page_h - 1) / page_h;" in layout,
+          "页数 = ceil((natural - excess) / page_h)（单容器口径）",
+          "口径变了 ⇒ 页数与尾部留白对不上，最后一页滚不满")
     check("const int excess = (avail > page_h) ? (avail - page_h) : 0;" in layout,
           "页数与留白按同一个 excess（视口高 - 页高）口径算",
           "两套口径会漂移：页数说 2 页、实际只能滚到 1.5 页")
+    check(re.search(r"lv_obj_set_height\(label,\s*pad_target\);", layout) is not None,
+          "给这一段补足尾部留白（pad_target），保证每个页起点都能精确滚到",
+          "不补 ⇒ 内容比 (pages-1)*page_h + 视口高 少一截，滚动位置被夹住，"
+          "最后一页顶端露出上一页的尾巴")
 
-    # 3) 落点 = 本句起始页，不是最后一页
+    # 4) 落点 = 本句起始页；翻页滚的是**当前那个**容器。
     check("chat_page_index_ = idx;" in layout and "anchor_px" in layout,
           "chat_page_index_ 由 anchor_px 换算的 idx 决定",
           "回到 pages - 1 ⇒ 屏跳到句子末尾，声音才念第一句")
@@ -321,18 +365,20 @@ def t4_paging_anchor_and_rate() -> None:
           "chat_page_index_ = chat_follow_tail_" not in layout,
           "不再有「追加即跳最后一页」",
           "追加跳末尾 = 前面几行永远轮不到，正是「多行显示不完整」")
+    check("chat_page_box_ = box;" in layout and
+          "lv_obj_scroll_to_y(chat_page_box_, y, LV_ANIM_ON);" in step,
+          "翻页滚的是 chat_page_box_（当前显示的那个容器）",
+          "写死 bottom_bar_ ⇒ 用户话那一屏翻页时滚的是看不见的容器")
     check("chat_follow_tail_" not in layout and "chat_follow_tail_" not in hdr,
           "follow_tail 状态已彻底删除（源码与头文件都没有）",
           "留着这个成员，下一个人会以为它还在生效")
 
-    # 4) ChatPageStep 不再"有字幕就早退"
+    # 5) ChatPageStep 不再"有字幕就早退"
     check("chat_follow_tail_" not in step,
           "ChatPageStep 里没有「有字幕就不翻页」的早退",
           "早退 + 屏停在末页 = 老人永远只看到句子尾巴")
-    # ⚠️ 只查 `chat_follow_tail_` 不够：换一种写法的早退（例如
-    # `if (chat_page_index_ >= 0) return;`）照样能让翻页彻底停摆，而上面那条
-    # 断言看不见。所以按**结构**查：整个函数体只允许两个 return，且每个
-    # return 前面必须是那两条合法守卫（页数 ≤ 1 / 已到最后一页）。
+    # ⚠️ 只查 `chat_follow_tail_` 不够：换一种写法的早退照样能让翻页停摆。
+    # 所以按**结构**查：只允许两个 return，且每个前面必须是那两条合法守卫。
     returns = [m.start() for m in re.finditer(r"\breturn\s*;", step)]
     stray = []
     for pos in returns:
@@ -345,7 +391,7 @@ def t4_paging_anchor_and_rate() -> None:
           "ChatPageStep 只有两个 return（页数≤1 / 已到最后一页），没有别的早退",
           f"发现 {len(returns)} 个 return，其中无守卫的：{stray} —— "
           "任何多余早退都会让长回答后面的页永远翻不到")
-    check(re.search(r"lv_obj_scroll_to_y\(bottom_bar_,\s*0\s*,", step) is None,
+    check(re.search(r"lv_obj_scroll_to_y\([^,]+,\s*0\s*,", step) is None,
           "翻完不回第 1 页（最后一页停住）",
           "回第 1 页会把老人正在读的结论翻走，且循环重置防烧屏计时")
     check("chat_page_index_++" in step,
@@ -355,39 +401,56 @@ def t4_paging_anchor_and_rate() -> None:
           "到最后一页停住定时器",
           "不停 ⇒ 空转烧 CPU")
 
-    # 5) 语音同步：先量本句起始行，再追加，再按落点上屏
+    # 6) 语音同步：先把 label 复位成自然高度、量本句起始行，再追加，再落点
+    i_reset = scm.find("lv_obj_set_height(chat_message_label_, LV_SIZE_CONTENT);")
     i_anchor = scm.find("anchor_px = prev_lines * line_h")
     i_set = scm.find("lv_label_set_text(target, merged.c_str())")
-    check(i_anchor >= 0 and i_set >= 0 and i_anchor < i_set,
-          "先量「本句第一行」再追加文本",
-          "先追加再量 ⇒ 量到的是本句之后的高度，落点永远差一句")
+    check(i_reset >= 0 and i_anchor >= 0 and i_set >= 0 and i_reset < i_anchor < i_set,
+          "追加前先把 label 复位成 LV_SIZE_CONTENT 再量行数（再追加、再落点）",
+          "不复位 ⇒ 量到的是上一轮补过留白的高度，行数偏大、落点算到后面："
+          "第 2 页顶端露出用户话、设备字幕只剩一行半 —— 正是用户报的现象")
     check("ChatPageLayout(anchor_px)" in scm,
           "SetChatMessage 把 anchor_px 传给 ChatPageLayout",
           "传默认值 ⇒ 每句都弹回第 1 页，屏和声音分家")
-
-    # 6) 两份字幕仍是两个独立控件（分页才谈得上"分到不同页"）
-    check("chat_user_label_ = lv_label_create(bottom_bar_);" in src and
-          "chat_message_label_ = lv_label_create(bottom_bar_);" in src,
-          "用户字幕与设备字幕是两个独立 lv_obj_t（各自 create）",
-          "合并成一个控件 ⇒ 颜色/清空逻辑互相踩，也无法分页")
     check("target = is_user ? chat_user_label_ : chat_message_label_;" in scm,
           "写入目标是二选一（不会同时写两个）",
-          "同时写两个 ⇒ 两段文字挤在同一页")
+          "同时写两个 ⇒ 两段文字挤在同一屏")
 
     # 7) 头文件签名
     check("void ChatPageLayout(int anchor_px = -1);" in hdr,
           "头文件签名是 ChatPageLayout(int anchor_px = -1)",
           "还是 bool follow_newest ⇒ 落点逻辑没接上")
+    check("lv_obj_t* user_box_" in hdr and "lv_obj_t* chat_page_box_" in hdr,
+          "头文件声明了 user_box_ 与 chat_page_box_",
+          "成员没声明 ⇒ 编译不过，或分页滚到错的容器上")
 
     # 8) 不再有 8 秒静默窗口
     check("#define CHAT_PAGE_LIVE_MS" not in src,
           "CHAT_PAGE_LIVE_MS 已删除（翻页不再等静默窗口）",
           "留着它就是「有字幕期间不翻页」那套旧行为")
 
-    # 9) 扩容量：列宽从 183 提到 242（8 字/行），且没动字号
-    check("ChatAvatarSize()" in src and "ChatPadX()" in src,
-          "对话态用专用的头像/边距（列宽 242 ⇒ 8 字/行）",
-          "回到 AvatarSize() 的 90px ⇒ 列宽 183，一行只有 6 个汉字")
+    # 9) 藏字幕时两个容器都要藏
+    check("lv_obj_add_flag(user_box_, LV_OBJ_FLAG_HIDDEN);" in hide and
+          "lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);" in hide,
+          "SetHideSubtitle 同时隐藏 user_box_（不只是 bottom_bar_）",
+          "只藏 bottom_bar_ ⇒ 关了字幕，用户刚说的那句话还挂在屏上")
+
+    # 10) 头像/边距回到 8a0839c 之前（用户第 4 条）
+    check("ChatAvatarSize" not in src and "ChatAvatarSize" not in hdr and
+          "ChatAvatarRight" not in src and "ChatPadX" not in src,
+          "ChatAvatarSize / ChatAvatarRight / ChatPadX 已删除",
+          "留着就是 52px 那套版式，用户明确不接受")
+    check(re.search(r"inline int AvatarSize\(\)\s*\{\s*return LV_VER_RES \* 90 / 240;",
+                    src) is not None,
+          "AvatarSize() 仍是 LV_VER_RES * 90 / 240（90px 圆）",
+          "改了直径 ⇒ 表情图标变小，正是用户第 4 条报的那个现象")
+    check("lv_obj_align(emoji_box_, LV_ALIGN_TOP_RIGHT, -AvatarRight(), AvatarTop());" in src
+          and "lv_obj_align(preview_image_, LV_ALIGN_TOP_RIGHT, -AvatarRight(), AvatarTop());" in src,
+          "头像圆与预览图都用 -AvatarRight() / AvatarTop() 定位（位置复原）",
+          "用对话态专用边距 ⇒ 头像位置偏移，用户报「位置也变了」")
+    check("const int col_x = MainPadX();" in src,
+          "文字列左边距回到 MainPadX()（18px）",
+          "还是 ChatPadX() 的 10px ⇒ 左列整体左移")
     check("chat_font" in src,
           "字号仍是 30px 的 chat_font（不许降到 20px）",
           "20px 汉字只有 2mm 高，老人看不清")

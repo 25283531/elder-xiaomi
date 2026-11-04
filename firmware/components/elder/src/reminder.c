@@ -1741,7 +1741,7 @@ void elder_reminder_screen_text(const elder_rmd_item_t *item, char *out, size_t 
      *    按同一份规则拆行）：
      *      第 1 个非空行      标题
      *      以「请」开头的行    橙色提示语
-     *      其余行             明细，逐行列出
+     *      其余行             明细，逐行列出（一味药占一行，见单条分支的说明）
      *    改一边必须改另一边；只改一边的表现是"提示语跑到明细里去了"。
      *
      *    行动指令（"长按机身顶部大按键确认"）**不再**由这里下发 ——
@@ -1819,14 +1819,48 @@ void elder_reminder_screen_text(const elder_rmd_item_t *item, char *out, size_t 
          * 看得全，药名剂量留给单条提醒（现实里同一分钟多条服药提醒极少）。
          *
          * ⚠️ 剂量是家属自由输入（可能带换行），必须挡一次：换行会破坏
-         * "一行一件事"的格式契约，让显示层把后半句当成新的明细项。 */
+         * "一行一件事"的格式契约，让显示层把后半句当成新的明细项。
+         *
+         * ⚠️ 2026-11-04 用户第 3 条：「两种药是按照一行显示的，所以第二种药
+         * 只显示了前几个字。」
+         *
+         * 根因在**上游**：sync.c 把同一时刻的多味药拼成一行（形如
+         * 「降压药1片、降脂药1片」，用全角顿号分隔），而屏上一行只放 6 个
+         * 汉字（183px / 30px 字号）—— 第二味药必然只剩前几个字。
+         * 屏上的契约是**一行一件事**，所以这里把顿号还原成换行：一味药一行，
+         * 显示层按行排版（放不下会压行距、再滚动，不会裁字）。
+         *
+         * 为什么不直接改 sync.c 的拼法：那一行 med_line 同时被
+         * elder_reminder_med_line() 对外暴露（日志/上报也在用），改成多行会
+         * 破坏"一行一条记录"的语义；而且它属于解析层，屏幕文案的**排版**是
+         * 这一层的事。这里只动"给人看的那一段话"。
+         *
+         * 注意「、」在 UTF-8 里是 3 个字节（E3 80 81），不能按字节替换 ——
+         * 必须用 strstr 按子串切，否则会把一个汉字切成两半（屏上是乱码方块）。 */
         char med[ELDER_MED_LINE_MAX + 1];
         med[0] = '\0';
         if (item->type == ELDER_RMD_TYPE_MEDICINE) {
-            snprintf(med, sizeof(med), "%s", med_line_of(item));
-            for (char *p = med; *p != '\0'; p++) {
-                if (*p == '\r' || *p == '\n' || *p == '\t') *p = ' ';
+            const char *src_line = med_line_of(item);
+            const char *sep_mark = "、";
+            size_t used = 0;
+            const char *q = src_line;
+            while (*q != '\0' && used + 1 < sizeof(med)) {
+                const char *sep = strstr(q, sep_mark);
+                const size_t seg = (sep != NULL) ? (size_t)(sep - q) : strlen(q);
+                for (size_t k = 0; k < seg && used + 1 < sizeof(med); k++) {
+                    /* 脏数据（家属自由输入）里的换行/制表符一律换成空格：
+                     * 它们会破坏"一行一件事"的契约，让显示层把后半句当成
+                     * 新的明细项。 */
+                    char c = q[k];
+                    med[used++] = (c == '\r' || c == '\n' || c == '\t') ? ' ' : c;
+                }
+                if (sep == NULL) break;
+                if (used + 1 < sizeof(med)) {
+                    med[used++] = '\n';   /* 多味药：每味一行 */
+                }
+                q = sep + strlen(sep_mark);
             }
+            med[used] = '\0';
         }
         if (med[0] != '\0') {
             snprintf(out, len, "%s\n%s\n%s", head, med, hint);
