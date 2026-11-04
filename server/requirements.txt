@@ -22,5 +22,5 @@ websockets>=12,<14
 # av：mp3 解码。Edge 只吐 mp3，而本项目客户端只吃 24kHz 裸 PCM，
 #   两者之间的转换必须有人做 —— 否则选 Edge 音色会「配置正常但一点声音没有」。
 #   PyAV 自带 ffmpeg，不需要系统装 ffmpeg。
-edge-tts>=7.0,<8.0
+edge-tts>=7.3.1,<8.0
 av>=13.0
