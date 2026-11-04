@@ -112,6 +112,12 @@ _ENTER_FACTOR: Final[float] = 2.0           # enter 门限 = 底噪 × 2
 _KEEP_FACTOR: Final[float] = 1.3            # keep  门限 = 底噪 × 1.3
 _PAUSE_MARGIN_MS: Final[int] = 500          # 自适应阈值的固定余量
 
+# 短句豁免上限（见 `_has_real_speech`）。
+# 累计语音不超过这个值时**不要求**有连续语音段 —— 老人说「好」「嗯」
+# 「退下吧」整句只有 250~600ms，一刀切会把它们判成噪声。
+# 现场实测：噪声爆发平均 204ms、最长 180~200ms；真语音平均 522ms。
+_SHORT_UTTERANCE_MS: Final[int] = 1500
+
 # ---- 全双工打断（F2，2026-10-21）----
 # 播报中检测到人声就停嘴改听 —— 这是"AEC 全双工"的体验核心：老人说话时
 # 音箱不该自顾自讲完。上游小智同款机制（core/handle/receiveAudioHandle.py：
@@ -1957,6 +1963,11 @@ class VoiceSession:
             self._noise_floor = _NOISE_FLOOR_INIT
             self._ms_since_loud = 10 ** 9
             self._max_closed_pause_ms = 0
+            # ⚠️ 2026-11-04：连续语音段也必须一起清。它现在是**判据**
+            # （见 _silence_watchdog），不清就会把上一轮的长语音段带进来，
+            # 让这一轮的噪声窗口被误判成"有人说话"。
+            self._speech_run_ms = 0
+            self._max_speech_run_ms = 0
             self._reset_speech_window()
             self._barge_speech_ms = 0
             self._barge_silence_ms = 0
@@ -2167,6 +2178,9 @@ class VoiceSession:
         self._noise_floor = _NOISE_FLOOR_INIT
         self._ms_since_loud = 10 ** 9
         self._max_closed_pause_ms = 0
+        # 同 _start_listen 那处：连续语音段是判据，必须跟着清零。
+        self._speech_run_ms = 0
+        self._max_speech_run_ms = 0
         self._reset_speech_window()
         self._barge_speech_ms = 0
         self._barge_silence_ms = 0
@@ -2268,6 +2282,9 @@ class VoiceSession:
         self._pcm.clear()
         self._speech_ms = 0
         self._silence_ms = 0
+        # 同 _start_listen 那处：连续语音段是判据，必须跟着清零。
+        self._speech_run_ms = 0
+        self._max_speech_run_ms = 0
         self._reset_speech_window()
         # 先把 state 落下，待机期间后续到达的上行帧一律按"非 listening"丢弃。
         self.state = "idle"
@@ -2313,6 +2330,41 @@ class VoiceSession:
                         self.session_id, type(exc).__name__, exc)
             return "留证失败：%s" % type(exc).__name__
 
+    def _has_real_speech(self) -> bool:
+        """这一轮里到底有没有"人说话"，而不是"房间噪声够响"。
+
+        两个判据是**并且**关系（`config.VOICE_MIN_SPEECH_RUN_MS` 的注释里
+        写的就是这个意思，只是从来没接上）：
+
+          * 累计语音够长（``VOICE_MIN_SPEECH_MS``，300ms）—— 防"一个字没说"；
+          * **有一段连续**够长（``VOICE_MIN_SPEECH_RUN_MS``，400ms）—— 防噪声。
+
+        为什么必须有第二条（2026-11-04 现场实测）：噪声是零星的孤立尖峰，
+        平均 204ms、最长 180~200ms；人说话是连续能量，平均 522ms。只判
+        累计值时，噪声每 1~3 秒打一次就能把累计值堆到 7~13 秒 ⇒ 服务端拿
+        一段**纯噪声**送 ASR ⇒ 五家 ASR 一致返回空（那份 wav 的 HNR 只有
+        0.22，真语音 ≥0.7）⇒ 老人听到「抱歉，我没听清，您能再说一遍吗？」。
+
+        ⚠️⚠️ 2026-11-04 教训：这个判据 2026-10-22 就写进 config 了，
+        `_max_speech_run_ms` 也一直在 `_feed_vad` 里维护，但
+        **全仓没有任何一处读它做判断**（grep 只有定义 + 写入）。
+        也就是说 10-22 那次「没有唤醒也说抱歉我没听清」的修复
+        从来没有生效过 —— 写了判据、没接线，CI 全绿。
+        以后新增判据必须同时给"读它"的地方和"它不成立时"的断言。
+
+        为什么还要有 `_SHORT_UTTERANCE_MS` 这条豁免（**很重要**）：
+        「连续段够长」这条判据对**短句**是致命的。老人说一声「好」、
+        「嗯」、「退下吧」，整句只有 250~600ms，本来就不可能凑出
+        400ms 以上的连续段 —— 一刀切会把它们全判成噪声，表现是
+        「说了『好』设备没反应」，比原来更糟。
+        所以规则是：**短句（累计 ≤1.5s）直接放行**，只有"累计很长"时
+        才要求"必须有一段连续"—— 因为真人连续说 1.5 秒以上，里面
+        必然有 ≥400ms 的连续能量；而噪声堆到 7.8 秒也凑不出 400ms。
+        """
+        return (self._speech_ms >= config.VOICE_MIN_SPEECH_MS
+                and (self._max_speech_run_ms >= config.VOICE_MIN_SPEECH_RUN_MS
+                     or self._speech_ms <= _SHORT_UTTERANCE_MS))
+
     async def _silence_watchdog(self) -> None:
         """连续静音达到阈值就自动 finalize（等价于设备端 VAD 断句）。
 
@@ -2349,8 +2401,7 @@ class VoiceSession:
                         f"连续 {config.VOICE_IDLE_STANDBY_SEC}s 没有有效内容")
                     return
                 threshold = self._silence_threshold_ms()
-                if self._silence_ms >= threshold and \
-                        self._speech_ms >= config.VOICE_MIN_SPEECH_MS:
+                if self._silence_ms >= threshold and self._has_real_speech():
                     if not self._start_turn():
                         # 旧轮还在收尾（barge 打断后尤其常见）：等它完了
                         # 再起，**不能 return** —— 把看门狗一起带走的话，
@@ -2379,18 +2430,28 @@ class VoiceSession:
                 # 得到的必然是"我没听清"。
                 elapsed_ms = int((time.monotonic() - self._t0) * 1000)
                 if elapsed_ms >= config.VOICE_MAX_LISTEN_MS:
-                    if self._speech_ms < config.VOICE_MIN_SPEECH_MS:
+                    if not self._has_real_speech():
                         # ⚠️ 这个分支原先**只打一行数字**（"累计语音 0ms"），
                         # 2026-11-03 深夜现场就撞上了：老人说他明明说了话，
                         # 服务端却认定 60 秒里一句没说。没有音频指纹就无从
                         # 判断是"门限太高"还是"送上来的音频被衰减"，所以
                         # 这里也留指纹（峰值够高时连 wav 一起落）。
                         # 必须在 _rearm_listening() **之前**取，它会清 _pcm。
-                        log.info("[%s] 收听超 %ds 但一句都没说（累计语音 %dms "
-                                 "< %dms），重新武装而不送 ASR；音频指纹：%s",
+                        #
+                        # 2026-11-04：判据从"累计语音"升级成 _has_real_speech()
+                        # （累计 + **最长连续段**）。现场 09:13:57 那轮累计
+                        # 7800ms 全是房间噪声（HNR 0.22、最长连续段仅 180ms），
+                        # 旧判据放行 ⇒ 纯噪声送 ASR ⇒ 返回空 ⇒ 老人听
+                        # 「抱歉，我没听清」。日志里把最长连续段一起打出来，
+                        # 下次不用再猜是"没人说话"还是"噪声太响"。
+                        log.info("[%s] 收听超 %ds 但没有人说话（累计语音 %dms "
+                                 "< %dms，最长连续段 %dms < %dms），重新武装而"
+                                 "不送 ASR；音频指纹：%s",
                                  self.session_id,
                                  config.VOICE_MAX_LISTEN_MS // 1000,
                                  self._speech_ms, config.VOICE_MIN_SPEECH_MS,
+                                 self._max_speech_run_ms,
+                                 config.VOICE_MIN_SPEECH_RUN_MS,
                                  self._listen_timeout_fingerprint(elapsed_ms))
                         self._rearm_listening()
                         return

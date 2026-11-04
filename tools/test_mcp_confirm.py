@@ -269,7 +269,17 @@ def t_execute_tool_wiring() -> None:
                            "isError": False}}
 
     r = execute_tool(None, 1, "confirm_reminder", "{}", device_call=device_call)
-    check("真的下发了设备工具调用", seen == [("self.elder.confirm_reminder", {}, 3.0)],
+    # ⚠️ 2026-11-04：超时从 3.0 提到 8.0。判据不能只比"等于某个数"，
+    # 必须钉住**为什么是这个数**：设备侧处理 confirm_reminder 是同步阻塞的
+    # （sync.c 的 flush_queue → esp_http_client_perform），实测 3.5 秒，
+    # 而设备自己的 HTTP 超时是 CONFIG_ELDER_HTTP_TIMEOUT_MS=8000。
+    # 服务端比设备先放弃 ⇒ 每次都输 0.5 秒 ⇒ 老人听到"请按一下按键"（他刚按过）。
+    from app.voice.tools import _DEVICE_CALL_TIMEOUT_SEC
+    check("confirm_reminder 等设备回包的时间 ≥ 设备自己的 HTTP 超时（8s）",
+          _DEVICE_CALL_TIMEOUT_SEC >= 8.0,
+          f"实际 {_DEVICE_CALL_TIMEOUT_SEC}s；小于 8 就会稳定输给设备的同步回执（3.5s）")
+    check("真的下发了设备工具调用",
+          seen == [("self.elder.confirm_reminder", {}, _DEVICE_CALL_TIMEOUT_SEC)],
           f"实际 {seen!r}")
     check("结果 ok", r.get("ok") is True, f"{r!r}")
 
@@ -345,7 +355,7 @@ def t_device_controls() -> None:
           f"calls={dev.calls}")
     check("参数名是 volume（固件 Property('volume', ...) 拼错就 Unknown tool）",
           dev.calls and dev.calls[0][1] == {"volume": 40}, f"calls={dev.calls}")
-    check("超时用 2.0 秒（小于 confirm_reminder 的 3.0，回调是毫秒级的）",
+    check("超时用 2.0 秒（回调是毫秒级的；confirm_reminder 那条才要 8.0）",
           dev.calls and dev.calls[0][2] == 2.0, f"calls={dev.calls}")
     check("绝对量只走一次往返，不先读状态",
           len(dev.calls) == 1, f"calls={dev.calls}")

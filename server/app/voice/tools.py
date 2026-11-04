@@ -1192,6 +1192,26 @@ def _disarm_voice(db: Any, ev: Any, prev: int | None) -> None:
                     type(exc).__name__, exc)
 
 
+# 调设备 MCP 工具时等多久（秒）。
+#
+# ⚠️⚠️ 2026-11-04 现场事故：原来是 **3.0**，而设备侧处理
+# `elder.confirm_reminder` 是**同步阻塞**的 ——
+#   elder_bridge.cc:1576 → reminder.c:1484 → sync.c:943 里
+#   `if (online) flush_queue();` → net.c:206 `esp_http_client_perform()`
+# 也就是说"按一下键"要等设备把回执 POST 回服务端才算完，而那条 HTTP
+# 请求 `keep_alive_enable=false`（每次重做 TCP+TLS 握手），
+# 实测 **3.5 秒**。服务端只等 3.0 秒 ⇒ **每次都稳定输 0.5 秒**：
+#   09:15:13.740 下发 → 09:15:16.745 判超时 → 09:15:17.210 回执才落库
+#   09:18:53.400 下发 → 09:18:56.403 判超时 → 09:18:56.901 回执才落库
+# 后果有两层：老人听到「请让老人按一下设备上的按键确认」（他刚按过）；
+# 而且 `_disarm_voice()` 已经把预写的 VOICE 回滚，0.5 秒后到的 BUTTON
+# 合并不上 ⇒ `confirm_method` 落成 2（仅按键）而不是 5（语音+按键全置信）。
+#
+# 与设备侧 `CONFIG_ELDER_HTTP_TIMEOUT_MS=8000`（sdkconfig.defaults:185）
+# 对齐：设备最坏情况 8 秒才放弃，服务端就不该比它早。
+_DEVICE_CALL_TIMEOUT_SEC = 8.0
+
+
 def _device_pending_call(device_call: Any) -> dict[str, Any]:
     """不带 ``server_id`` 让设备确认**它自己挂着的那条** —— 真正的下发与解析。
 
@@ -1203,9 +1223,11 @@ def _device_pending_call(device_call: Any) -> dict[str, Any]:
         return {"ok": False, "message": "现在连不上设备，请让老人按一下设备上的按键确认"}
 
     try:
-        payload = device_call("self.elder.confirm_reminder", {}, 3.0)
+        payload = device_call("self.elder.confirm_reminder", {},
+                              _DEVICE_CALL_TIMEOUT_SEC)
     except TimeoutError:
-        log.warning("confirm_reminder：设备 3 秒内没回包")
+        log.warning("confirm_reminder：设备 %d 秒内没回包",
+                    int(_DEVICE_CALL_TIMEOUT_SEC))
         return {"ok": False, "message": "设备没有响应，请让老人按一下设备上的按键确认"}
     except Exception as exc:  # noqa: BLE001  设备离线/WS 已断
         log.warning("confirm_reminder：下发失败 %s: %s", type(exc).__name__, exc)
@@ -1501,7 +1523,8 @@ def _confirm_reminder(db: Any, device_pk: int, device_call: Any,
         else:
             try:
                 payload = device_call("self.elder.confirm_reminder",
-                                      {"server_id": ev.reminder_id}, 3.0)
+                                      {"server_id": ev.reminder_id},
+                                      _DEVICE_CALL_TIMEOUT_SEC)
                 if not isinstance(payload, dict):
                     dev_err = "设备返回的内容看不懂"
                 elif payload.get("error"):
@@ -1514,8 +1537,9 @@ def _confirm_reminder(db: Any, device_pk: int, device_call: Any,
                     if isinstance(result, dict) and result.get("isError"):
                         dev_err = "设备说没办成"
             except TimeoutError:
-                dev_err = "设备 3 秒内没回包"
-                log.warning("confirm_reminder：设备 3 秒内没回包")
+                dev_err = f"设备 {int(_DEVICE_CALL_TIMEOUT_SEC)} 秒内没回包"
+                log.warning("confirm_reminder：设备 %d 秒内没回包",
+                            int(_DEVICE_CALL_TIMEOUT_SEC))
             except Exception as exc:  # noqa: BLE001  设备离线 / WS 已断
                 dev_err = "现在连不上设备"
                 log.warning("confirm_reminder：下发失败 %s: %s", type(exc).__name__, exc)
