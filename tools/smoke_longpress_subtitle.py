@@ -20,6 +20,11 @@
  #FF69B4 全亮闪 5 次」。灯效只能在真机上看，本机唯一能守的是**代码位**：
 渐变是不是还走同一色相（scale_color）、是不是还用墙上时钟、追问路径有没有
 真的闪天蓝、灯珠宏有没有被顺手改掉。
+
+2026-11-04 新增第 6 组（同日第二个需求：「确认窗口在 4 个小时内只要屏幕显示
+的是待办事项就可以按键进行确认」）：日程类播报即 auto_done，引擎里没有待确认
+项，但屏幕还挂着 4 小时 —— 闸门必须改成「引擎有待确认项 ∨ 屏上还挂着」，
+并且 ui.c 的 show/hide 要跟着同步 #1 灯（hide 必须在清标志之后）。
 """
 from __future__ import annotations
 
@@ -32,6 +37,8 @@ BRIDGE = ROOT / "firmware" / "components" / "elder" / "src" / "elder_bridge.cc"
 CLIP_C = ROOT / "firmware" / "components" / "elder" / "src" / "elder_clip.c"
 CLIP_H = ROOT / "firmware" / "components" / "elder" / "include" / "elder_clip.h"
 REMINDER_C = ROOT / "firmware" / "components" / "elder" / "src" / "reminder.c"
+#: 全屏提醒（4 小时窗口）与「屏显 / #1 灯同源」的真源
+UI_C = ROOT / "firmware" / "components" / "elder" / "src" / "ui.c"
 LCD = ROOT / "firmware" / "xiaozhi" / "main" / "display" / "lcd_display.cc"
 #: #1 按键灯的真源（`firmware/xiaozhi/components/elder` 是 merge 生成的副本，不读它）
 RGB_C = ROOT / "firmware" / "components" / "elder" / "src" / "rgb.c"
@@ -274,12 +281,133 @@ def t5_button_led() -> None:
               f"实际 {got or '缺失'} —— 改了它后 11 颗会停在开机随机态常亮")
 
 
+def t6_actionable_gate() -> None:
+    """「屏上显示着待办 ⇒ 按键就能确认、#1 灯亮」（2026-11-04）。
+
+    需求原话：「确认窗口在 4 个小时内只要屏幕显示的是待办事项就可以按键进行确认」。
+
+    守的是这条链：日程/待办类提醒**播报即 auto_done**（用户 2026-11-03 定的），
+    DONE 不在 has_pending_confirm() 的集合里 ⇒ 引擎里"没有待确认项"，可屏幕
+    还挂着 4 小时。此时 #1 的闸门若只判引擎状态，老人长按 3 秒灯不亮、没渐变
+    （rgb.c 里 g.btn_pending 为假时按下去什么都不亮），他会以为按键坏了。
+    所以闸门改成 elder_reminder_button_actionable() = 引擎有待确认项 ∨ 屏上
+    还挂着；屏显的 show/hide 两处都要跟着同步灯，hide 必须在清标志**之后**。
+
+    本组每条断言都做过「临时改坏真源 → 跑本脚本 → 确认对应断言变红 → 还原」
+    的验证（2026-11-04，改坏点与结果记录如下，避免以后有人以为是装饰性断言）：
+      · actionable 的 `|| elder_ui_reminder_showing()` 删掉
+            ⇒ 6.1 两条红（缺屏显项 / 缺 || 连接）
+      · reminder.c 里 490 行实参改回裸 has_pending_confirm()
+            ⇒ 6.2 两条红（仍有裸实参 / actionable 调用点少一处）
+      · ui.c 的 show_reminder 里删掉同步调用
+            ⇒ 6.3 的 show 一条红
+      · ui.c 的 hide_reminder 里删掉同步调用
+            ⇒ 6.3 的 hide 一条红 + 6.4 顺序断言红（调用没了，find 返回 -1）
+      · hide_reminder 里把同步调用挪到 `reminder_showing = false;` 之前
+            ⇒ 6.4 顺序断言红（6.3 仍绿 —— 调用还在，正是顺序断言存在的理由）
+      · has_pending_confirm() 集合里加 `st == ELDER_RMD_DONE`
+            ⇒ 6.5 红
+      · ELDER_UI_REMINDER_HOLD_US 改成 2 小时
+            ⇒ 6.6 红
+    """
+    print("\n── 6. 屏上有待办 ⇒ 按键可确认、#1 灯亮（屏显与灯同源）──")
+    r = strip_comments(REMINDER_C.read_text(encoding="utf-8"))
+    u = strip_comments(UI_C.read_text(encoding="utf-8"))
+
+    # 6.1 单一真源函数：两个判据都要在，且用 || 连接。
+    #     不能只判引擎：日程类播报即 DONE，屏还挂着 4 小时（见函数 docstring）。
+    pos = r.find("bool elder_reminder_button_actionable(void)")
+    act = _brace_body(r, pos) if pos >= 0 else ""
+    check(bool(act), "能定位 elder_reminder_button_actionable() 函数体",
+          "找不到定义，函数被改名/删掉了？")
+    check("has_pending_confirm()" in act,
+          "actionable 判据包含 has_pending_confirm()（引擎里还有待确认项）",
+          "删了它 ⇒ 服药等待确认时按键也没反应")
+    check("elder_ui_reminder_showing()" in act,
+          "actionable 判据包含 elder_ui_reminder_showing()（屏上还挂着提醒）",
+          "删了它 ⇒ 日程类 auto_done 后屏挂 4 小时，按键依旧没灯")
+    check(bool(re.search(r"has_pending_confirm\(\)\s*\|\|\s*elder_ui_reminder_showing\(\)",
+                         act)),
+          "两个判据用 || 连接（任一成立即可按键）",
+          "写成 && ⇒ 只有「引擎有待确认项 且 屏还挂着」才亮，"
+          "正是要修的「屏上有待办却按不动」")
+
+    # 6.2 reminder.c 的闸门实参：一处都不许还是裸的 has_pending_confirm()。
+    #     按行正则（已剥注释），不做整文件子串匹配 —— 本仓踩过注释自己踩红的坑。
+    bare = re.findall(
+        r"elder_rgb_button_pending\s*\(\s*has_pending_confirm\s*\(\s*\)\s*\)", r)
+    check(not bare,
+          "reminder.c 没有一处 elder_rgb_button_pending(has_pending_confirm())",
+          f"仍有 {len(bare)} 处裸判据 ⇒ 那几条路径上屏挂着灯也不亮")
+    n_act = len(re.findall(
+        r"elder_rgb_button_pending\s*\(\s*elder_reminder_button_actionable\s*\(\s*\)\s*\)", r))
+    check(n_act >= 4,
+          f"reminder.c 的闸门调用点都走 actionable（≥4 处，实际 {n_act}）",
+          "set_state / 跨天 / 合并 / auto_done 四处漏了任何一处，"
+          "灯就会与屏不同步")
+
+    # 6.3 ui.c 的 show / hide 都要同步灯。
+    sp = u.find("esp_err_t elder_ui_show_reminder(const char *text)")
+    show = _brace_body(u, sp) if sp >= 0 else ""
+    hp = u.find("void elder_ui_hide_reminder(void)")
+    hide = _brace_body(u, hp) if hp >= 0 else ""
+    check(bool(show) and bool(hide), "能定位 ui.c 的 show/hide 函数体",
+          "函数签名被改过？")
+    call = "elder_rgb_button_pending(elder_reminder_button_actionable())"
+    check(call in show,
+          "elder_ui_show_reminder() 里同步 #1 灯（屏一亮就可按键）",
+          "缺这一句 ⇒ 屏上待办挂 4 小时，灯全程不亮")
+    check(call in hide,
+          "elder_ui_hide_reminder() 里同步 #1 灯（屏收了灯也要收）",
+          "缺这一句 ⇒ 确认后灯橙色呼吸到 4 小时上限才灭")
+
+    # 6.4 hide 里同步调用必须在清掉 reminder_showing **之后**。
+    #     这是「灯灭不掉」那个坑的防线：ConfirmMedicine() 的 set_state(DONE)
+    #     → 灯同步，发生在 OnReminder(DONE) → hide 之前，那一刻屏还挂着。
+    if hide:
+        i_flag = hide.find("reminder_showing = false")
+        i_call = hide.find(call)
+        check(i_flag >= 0 and i_call > i_flag,
+              "hide 里同步灯在 reminder_showing = false 之后",
+              "顺序反了 ⇒ 同步时屏仍算「挂着」，灯被判成可按键、"
+              "橙色呼吸到 4 小时上限")
+    else:
+        check(False, "hide 里同步灯在 reminder_showing = false 之后",
+              "函数体没定位到")
+
+    # 6.5 防回归：DONE 绝不许进 has_pending_confirm() 的状态集合。
+    #     加进去会重复回调 OnReminder(DONE)、重复 enqueue_event(CONFIRMED)，
+    #     家属端看到重复的确认记录。
+    hc = r.find("static bool has_pending_confirm(void)")
+    hb = _brace_body(r, hc) if hc >= 0 else ""
+    check(bool(hb), "能定位 has_pending_confirm() 函数体",
+          "函数被改名/挪走了？")
+    check("ELDER_RMD_DONE" not in hb,
+          "has_pending_confirm() 的状态集合里没有 ELDER_RMD_DONE",
+          "加进去 ⇒ auto_done 的条目被当成待确认，重复回调 + 重复上报")
+
+    # 6.6 4 小时窗口的唯一真源仍在 ui.c，没被顺手改短/改长。
+    m = re.search(r"^[ \t]*#define[ \t]+ELDER_UI_REMINDER_HOLD_US[ \t]+(.+)$", u, re.M)
+    raw = m.group(1).strip() if m else ""
+    expr = re.sub(r"(?i)(?<=\d)(?:ull|ll|ul|u|l)\b", "", raw)
+    hours = None
+    if expr and re.fullmatch(r"[0-9*+() \t]+", expr):
+        try:
+            hours = eval(expr, {"__builtins__": {}}, {}) / (60 * 60 * 1000 * 1000)
+        except Exception:
+            hours = None
+    check(hours == 4,
+          "ELDER_UI_REMINDER_HOLD_US 仍是 4 小时",
+          f"实际 {raw or '缺失'} ⇒ 用户明确要求 4 小时")
+
+
 def main() -> int:
     t1_clip_ids()
     t2_long_press_wiring()
     t3_subtitle_accumulate()
     t4_reminder_list()
     t5_button_led()
+    t6_actionable_gate()
 
     passed = sum(1 for ok, _, _ in results if ok)
     failed = len(results) - passed

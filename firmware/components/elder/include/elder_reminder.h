@@ -452,6 +452,35 @@ bool elder_reminder_has_pending_medicine(void);
 bool elder_reminder_has_pending_confirm(void);
 
 /**
+ * @brief 「这一下按键该不该有反应」—— #1 按键指示灯闸门的**唯一真源**。
+ *
+ * 判据：has_pending_confirm()（引擎里还有待确认项）**或**
+ *       elder_ui_reminder_showing()（屏幕上正挂着全屏提醒）。
+ *
+ * 为什么不能只判 has_pending_confirm()（2026-11-04 用户原话「确认窗口在
+ * 4 个小时内只要屏幕显示的是待办事项就可以按键进行确认」）：
+ *   日程/待办类提醒在**播报那一刻**就被 elder_reminder_auto_done() 标成
+ *   DONE（用户 2026-11-03 定的「日程类只要进行提醒就算完成流程」），
+ *   DONE 不在 has_pending_confirm() 的集合里 ⇒ 引擎说"没有待确认项"，
+ *   可屏幕还挂着 4 小时。只判引擎状态，老人对着屏上的日程卡长按 3 秒
+ *   就是灯不亮、没渐变（rgb.c 的 g.btn_pending 为 false 时按下去什么都不亮），
+ *   他会以为按键坏了 —— 功能上其实确认成功了。
+ *
+ * 为什么把 elder_ui_reminder_showing() 也算进来是**同源**、不是第二份真源：
+ *   屏显和 #1 灯本来就是同一件事的两面，必须从同一个表达式取值。本仓
+ *   2026-10-31 有过反例「灯还在闪、屏幕已经回到待机熊猫」，那次是收屏
+ *   判据没问引擎；这里的语义反过来对齐：**屏上看得见 ⇒ 按键就该有反应**。
+ *
+ * 4 小时窗口的唯一真源仍在 ui.c 的 ELDER_UI_REMINDER_HOLD_US（屏自己到点
+ * 收）。本函数**不另设任何时间窗**，否则就是第二份计时，迟早漂移。
+ *
+ * ⚠️ 不要把 ELDER_RMD_DONE 加进 has_pending_confirm() 来"顺便"解决这件事：
+ *    那会让 auto_done 的条目重新被当成待确认，重复回调 OnReminder(DONE)、
+ *    重复 enqueue_event(CONFIRMED)，家属端看到重复的确认记录。
+ */
+bool elder_reminder_button_actionable(void);
+
+/**
  * @brief 当前**正在响铃**的提醒下标（语音/按键确认的优选目标）；没有则 -1。
  *
  * 「响铃中」= state ∈ {PENDING, CONFIRM_WIN, ESCALATED} 且 enabled，
