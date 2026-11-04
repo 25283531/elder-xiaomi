@@ -68,7 +68,7 @@ jobs:
             artifact: elder-app-mp-weixin
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 判断本次是否需要构建
         id: gate

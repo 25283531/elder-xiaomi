@@ -56,7 +56,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 准备 Python
         uses: actions/setup-python@v5

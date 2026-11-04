@@ -82,7 +82,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 编译并运行 elder_rmd_sched 单测
         run: |
@@ -120,7 +120,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 准备 Python
         uses: actions/setup-python@v5
@@ -195,7 +195,7 @@ jobs:
     container:
       image: espressif/idf:v5.5.1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 注入 elder 组件到 xiaozhi 源码树
         run: |

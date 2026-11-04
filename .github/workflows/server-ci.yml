@@ -47,7 +47,7 @@ jobs:
         working-directory: .
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # 取**全历史**，不是默认的 depth=1。
           #
@@ -717,7 +717,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # ubuntu-latest 自带 gcc/make，这里显式确认一次：
       # 「编译器缺失」必须当场红成一条清楚的错误，而不是让 make 报一句
@@ -843,7 +843,7 @@ jobs:
           --health-retries 20
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 准备 Python 3.11
         uses: actions/setup-python@v5
@@ -954,7 +954,7 @@ jobs:
     name: Compose 文件校验
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: 校验默认形态（内置 SQLite）
         working-directory: server
         run: docker compose config --quiet
@@ -966,7 +966,7 @@ jobs:
     name: Dockerfile 语法检查
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: hadolint
         uses: hadolint/hadolint-action@v3.1.0
         with:
