@@ -299,7 +299,19 @@ void elder_rgb_reminder_nag_stop(void);
 void elder_rgb_button_press(void);
 
 /** 松开。仍在渐变中 ⇒ 判定为"中途松开没确认"，粉红闪 5 次。
- *  已经出过结果（confirmed 或已闪烁）⇒ 忽略，不会重复反馈。 */
+ *  已经出过结果（confirmed 或已闪烁）⇒ 忽略，不会重复反馈。
+ *
+ *  ⚠️ 2026-11-04 起还有一道**抖动兜底**：本轮按压总时长
+ *  < ELDER_RGB_BTN_DEBOUNCE_MIN_MS(300ms) 时**不闪粉红**，直接回
+ *  "橙色呼吸/熄灭"并把本轮标成已出结果。
+ *
+ *  为什么需要它：用户实报「按键超过 1 秒就开始进行粉红色闪烁」—— 老人按住
+ *  不动，机械按键中途抖几十毫秒就被当成松手，渐变被掐掉、灯报"你没按够"。
+ *  input.c 已把松手消抖单独加到 80ms（RELEASE_DEBOUNCE_MS），这里是第二道
+ *  防线：300ms 以内不可能有人主动放弃，那一段里的"松开"只可能是抖动。
+ *
+ *  这**不是**放宽标准：3 秒才算确认的判据（ELDER_BTN_CONFIRM_HOLD_MS）一个字
+ *  都没动，300ms 之后的松手照样粉红闪 5 次。 */
 void elder_rgb_button_release(void);
 
 /** 确认完成 ⇒ 天蓝 #00BFFF 全亮闪 3 次 */
