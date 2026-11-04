@@ -399,6 +399,31 @@ static bool has_pending_confirm(void)
     return false;
 }
 
+/* 「这一下按键该不该有反应」—— #1 按键指示灯闸门的**唯一真源**。
+ *
+ * 为什么不能只判 has_pending_confirm()（2026-11-04 用户原话：「确认窗口在
+ * 4 个小时内只要屏幕显示的是待办事项就可以按键进行确认」）：
+ *   日程/待办类提醒在**播报那一刻**就被 elder_reminder_auto_done() 标成
+ *   DONE（用户 2026-11-03 明确定过「日程类只要进行提醒就算完成流程」），
+ *   而 DONE 不在 has_pending_confirm() 的集合里 ⇒ 引擎说"没有待确认项"，
+ *   可屏幕还挂着 4 小时。老人对着屏上那张日程卡长按 3 秒，rgb.c 的
+ *   g.btn_pending 是 false ⇒ 灯不亮、没有渐变，他以为按键坏了。
+ *
+ * 为什么把 elder_ui_reminder_showing() 也算进来是**同源**、不是"第二份真源"：
+ *   屏显和 #1 灯本来就是同一件事的两面，必须同源。本仓 2026-10-31 有过
+ *   反例「灯还在闪、屏幕已经回到待机熊猫」—— 那次是收屏判据没问引擎。
+ *   这里的语义反过来对齐：**屏上看得见 ⇒ 按键就该有反应**，两处都从这一个
+ *   表达式取值，谁也不再各判一套。
+ *
+ * 4 小时窗口的唯一真源仍然在 ui.c 的 ELDER_UI_REMINDER_HOLD_US（屏自己
+ * 到点收），本函数**不另设任何时间窗** —— 加一个"再来 4 小时"的常量，
+ * 就是第二份真源，两条计时迟早漂移。
+ */
+bool elder_reminder_button_actionable(void)
+{
+    return has_pending_confirm() || elder_ui_reminder_showing();
+}
+
 static void set_state(int idx, elder_rmd_state_t st)
 {
     if (idx < 0 || idx >= ELDER_REMINDER_MAX) return;
@@ -462,7 +487,7 @@ static void set_state(int idx, elder_rmd_state_t st)
     /* #1 指示灯的"待确认"态跟着状态集合走。放在 g.cb 之前：
      * 回调里会播提示音、切全屏提醒，那一刻灯应该已经是新的状态，
      * 否则老人会看到"屏上写着该吃药了，灯却不亮"。 */
-    elder_rgb_button_pending(has_pending_confirm());
+    elder_rgb_button_pending(elder_reminder_button_actionable());
     if (g.cb) g.cb(&g.table.items[idx], st, g.ctx);
 }
 
@@ -514,7 +539,7 @@ static void tick(void)
             g.table.items[i].fired_due_at = 0;
         }
         g.dirty = true;
-        elder_rgb_button_pending(has_pending_confirm());   /* 跨天清空 ⇒ 灯也该灭 */
+        elder_rgb_button_pending(elder_reminder_button_actionable());   /* 跨天清空 ⇒ 灯也该灭 */
     }
     g.table.last_day_ordinal = ord;
 
@@ -1163,7 +1188,7 @@ esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items,
     /* 合并后条数/下标都变了，待确认集合必须重算 —— 否则 #1 指示灯会停在
      * 合并前的状态：提醒被后端删了灯还亮着（催老人确认一条不存在的任务），
      * 或者后端新下发的提醒在等确认、灯却不亮。 */
-    elder_rgb_button_pending(has_pending_confirm());
+    elder_rgb_button_pending(elder_reminder_button_actionable());
 
     /* ---- 7. 同步后对账：屏幕与引擎状态必须同源 ----
      * replace_all 是**全表替换**：被后端删掉/停用的条目会整条消失，这时
@@ -1527,8 +1552,11 @@ esp_err_t elder_reminder_auto_done(uint8_t id)
      *   · btn_pending 还停在 true ⇒ #1 一直橙色呼吸，催老人去按一个
      *     first_ringing() 永远选不中的键；
      *   · 老人真按下去 ⇒ 渐变走满 ⇒ 松开时"未出结果" ⇒ 深粉红闪 5 次（报错）。
-     * 这里补上同一次状态同步。判据用 has_pending_confirm()，不另算一套。 */
-    elder_rgb_button_pending(has_pending_confirm());
+     * 这里补上同一次状态同步。判据用 elder_reminder_button_actionable()
+     * （引擎有待确认项 ∨ 屏上还挂着），不另算一套 —— 此刻屏通常还没推上去，
+     * 于是 auto_done 先熄灯，紧接着 show_reminder() 会按"屏上看得见"再点亮。
+     * 直接判 has_pending_confirm() 的话，日程类整段 4 小时里灯都不会亮。 */
+    elder_rgb_button_pending(elder_reminder_button_actionable());
     return ESP_OK;
 }
 

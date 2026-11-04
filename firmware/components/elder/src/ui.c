@@ -3,6 +3,8 @@
  * 屏幕原先只看自己记的 4 小时计时，于是出现「灯还在闪、屏幕已经回到待机熊猫」
  * —— 老人 8 点没确认，中午 12 点屏幕自己黑了，只剩 #1 在呼吸。 */
 #include "elder_reminder.h"
+/* #1 按键指示灯：屏显与灯必须同源（屏上看得见 ⇒ 按键就该有反应）。 */
+#include "elder_rgb.h"
 
 #include <string.h>
 
@@ -178,6 +180,11 @@ esp_err_t elder_ui_show_reminder(const char *text)
     g.reminder_showing = true;
     g.reminder_expire_us = esp_timer_get_time() + ELDER_UI_REMINDER_HOLD_US;
 
+    /* 屏一亮，#1 立刻进入"可按键"态。理由见 elder_reminder_button_actionable()
+     * 的头文件注释：日程类播报即 auto_done，引擎里已经没有待确认项，只判引擎
+     * 的话老人对着屏上的待办长按 3 秒灯不亮、没渐变，会以为按键坏了。 */
+    elder_rgb_button_pending(elder_reminder_button_actionable());
+
     if (!g.has_hooks || !g.hooks.show_reminder) {
         /* 无屏设备 / 钩子尚未注入：仍然记状态。**不要在这里 return 错误** ——
          * 调用方（提醒回调）不该因为"这块板子没有屏"而少做别的事
@@ -195,6 +202,14 @@ void elder_ui_hide_reminder(void)
     if (!g.reminder_showing && !g.reminder_expire_us) return;
     g.reminder_showing = false;
     g.reminder_expire_us = 0;
+
+    /* 必须**在清掉 reminder_showing 之后**再同步一次灯：elder_bridge.cc 的
+     * ConfirmMedicine() → set_state(DONE) → elder_rgb_button_pending(...) 是在
+     * OnReminder(DONE) → 本函数**之前**执行的，那一刻屏还挂着，
+     * elder_reminder_button_actionable() 为真 ⇒ 灯会一直橙色呼吸到 4 小时上限
+     * 才灭。屏已经收了，这里必须把灯收干净。 */
+    elder_rgb_button_pending(elder_reminder_button_actionable());
+
     if (!g.has_hooks || !g.hooks.hide_reminder) return;
     ESP_LOGI(TAG, "全屏提醒收起");
     g.hooks.hide_reminder(g.hooks.ctx);
