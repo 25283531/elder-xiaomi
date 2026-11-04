@@ -14,6 +14,12 @@
      长按屏幕显示服药提醒 → 播「您确认已经完成这次服药了吗？」并进入聆听。
   2. 累积多条提醒 → 同时显示在一屏上。
   3. 字幕显示不完整 → 要能翻页/滚动（根因是每句覆盖，见第 3 组）。
+
+2026-11-04 新增第 5 组：#1 按键指示灯的长按灯效改成
+「天青 #00E5FF 由暗变亮 → 3 秒达标天蓝 #00BFFF 全亮闪 3 次 / 中途松开粉红
+ #FF69B4 全亮闪 5 次」。灯效只能在真机上看，本机唯一能守的是**代码位**：
+渐变是不是还走同一色相（scale_color）、是不是还用墙上时钟、追问路径有没有
+真的闪天蓝、灯珠宏有没有被顺手改掉。
 """
 from __future__ import annotations
 
@@ -27,6 +33,9 @@ CLIP_C = ROOT / "firmware" / "components" / "elder" / "src" / "elder_clip.c"
 CLIP_H = ROOT / "firmware" / "components" / "elder" / "include" / "elder_clip.h"
 REMINDER_C = ROOT / "firmware" / "components" / "elder" / "src" / "reminder.c"
 LCD = ROOT / "firmware" / "xiaozhi" / "main" / "display" / "lcd_display.cc"
+#: #1 按键灯的真源（`firmware/xiaozhi/components/elder` 是 merge 生成的副本，不读它）
+RGB_C = ROOT / "firmware" / "components" / "elder" / "src" / "rgb.c"
+BOARD_H = ROOT / "firmware" / "components" / "elder" / "include" / "elder_board.h"
 
 results: list[tuple[bool, str, str]] = []
 
@@ -148,9 +157,9 @@ def t3_subtitle_accumulate() -> None:
     check("const bool dup =" in src,
           "重复句保护（同一句重发不追加两遍）",
           "工具轮重发同一句时老人会看到两遍")
-    check("ChatPageLayout();" in src,
-          "写完文字后仍然调 ChatPageLayout()（分页入口）",
-          "删了就没分页")
+    check("ChatPageLayout(anchor_px)" in src,
+          "写完文字后仍然调 ChatPageLayout(anchor_px)（分页入口）",
+          "删了就没分页；不带 anchor_px 就等于每句都弹回第 1 页")
 
 
 def t4_reminder_list() -> None:
@@ -167,11 +176,110 @@ def t4_reminder_list() -> None:
           "两套判据会漂移：屏幕写 3 条、实际只列 2 条")
 
 
+def _define_value(src: str, name: str) -> str:
+    """取 `#define NAME value` 的 value（src 必须已经剥过注释）。找不到返回空串。"""
+    m = re.search(rf"^[ \t]*#define[ \t]+{re.escape(name)}[ \t]+(\S+)", src, re.M)
+    return m.group(1) if m else ""
+
+
+def _brace_body(src: str, start: int) -> str:
+    """从 start 往后找第一个 `{`，按花括号配平返回其内部文本。
+
+    只用于**已剥注释**的源码；这几个函数体里没有带花括号的字符串字面量。
+    """
+    i = src.find("{", start)
+    if i < 0:
+        return ""
+    depth = 0
+    for j in range(i, len(src)):
+        if src[j] == "{":
+            depth += 1
+        elif src[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[i + 1:j]
+    return ""
+
+
+def t5_button_led() -> None:
+    """#1 按键灯新语义（2026-11-04）。
+
+    本组每条断言都做过「临时改坏真源 → 跑本脚本 → 确认对应断言变红 → 还原」
+    的验证（2026-11-04，改坏点记录如下，避免以后有人以为是装饰性断言）：
+      · 渐变改回 lerp_color            ⇒ 5.1 的 scale_color / lerp_color 两条红
+      · 渐变 el 偷换成 g.btn_anim_ms   ⇒ 5.1 的墙上时钟 / 渲染时钟两条红
+      · GRAD_COLOR 0x00E5FF→0x00E6FF   ⇒ 天青常量红
+      · OK_COLOR 0x00BFFF→0x00CED1     ⇒ 天蓝常量红
+      · FAIL_COLOR 0xFF69B4→0xFF1493   ⇒ 粉红常量红
+      · GRAD_MIN_LEVEL 20→0            ⇒ 起点亮度红
+      · OK_TIMES 3→4 / FAIL_TIMES 5→4  ⇒ 次数两条分别红
+      · acknowledged 退回 BTN_ATTRACT  ⇒ 5.3 两条都红
+      · ELDER_RGB_CHAIN 20→9 / LEDS 9→8⇒ 灯珠宏防回归红
+    """
+    print("\n── 5. #1 按键灯：天青变亮 → 天蓝闪 3 次 / 粉红闪 5 次 ──")
+    src = strip_comments(RGB_C.read_text(encoding="utf-8"))
+
+    # 5.1 渐变分支（只切 `case BTN_GRADIENT:` 到 `case BTN_FLASH:` 这一小段）。
+    #     不能整文件匹配：同一个 btn_step 里 FLASH 分支本来就该用
+    #     g.btn_anim_ms（渲染时钟，防止系统忙时少闪），整文件断言会误杀。
+    m = re.search(r"case BTN_GRADIENT\s*:(.*?)case BTN_FLASH\s*:", src, re.S)
+    grad = m.group(1) if m else ""
+    check(bool(grad), "能定位 BTN_GRADIENT 分支",
+          "找不到 case BTN_GRADIENT … case BTN_FLASH，状态机被重构过？")
+    check("scale_color(ELDER_RGB_BTN_GRAD_COLOR" in grad,
+          "渐变用 scale_color(ELDER_RGB_BTN_GRAD_COLOR)（同一色相只改亮度）",
+          "换成 lerp/dim ⇒ 要么变「换颜色」，要么暗端死黑看不出渐变")
+    check("lerp_color" not in grad,
+          "渐变分支不再用 lerp_color（它会把天青插值成别的色相）",
+          "回到 lerp_color ⇒ 老人看到的是「换了个颜色」而不是进度")
+    check("g.btn_phase_ms" in grad,
+          "渐变进度用墙上时钟 g.btn_phase_ms（与 input.c 的 3 秒判定同源）",
+          "不用墙上时钟 ⇒ 系统忙时灯还没亮满、按键已经算确认，灯在骗人")
+    check("g.btn_anim_ms" not in grad,
+          "渐变分支没有偷换成渲染时钟 g.btn_anim_ms",
+          "渲染时钟会被 ELDER_RGB_ANIM_MAX_STEP_MS 拖慢，和 3 秒判定错位")
+
+    # 5.2 颜色 / 次数常量（对应需求原词：天青、天蓝、粉红、3 次、5 次）
+    for name, want, why in (
+        ("ELDER_RGB_BTN_GRAD_COLOR", "0x00e5ffu", "天青色"),
+        ("ELDER_RGB_BTN_OK_COLOR", "0x00bfffu", "天蓝色"),
+        ("ELDER_RGB_BTN_FAIL_COLOR", "0xff69b4u", "粉红色"),
+        ("ELDER_RGB_BTN_GRAD_MIN_LEVEL", "20u", "渐变起点亮度（不从全黑起）"),
+    ):
+        got = _define_value(src, name)
+        check(got.lower() == want, f"{name} == {want}（{why}）",
+              f"实际 {got or '缺失'}")
+    for name, want in (("ELDER_RGB_BTN_OK_TIMES", "3"),
+                       ("ELDER_RGB_BTN_FAIL_TIMES", "5")):
+        got = _define_value(src, name)
+        check(got == want, f"{name} == {want}（用户要求闪 {want} 次）",
+              f"实际 {got or '缺失'}")
+
+    # 5.3 追问路径：3 秒达标即闪天蓝，不能再退回橙色呼吸。
+    pos = src.find("void elder_rgb_button_acknowledged(void)")
+    ack = _brace_body(src, pos) if pos >= 0 else ""
+    check("btn_enter_flash(ELDER_RGB_BTN_OK_COLOR, ELDER_RGB_BTN_OK_TIMES)" in ack,
+          "elder_rgb_button_acknowledged() 调 btn_enter_flash(OK, 3)",
+          "退回「只回橙色呼吸」⇒ 老人按满 3 秒却看不到任何回执")
+    check("BTN_ATTRACT" not in ack,
+          "acknowledged() 不再自己切 BTN_ATTRACT（迁移交给 btn_enter_flash）",
+          "又写回 BTN_ATTRACT ⇒ 与 confirmed() 不一致，追问路径不闪结果色")
+
+    # 5.4 灯珠宏防回归：CHAIN != LEDS 是本项目硬约束。
+    #     后 11 颗必须每帧写 0，否则它们停在开机随机态常亮（2026-10-27 实报）。
+    b = strip_comments(BOARD_H.read_text(encoding="utf-8"))
+    for name, want in (("ELDER_RGB_LEDS", "9"), ("ELDER_RGB_CHAIN", "20")):
+        got = _define_value(b, name)
+        check(got == want, f"{name} 仍是 {want}",
+              f"实际 {got or '缺失'} —— 改了它后 11 颗会停在开机随机态常亮")
+
+
 def main() -> int:
     t1_clip_ids()
     t2_long_press_wiring()
     t3_subtitle_accumulate()
     t4_reminder_list()
+    t5_button_led()
 
     passed = sum(1 for ok, _, _ in results if ok)
     failed = len(results) - passed
