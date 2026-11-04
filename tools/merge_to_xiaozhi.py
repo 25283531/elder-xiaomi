@@ -194,32 +194,43 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/16m.csv"
 # 离线命令词（elder_cmd/elder_mn/custom_wake_word）已删除，NVS 离线提醒
 # 引擎（reminder.c 到点播报）保留。
 #
-# --- 降噪：只用算法（WebRTC NS），不加载任何模型（2026-11-04）---
+# --- 降噪：关闭（2026-11-04 最终结论，别再动）---
 #
-# 事实链（每一环都有真机证据，别再重走）：
+# 事实链，每一环都有真机证据：
 #
-# 1. 10-31 选了 SR_NSN_NSNET2，理由"模型进 model 列表 ⇒ ns_init=true"。
-#    不成立：本机分区表（partitions/v2/16m.csv）只有
-#    nvs/otadata/phy_init/ota_0/ota_1/assets，**没有 `model` 分区** ⇒
-#    `esp_srmodel_init("model")` 拿到空列表 ⇒ `esp_srmodel_filter` 恒为
-#    nullptr ⇒ 那条分支永远走不到。这两个星期**一帧降噪都没做**。
+# 1. 10-31 选了 SR_NSN_NSNET2，以为"模型进 model 列表就能开降噪"。不成立：
+#    本机分区表（partitions/v2/16m.csv）只有 nvs/otadata/phy_init/ota_0/
+#    ota_1/assets，**没有 `model` 分区** ⇒ esp_srmodel_init("model") 拿到空
+#    列表 ⇒ esp_srmodel_filter 恒为 nullptr ⇒ 那条分支永远走不到。
 #
-# 2. 11-04 上午改选 SR_NSN_WEBRTC，并在代码里把 ns_model_name 写成伪模型名
-#    "WEBRTC"（照着 esp_afe_config.h 里那句 `please use model name of NS,
-#    SSP: "WEBRTC"` 抄的）⇒ **唤醒后设备必重启**（用户连试三次三次重启，
-#    Guru Meditation: LoadProhibited）。根因不是"没有 model 分区就不能开
-#    降噪"，而是 **ns_model_name 必须为 nullptr**：AFE 看到它非空就去
-#    libnsnet.a 的 esp_nsnet_handle_from_name() 按"模型名"加载，空模型列表里
-#    解析 "WEBRTC" ⇒ 空指针解引用 ⇒ create_from_config 不返回。
+# 2. 11-04 上午改成"算法降噪"：ns_init=true + AFE_NS_MODE_WEBRTC +
+#    ns_model_name="WEBRTC"（照 esp_afe_config.h 那句注释抄的）
+#    ⇒ **唤醒后设备必重启**（连试三次三次重启，LoadProhibited）。
 #
-# ⇒ 现在代码里是 ns_init=true + AFE_NS_MODE_WEBRTC + ns_model_name=nullptr，
-#   NSNet2 相关代码（esp_srmodel_filter / AFE_NS_MODE_NET）已全部删除。
-#   这里跟着选 SR_NSN_WEBRTC，与代码语义一致（代码已不再 #ifdef 这个符号，
-#   但它代表"降噪走哪条算法"，写错会让下一个读代码的人误解）。
+# 3. 11-04 上午再改成 ns_model_name=nullptr，以为"算法降噪不挂模型名就行"
+#    ⇒ **仍然唤醒就重启**。用 xiaozhi.map 解 backtrace，崩点还在
+#    esp_afe_handle_from_config 里面，第二条 AFE 管线从未建起来。
 #
-# ⚠️ 判据只能看开机日志里**第二条** AFE 管线（特征是有 `AEC(VOIP_HIGH_PERF)`），
-#    它必须打出 `|NS(WebRTC)|` 和 `|AGC(WebRTC)|`。第一条是 WakeNet 自己建的，
-#    与这里的配置无关 —— 只看第一条会得出"降噪/AGC 没生效"的错误结论（踩过）。
+# ⇒ 真正的根因（查库得到，不是猜）：**这份预编译 esp-sr 里没有 WebRTC 降噪
+#   实现**。全组件只有一个 libnsnet.a、一个入口 esp_nsnet_handle_from_name，
+#   WebRtcNs_Create / WebRtcNsx_Process / NsHandle 这类符号在 libnsnet.a 与
+#   libesp_audio_front_end.a 里都不存在。所以 ns_init=true 只能走 NSNet2，
+#   而 NSNet2 要 model 分区 ⇒ 拿不到句柄 ⇒ 崩。**跟模型名怎么写无关。**
+#
+# ⇒ Kconfig 这个 choice 是**惰性的**：CMakeLists.txt 无条件只链一个
+#   libnsnet.a，选 WEBRTC 还是 NSNET2 产物完全一样。这里保留组件默认值
+#   （WEBRTC），但**不要**因为看到它就以为降噪是开的 —— 代码里是
+#   ns_init=false，开机管线上不会有 |NS(...)|。
+#
+# ⇒ 要在本机真开降噪，前提是给固件加 model 分区（红线 C14，要动分区表），
+#   不是改配置能解决的。而且降噪未必划算：esp-sr 自己写着
+#   "Noise Supression may reduce the accuracy of speech recognition.
+#    It is not recommended to turn it on."；实测 SNR ≈ 37 dB，本机的病是
+#   **电平偏低**（峰值 -29 dBFS），那是 AGC 的事，不是降噪的事。
+#
+# ⚠️ 验证 AGC 只能看开机日志里**第二条** AFE 管线（特征是有
+#    `AEC(VOIP_HIGH_PERF)`），它必须打出 `|AGC(WebRTC)|`。第一条是 WakeNet
+#    自己建的，与这里无关 —— 只看第一条会得出"没生效"的错误结论（踩过）。
 CONFIG_SR_NSN_WEBRTC=y
 # 业务后端地址（2026-10-18 起 IP 直连：域名未备案被厂商按 SNI 阻断，
 # 连 IP 不带 SNI 可绕过；服务端配 IP 证书后可开证书校验，见 Kconfig 帮助）

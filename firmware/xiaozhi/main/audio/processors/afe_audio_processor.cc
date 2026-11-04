@@ -45,47 +45,49 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
     }
 
     /* ══════════════════════════════════════════════════════════════════════
-     * 降噪：只用算法（WebRTC NS）。NSNet2 / 模型相关的代码已全部删除。
+     * 降噪：**关闭**。NSNet2 相关代码已删除；算法降噪在本机也不可用。
      * ══════════════════════════════════════════════════════════════════════
-     * 2026-11-04 定调：把 NSNet2 相关代码删掉，只用算法降噪。
+     * 2026-11-04 的定调是「删掉 NSNet2，只用算法降噪」。查完库之后的结论是：
+     * 算法降噪在这份 esp-sr 预编译库里**根本不存在**，所以降噪只能整体关掉。
+     * 证据不是猜的：
      *
-     * 为什么是"删"而不是"留着当备选"：NSNet2 在本机**永远不可能生效**。
-     * 分区表 partitions/v2/16m.csv 只有 nvs / otadata / phy_init / ota_0 /
-     * ota_1 / assets，**没有 model 分区** ⇒ esp_srmodel_init("model") 拿到
-     * 空列表 ⇒ esp_srmodel_filter(models, ESP_NSNET_PREFIX, NULL) 恒为
-     * nullptr。10-31 到 11-04 这两个星期里"降噪"一帧都没做、而构建与 CI
-     * 全绿，就是这条走不到的死分支造成的。留着它只会让人以为"支持 NSNet2"。
+     * 1) 整个 esp-sr 只有一个降噪库 libnsnet.a，里面只有一个入口
+     *    `esp_nsnet_handle_from_name`，**没有任何 WebRTC 降噪实现** ——
+     *    `WebRtcNs_Create` / `WebRtcNsx_Process` / `NsHandle` 这类符号在
+     *    libnsnet.a 与 libesp_audio_front_end.a 里都不存在。
+     *    Kconfig 里 SR_NSN_WEBRTC / SR_NSN_NSNET2 那个 choice 是**惰性的**：
+     *    CMakeLists.txt 无条件只链一个 libnsnet.a，选哪个都改变不了产物。
+     *    头文件里 `AFE_NS_MODE_WEBRTC // please use model name of NS, SSP:
+     *    "WEBRTC"` 那句是给「从源码编译 esp-sr」的人看的，不适用于预编译库。
      *
-     * WebRTC NS 是纯算法（webrtc_create / webrtc_process），不读任何模型
-     * 数据，与 model 分区无关。三件事必须同时成立：
-     *   1) ns_init       = true
-     *   2) afe_ns_mode   = AFE_NS_MODE_WEBRTC
-     *   3) ns_model_name = nullptr        ← **不是** "WEBRTC"
+     * 2) 所以 ns_init=true 时 AFE 只能走 NSNet2 那条路，而本机分区表
+     *    （partitions/v2/16m.csv）**没有 model 分区** ⇒ 模型列表为空 ⇒
+     *    句柄创建拿不到东西 ⇒ 解引用崩溃。两次实测都崩：
+     *      · ns_model_name = "WEBRTC" → 唤醒必重启（用户连试三次三次重启）
+     *      · ns_model_name = nullptr  → 唤醒仍重启（2026-11-04 第二次实测）
+     *    两次都是 `复位原因=PANIC`（Guru Meditation: LoadProhibited,
+     *    EXCVADDR=0 —— 空指针），且开机日志里**第二条** AFE 管线从未出现，
+     *    说明死在 create_from_config 里面。用 xiaozhi.map 解出的崩溃链：
+     *      0x4205d86a  esp_afe_handle_from_config +0x1f92
+     *      0x4205dc65  esp_afe_handle_from_config +0x238d
+     *      0x42025f46  AfeAudioProcessor::Initialize +0xe6
+     *      0x4200a59e  AudioService::EnableVoiceProcessing +0x22
+     *      0x420188ee  Application::SetDeviceState +0x192
+     *      ...         Application::OnWakeWordDetected ← MainEventLoop
+     *    ⇒ **只要 ns_init=true 就崩，跟模型名怎么写无关**。
      *
-     * ⚠️⚠️ 第 3 条是 2026-11-04 那次「唤醒后设备必重启」的根因（用户连试
-     * 三次三次重启，Guru Meditation: LoadProhibited，EXCVADDR=0）。
-     * esp_afe_config.h 里那句
-     *     AFE_NS_MODE_WEBRTC = 0, // please use model name of NS, SSP: "WEBRTC"
-     * 误导了我，我照着写 ns_model_name = "WEBRTC" —— 而 AFE 只要看到
-     * ns_model_name 非空，就会走 libnsnet.a 的 esp_nsnet_handle_from_name()
-     * 按"模型名"去加载，在空模型列表里解析 "WEBRTC" ⇒ 空指针解引用。
+     * 3) 而且降噪对本机没有价值：esp-sr 自己在库里就写着
+     *    "Noise Supression may reduce the accuracy of speech recognition.
+     *     It is not recommended to turn it on."
+     *    生产留证 wav（asr_empty_20261104-004208）实测 SNR ≈ 37 dB
+     *    （底噪 0.0003、语音峰值 0.036）：噪声从来不是问题，**电平才是**
+     *    （峰值只有 -29 dBFS）。降噪要治的病这里根本没有，治错了反而伤 ASR。
      *
-     * 崩溃点是**用 map 解析 backtrace 得到的，不是猜的**（2026-11-04 补测）：
-     *   0x4205d86a  esp_afe_handle_from_config +0x1f92
-     *   0x4205dc65  esp_afe_handle_from_config +0x238d
-     *   0x42025f46  AfeAudioProcessor::Initialize +0xe6
-     *   0x4200a59e  AudioService::EnableVoiceProcessing +0x22
-     *   0x420188ee  Application::SetDeviceState +0x192
-     *   ...         Application::OnWakeWordDetected ← MainEventLoop
-     * 也就是说：唤醒 → 建 AFE → 死在 esp_afe_handle_from_config 里面，
-     * 所以开机日志里**第二条** AFE 管线从来没出现过。
-     *
-     * WebRTC 是算法、不挂模型名，所以这里必须是 nullptr。
+     * ⇒ 真要在本机开降噪，前提是给固件加一个 model 分区（红线 C14，要动
+     *   分区表），不是改两行配置能解决的。在那之前这里必须是 false，并且
+     *   **不许留任何"填个模型名就能用"的写法** —— 那两次崩溃就是这么来的。
      */
-    afe_config->ns_init = true;
-    afe_config->afe_ns_mode = AFE_NS_MODE_WEBRTC;
-    afe_config->ns_model_name = nullptr;
-
+    afe_config->ns_init = false;
     /* ══════════════════════════════════════════════════════════════════════
      * AGC：上行（ASR 听到的那一路）自动增益
      * ══════════════════════════════════════════════════════════════════════
@@ -116,7 +118,8 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
      * "声音已正常、不许再修出破音/卡顿"的硬约束。
      *
      * ⚠️ 验证方法：开机日志里**第二条** AFE 管线（本文件创建的那条，特征是
-     * 有 `AEC(VOIP_HIGH_PERF)`）必须出现 `|NS(WebRTC)|` 和 `|AGC(WebRTC)|`。
+     * 有 `AEC(VOIP_HIGH_PERF)`）必须出现 `|AGC(WebRTC)|`（降噪是关的，
+     * 管线上**不会**有 `|NS(...)|`，别把它当成"没生效"）。
      * 只 grep 第一条（WakeNet 那条）会得出"没生效"的错误结论 —— 踩过。
      */
     afe_config->agc_init = true;

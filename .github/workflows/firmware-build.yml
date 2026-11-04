@@ -40,6 +40,9 @@ on:
       # afe_audio_processor.cc 与 sdkconfig.defaults，但"改断言本身"不碰
       # firmware/，不列进来就会「改了断言却没人跑」。
       - 'tools/smoke_afe_agc_ns.py'
+      # 库能力校验（2026-11-04，跑在 build 之后）：读 .a 的符号表，
+      # 证明「降噪只有 NSNet2 模型、AGC 真有实现」。改这个断言本身也要跑。
+      - 'tools/smoke_esp_sr_ns_libs.py'
       - '.github/workflows/firmware-build.yml'
   workflow_dispatch:
     inputs:
@@ -437,6 +440,14 @@ jobs:
           idf.py build 2>&1 | tee build/ci-build.log | tail -120
           echo "=== 产物 ==="
           ls -lh build/*.bin build/bootloader/*.bin build/partition_table/*.bin 2>/dev/null || true
+
+      # ⚠️ 2026-11-04 两次「唤醒即重启」的教训：静态门禁跑在 build **之前**，
+      #    那时 managed_components/ 还没拉下来（而且它是 .gitignore 的），
+      #    拿不到 .a 就只能靠注释断言"库里没有算法降噪"。注释不是判据。
+      #    这一步在 build 之后直接读符号表：降噪只有 NSNet2 模型、没有
+      #    ns_create/ns_pro_create，而 AGC 有 esp_agc —— 让产物自己作证。
+      - name: esp-sr 库能力校验（降噪不可用 / AGC 有实现）
+        run: python3 tools/smoke_esp_sr_ns_libs.py
 
       # ⚠️ 2026-10-23 假绿事故：DS1302 时钟 + WS2812 彩灯的配置写进了
       # `firmware/xiaozhi/sdkconfig.defaults`，但那个文件的 elder 段每次都被

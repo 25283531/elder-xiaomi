@@ -1,10 +1,10 @@
-"""守 AGC 与降噪**真的按设计接线**（静态接线 + 配置一致性）。
+"""守 AGC 与降噪**真的按设计接线**（静态接线 + 配置一致性 + 库能力前提）。
 
 为什么需要这个脚本 —— 这两件事都出过"配了但什么都没发生"或"配了直接把机器搞挂"，
 而且两次都**构建全绿、CI 全绿**：
 
-1. **降噪 = 纯算法（WebRTC NS），不加载任何模型。**
-   这里踩过两个坑，一个比一个贵：
+1. **降噪 = 关闭**（不是"打开"，这是结论不是偷懒）。
+   踩过三个坑，一个比一个贵：
 
    a) 10-31 选了 `CONFIG_SR_NSN_NSNET2`，理由是"模型进 model 列表 ⇒
       ns_init=true"。可本机分区表（`partitions/v2/16m.csv`）**没有 `model`
@@ -16,18 +16,29 @@
    b) 11-04 上午想把 (a) 修好，照着 `esp_afe_config.h` 里那句
       `AFE_NS_MODE_WEBRTC = 0, // please use model name of NS, SSP: "WEBRTC"`
       写了 `ns_model_name = "WEBRTC"` —— **唤醒后设备必重启**（用户连试三次
-      三次重启，Guru Meditation: LoadProhibited）。根因：AFE 只要看到
-      ns_model_name 非空就按"模型名"去 libnsnet.a 里加载，空模型列表里解析
-      "WEBRTC" ⇒ 空指针解引用 ⇒ create_from_config 不返回。
+      三次重启，Guru Meditation: LoadProhibited）。
 
-   ⇒ 现在 NSNet2 相关代码**全部删除**，只用算法降噪，且 `ns_model_name`
-   必须是 `nullptr`。本脚本把这三件事同时钉死（第 2 组），因为少任何一件
-   要么降噪静默失效、要么设备唤醒即重启。
+   c) 11-04 上午再改成 `ns_model_name = nullptr`（以为"算法降噪不挂模型名
+      就行"）—— **仍然唤醒就重启**。用 CI 产出的 `xiaozhi.map` 解 backtrace，
+      崩点还在 `esp_afe_handle_from_config` 里面，第二条 AFE 管线从未建起来。
+
+   ⇒ 真正的根因（查预编译库得到，不是猜）：**这份 esp-sr 里没有算法降噪**。
+      `libnsnet.a` 只有 `esp_nsnet1_quantized` / `esp_nsnet2_quantized` 两个
+      模型，`esp_nsn_models` 这张表里没有 "WEBRTC" 这一项；
+      `esp_ns.h` 声明的 `ns_create` / `ns_pro_create` / `ns_process` 在
+      libnsnet.a 与 libesp_audio_front_end.a 里**都没有符号**（真调用会链接
+      失败）。所以 `ns_init=true` 只能走 NSNet2，而 NSNet2 要 model 分区 ⇒
+      拿到空句柄 ⇒ 解引用崩溃。**跟模型名怎么写无关。**
+
+   本脚本因此把 `ns_init = false` 钉死（第 2 组）。第 4 组再让**构建产物**
+   自己证明"库里确实没有算法降噪"—— 判据落在 .a 的符号上，不是落在注释上。
 
 2. **AGC**：从 10-15 第一个提交起就是 `agc_init = false`。现场实测上行峰值
    只有 -29 dBFS（正常 -6~-12），老人说「你刚才没有说内容吗？」被识别成
    「你刚才没有说。」—— 轻声的句尾整段丢失。这一条没有任何编译期约束，
-   改回 false 也不会报错，只能靠断言守。
+   改回 false 也不会报错，只能靠断言守。AGC 在库里是真有实现的
+   （`esp_agc` / `enable_agc` / `disable_agc` / `|AGC(WebRTC)|`），所以它是
+   本机能真正落地的那个修法。
 
 断言纪律（本仓踩过的坑）：
   * **先剥注释再匹配代码位**，否则解释这件事的注释自己会把断言踩红；
@@ -49,6 +60,7 @@ MERGE = ROOT / "tools" / "merge_to_xiaozhi.py"
 PARTS = ROOT / "firmware" / "xiaozhi" / "partitions" / "v2" / "16m.csv"
 SYNTAX = ROOT / "tools" / "syntax_check_elder.py"
 WF = ROOT / ".github" / "workflows" / "firmware-build.yml"
+LIB_CHECK = ROOT / "tools" / "smoke_esp_sr_ns_libs.py"
 
 results: list[tuple[bool, str, str]] = []
 
@@ -61,7 +73,7 @@ def check(ok: bool, name: str, detail: str = "") -> None:
 def strip_cpp_comments(src: str) -> str:
     """去掉 // 与 /* */ 注释，保留字符串字面量。
 
-    不剥注释的后果（真踩过）：解释"为什么不能写 agc_init = false"的那段
+    不剥注释的后果（真踩过）：解释"为什么不能写 ns_init = true"的那段
     注释里就有这串字，负向断言会自己踩红，而且看起来像是代码真的错了。
     """
     out: list[str] = []
@@ -109,6 +121,16 @@ def init_body(src: str) -> str:
             if depth == 0:
                 return src[start:i + 1]
     return src[start:]
+
+
+def comment_block_before(src: str, anchor: str) -> str:
+    """取紧贴 anchor 之前的那段 /* */ 注释（不含别处的同名串）。"""
+    idx = src.find(anchor)
+    if idx <= 0:
+        return ""
+    b0 = src.rfind("/*", 0, idx)
+    b1 = src.rfind("*/", 0, idx)
+    return src[b0:idx] if b0 >= 0 and b1 > b0 else ""
 
 
 def partition_names() -> list[str]:
@@ -183,16 +205,7 @@ def t_agc() -> None:
 
     # 验证方法必须写在源码里：这台机器上**有两条** AFE 管线，只有第二条是我们的。
     # 只 grep 第一条（WakeNet 自己建的那条）会得出"AGC 没生效"的错误结论 —— 真踩过。
-    #
-    # ⚠️ 判据要限定在「紧贴 agc_init 的那段注释」里：`AEC(VOIP_HIGH_PERF)` 这个串
-    # 在上面的降噪注释里也出现过，整文件子串判据会被它蒙过去（变异验证抓到过）。
-    idx = raw.find("afe_config->agc_init")
-    blk = ""
-    if idx > 0:
-        b0 = raw.rfind("/*", 0, idx)
-        b1 = raw.rfind("*/", 0, idx)
-        if b0 >= 0 and b1 > b0:
-            blk = raw[b0:idx]
+    blk = comment_block_before(raw, "afe_config->agc_init")
     check("第二条" in blk and "|AGC(WebRTC)|" in blk,
           "紧贴 agc_init 的注释里写了「看第二条管线 + 找 |AGC(WebRTC)|」",
           "不写下来，下一个人还会去 grep 第一条 WakeNet 管线然后误判没生效")
@@ -200,7 +213,7 @@ def t_agc() -> None:
 
 # ================================================================ 2. 降噪
 def t_ns() -> None:
-    print("\n── 2. 降噪：只用算法（WebRTC NS），不许再有任何模型相关代码 ──")
+    print("\n── 2. 降噪：必须关着（本机没有算法降噪，NSNet2 也没有 model 分区）──")
 
     # 前提：分区表里没有 model 分区。这一条是"为什么不能用 NSNet2"的根。
     parts = partition_names()
@@ -216,88 +229,80 @@ def t_ns() -> None:
         check(False, "能定位到 Initialize() 函数体（降噪判据的前提）")
         return
 
-    # 2a. NSNet2 相关代码必须彻底消失（用户 2026-11-04 明确要求"删除"）。
-    check("ESP_NSNET_PREFIX" not in body,
-          "Initialize() 里不再有 esp_srmodel_filter(..., ESP_NSNET_PREFIX, ...)（负向）",
-          "留着它就是在空模型列表里找 NSNet2，永远拿到 nullptr —— 走不到的死分支")
-    check("AFE_NS_MODE_NET" not in body,
-          "Initialize() 里不再有 AFE_NS_MODE_NET 分支（负向）",
-          "神经网络降噪需要 model 分区，本机没有")
-    check("afe_config->ns_model_name = ns_" not in body,
-          "不再把 filter 结果赋给 ns_model_name（负向）",
-          "那正是「没有模型」那条死分支的写法")
+    # 2a. 降噪必须显式关闭，而且不许有任何"填个名字就能开"的写法。
+    check("ns_init = false" in body, "Initialize() 里 ns_init = false",
+          "true ⇒ 唤醒必重启（两次实测：模型名写 \"WEBRTC\" 崩，写 nullptr 也崩）")
+    check("ns_init = true" not in body, "ns_init 不许是 true（负向）",
+          "只要 ns_init=true 就崩，跟模型名怎么写无关 —— 别再一次一次试")
+    for bad, why in (
+        ("ESP_NSNET_PREFIX", "在空模型列表里找 NSNet2，永远 nullptr，且会把 NS 打开"),
+        ("AFE_NS_MODE_NET", "神经网络降噪需要 model 分区，本机没有"),
+        ("AFE_NS_MODE_WEBRTC", "本机库里没有算法降噪实现，写它只会把 NS 打开然后崩"),
+        ("ns_model_name", "ns_model_name 只服务于 NS；NS 关掉后它不该出现"),
+    ):
+        check(bad not in body, f"Initialize() 里不再出现 {bad}（负向）", why)
 
-    # 2b. WebRTC NS 三件事，缺一不可。
-    check("ns_init = true" in body, "Initialize() 里 ns_init = true",
-          "关着 ⇒ 降噪一帧都不做（10-31~11-04 两个星期就是这么过的）")
-    check("ns_init = false" not in body, "ns_init 不许是 false（负向）",
-          "回到 false 就是「降噪静默失效」的那个状态")
-    check("AFE_NS_MODE_WEBRTC" in body, "afe_ns_mode = AFE_NS_MODE_WEBRTC",
-          "WebRTC NS 是纯算法，不读模型数据，与 model 分区无关")
-
-    # 2c. 事故根因：ns_model_name 必须是 nullptr。
-    check("ns_model_name = nullptr" in body,
-          "ns_model_name = nullptr（**不是** \"WEBRTC\"）",
-          "非空 ⇒ AFE 按模型名去 libnsnet.a 加载 ⇒ 空列表里解析 ⇒ 空指针 ⇒ 唤醒即重启")
-    check('"WEBRTC"' not in body,
-          'Initialize() 里不许出现 "WEBRTC" 这个伪模型名（负向）',
-          '2026-11-04 事故原样：ns_model_name = "WEBRTC" ⇒ 三次唤醒三次重启')
-    check("afe_config->ns_model_name = nullptr" in body,
-          "显式写 nullptr（不是留空不管）",
-          "不显式写就吃 afe_config_init 的默认值，等于没人负责")
-
-    # 2d. 事故记录必须在（防止有人把注释删了、然后"重新发现"这个想法）。
+    # 2b. 事故记录必须在（防止有人把注释删了、然后"重新发现"这个想法）。
     # ⚠️ 判据要限定在**紧贴 ns_init 的那段注释**里：
     #    * `2026-11-04` 在文件头的"定调"那句话里也有；
     #    * `create_from_config` 在本函数的代码里也有（`afe_data_ = ...`），
     #      整文件判据会被它蒙过去（变异验证两次都抓到了这种假绿）。
-    idx = raw.find("afe_config->ns_init = true;")
-    ns_blk = ""
-    if idx > 0:
-        b0 = raw.rfind("/*", 0, idx)
-        b1 = raw.rfind("*/", 0, idx)
-        if b0 >= 0 and b1 > b0:
-            ns_blk = raw[b0:idx]
-    check(bool(ns_blk), "能定位到紧贴 ns_init 的那段注释", "注释被挪走，下面三条判据失效")
-    check("Guru Meditation" in ns_blk and "LoadProhibited" in ns_blk,
-          "注释里记着崩溃类型（Guru Meditation / LoadProhibited）",
+    ns_blk = comment_block_before(raw, "afe_config->ns_init = false;")
+    check(bool(ns_blk), "能定位到紧贴 ns_init 的那段注释", "注释被挪走，下面几条判据失效")
+    check("LoadProhibited" in ns_blk and "PANIC" in ns_blk,
+          "注释里记着崩溃类型（LoadProhibited / 复位原因=PANIC）",
           "删掉记录 ⇒ 下一个人会照着同一个头文件注释再写一次 \"WEBRTC\"")
     # 崩溃调用链必须完整记下来：这些符号名和地址是**用 CI 产出的 xiaozhi.map
     # 解析 backtrace 得到的**，删掉就只能靠猜（这次就猜错过一次）。
-    # ⚠️ 第一帧要判「函数名 + 偏移」而不是光判函数名：正文里也写着
-    # "死在 esp_afe_handle_from_config 里面"，只判函数名会被正文蒙过去
-    # （变异验证抓到的）。
-    frames = ["esp_afe_handle_from_config +0x", "AfeAudioProcessor::Initialize",
-              "AudioService::EnableVoiceProcessing", "Application::SetDeviceState",
-              "OnWakeWordDetected"]
+    # ⚠️ 每一帧都要判「函数名 + 偏移」，不能只判函数名：
+    #    * 正文里也写着 "死在 esp_afe_handle_from_config 里面"，只判函数名会被
+    #      正文蒙过去；
+    #    * 只给第一帧判 `+0x`、其余只判函数名时，把偏移删掉照样绿
+    #      （变异 M6 抓到的）。
+    frames = ["esp_afe_handle_from_config +0x", "AfeAudioProcessor::Initialize +0x",
+              "AudioService::EnableVoiceProcessing +0x",
+              "Application::SetDeviceState +0x", "OnWakeWordDetected"]
     missing = [f for f in frames if f not in ns_blk]
     check(not missing,
           "注释里记着完整的崩溃调用链（5 帧，含符号名与偏移）",
           f"缺：{missing} —— 只写「崩了」不写崩在哪，等于没记")
-    check("ns_model_name 非空" in ns_blk,
-          "注释里写清了根因（ns_model_name 非空 ⇒ 按模型名加载）",
-          "不写根因 ⇒ 下次还是不知道为什么不能填 \"WEBRTC\"")
+    # 根因必须写成"库里根本没有算法降噪 + NSNet2 要 model 分区"，不能写成
+    # "模型名不能填 WEBRTC" —— 后者是错的（填 nullptr 也崩），会误导下一个人。
+    # ⚠️ 判「根本不存在」这句强断言：只判"WebRTC 降噪"这类词，把强断言弱化成
+    #    "降噪在本机不太好使" 也照样绿（变异 M8 抓到的）。
+    check("根本不存在" in ns_blk and "model 分区" in ns_blk,
+          "注释里写清了真根因（库里根本没有算法降噪 + NSNet2 要 model 分区）",
+          "根因写错成「模型名不能填 WEBRTC」⇒ 下一个人改填 nullptr 再崩一次（真发生过）")
+    check("esp_nsnet_handle_from_name" in ns_blk,
+          "注释里点名了唯一的降噪入口（esp_nsnet_handle_from_name）",
+          "不点名就没法自查「库里到底有没有算法降噪」")
 
-    # 2e. 配置：模板与生成物必须一致（sdkconfig.defaults 是生成文件，手改会被覆盖）
+    # 2c. 配置：模板与生成物必须一致（sdkconfig.defaults 是生成文件，手改会被覆盖）
     sdk_val = ns_choice(SDK)
     tpl_val = ns_choice(MERGE)
     print(f"  sdkconfig.defaults: CONFIG_SR_NSN_{sdk_val or '?'}   "
           f"merge 模板: CONFIG_SR_NSN_{tpl_val or '?'}")
     check(tpl_val == "WEBRTC",
-          f"模板选的是 WEBRTC（实际 {tpl_val or '未选'}）",
-          "代码只走算法降噪，配置跟着选 WEBRTC；选 NSNET2 会让读代码的人以为支持模型降噪")
+          f"模板保留组件默认的 WEBRTC（实际 {tpl_val or '未选'}）",
+          "这个 choice 是惰性的（只链一个 libnsnet.a），但选 NSNET2 会让读代码的人以为支持模型降噪")
     check(sdk_val == tpl_val,
           "生成物与模板的 SR_NSN 选择一致",
           "不一致 ⇒ 生成文件被手改过，下次 merge 会把它改回去（MEMORY 第 6 条）")
+    tpl_txt = MERGE.read_text(encoding="utf-8")
+    check("惰性" in tpl_txt and "SR_NSN" in tpl_txt,
+          "模板注释里写明「这个 choice 是惰性的」",
+          "不写 ⇒ 下一个人会以为「换成 WEBRTC 就有算法降噪了」，然后唤醒即重启")
 
 
 # ================================================================ 3. 门禁
 def t_gate() -> None:
-    print("\n── 3. 这个文件本身必须被检查、且被 CI 跑 ──")
+    print("\n── 3. 这两个脚本本身必须被检查、且被 CI 跑 ──")
     syn = SYNTAX.read_text(encoding="utf-8")
     check("afe_audio_processor.cc" in syn,
           "syntax_check_elder.py 覆盖了 afe_audio_processor.cc",
           "它编译失败 = 整机起不来（AFE 创建不出来就没有音频任务）")
+    check(LIB_CHECK.exists(), f"{LIB_CHECK.name} 存在（构建后校验库能力）",
+          "没有它 ⇒ 「库里到底有没有算法降噪」只能靠注释说，等于没判据")
     wf = WF.read_text(encoding="utf-8")
     # ⚠️ 不能只判"文件里出现过这个脚本名" —— `on.push.paths` 过滤器里也有一份，
     # 有人把 run 步骤删了、只留过滤器，子串判据照样绿（这就是"写了不跑"的坑）。
@@ -307,6 +312,9 @@ def t_gate() -> None:
           "firmware-build.yml 里有 `run: ... smoke_afe_agc_ns.py` 这一步",
           "写了不跑 = 没门禁，而且不报错（MEMORY 第 1 条）；"
           "只留在 paths 过滤器里不算跑")
+    check(any("smoke_esp_sr_ns_libs.py" in l for l in run_lines),
+          "firmware-build.yml 里有 `run: ... smoke_esp_sr_ns_libs.py` 这一步",
+          "库能力校验必须真跑，而且必须在 idf.py build **之后**（那时 .a 才在）")
 
 
 def main() -> int:
