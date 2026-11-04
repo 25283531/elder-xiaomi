@@ -20,8 +20,11 @@
   id」来反向验证，防止以后有人把 id 改成 uuid。
 * 超时和「设备答 false」**必须区分**：前者要让老人改按按键，后者是正常业务
   结果（老人顺口说「吃过了」而已）。混成一个会让 LLM 对老人说「失败了」。
-* 只改数据库不算确认：``_confirm_reminder`` 全程不碰 db（参数留着但没用），
-  状态以设备回执为准。这条靠代码结构保证，这里用 ``db=None`` 反证。
+* 只改数据库不算确认：状态以设备回执为准，``_confirm_reminder`` 不会因为自己
+  写了一次库就宣布成功。第 [8] 组反向守住这一点 —— 库里"刚刚确认过"的记录
+  只能用来**回答"是不是已经办完了"**，不能用来替代一次真正的设备确认。
+  这也是为什么回看窗口必须短（<= 15 分钟）：窗口一长，它就会把"老人其实
+  还没吃药"静默吞掉，那比多问一句危险得多。
 
 跑法
 ----
@@ -334,6 +337,159 @@ def _text_reply(text: str, is_error: bool = False) -> dict:
                        "isError": is_error}}
 
 
+def t_recent_confirm() -> None:
+    """「刚刚已经确认过」的回查 —— 2026-11-04 用户实报「按键按了不能确认」的根因防线。
+
+    现场（生产日志逐行核对）：
+      09:14:07 老人说「确认。」，待确认清单里有那条
+      09:14:08 大模型开始生成，首字卡了 **65.4 秒**
+      09:15:12 这 65 秒里老人自己长按了按键，设备把那条写成 CONFIRMED
+      09:15:13 服务端才执行工具，清单空了 ⇒ 退回设备旧路径
+      09:15:16 设备正忙着同步 POST 回执 ⇒ 超时
+      09:15:18 模型说「您按一下设备上的按键」—— 他 6 秒前刚按完
+
+    所以这里钉两件事：
+      1. 清单为空但 15 分钟内有确认 ⇒ 直接回「已经记上了」，**不调设备**；
+      2. 设备超时但 15 分钟内有确认 ⇒ 按成功处理，**不让老人重按**。
+    两个都必须有负向对照（40 分钟前的旧确认不许被当成"刚刚"），
+    否则"回查"会变成把所有失败都吞掉。
+    """
+    print("\n[8] 清单为空 / 设备超时 ⇒ 回查「刚刚确认过」，不让老人重按")
+    from datetime import timedelta
+
+    from app import models
+    from app.db import SessionLocal, init_db
+    from app.schedule import local_now
+    from app.voice.tools import (_RECENT_CONFIRM_MIN, _confirm_reminder,
+                                 _recently_confirmed_medicine)
+
+    init_db()
+    db = SessionLocal()
+    try:
+        # 干净起点：这个测试库是本进程独占的临时文件，清掉上次运行的行。
+        db.query(models.ReminderEvent).delete()
+        db.query(models.Reminder).delete()
+        db.query(models.Device).delete()
+        db.commit()
+
+        dev = models.Device(device_id="aabbccdd0011", name="测试设备")
+        db.add(dev)
+        db.commit()
+        pk = int(dev.id)
+
+        rule = models.Reminder(
+            device_id=pk, title="新的服药提醒", rtype=int(models.ReminderType.MEDICINE),
+            require_confirm=True, enabled=True,
+            times_of_day='["09:00"]', weekdays="[]", month_days="[]",
+            medicines="[]", tz="Asia/Shanghai", tz_offset_min=0,
+        )
+        db.add(rule)
+        db.commit()
+
+        def add_event(minutes_ago: int, method: int) -> int:
+            now = local_now()
+            ev = models.ReminderEvent(
+                reminder_id=rule.id, device_id=pk,
+                due_at=now - timedelta(minutes=minutes_ago),
+                fired_at=now - timedelta(minutes=minutes_ago),
+                confirmed_at=now - timedelta(minutes=minutes_ago),
+                state=int(models.EventState.CONFIRMED),
+                confirm_method=method, tz="Asia/Shanghai", tz_offset_min=0,
+            )
+            db.add(ev)
+            db.commit()
+            return int(ev.id)
+
+        # ---- ① 15 分钟内的按键确认：必须被认出来 ----
+        ev_id = add_event(3, int(models.ConfirmMethod.BUTTON))
+        hit = _recently_confirmed_medicine(db, pk)
+        check("3 分钟前的按键确认能被回查到",
+              hit is not None and int(hit[0].id) == ev_id, f"hit={hit!r}")
+        check("回查给出的分钟数是 3",
+              hit is not None and hit[2] == 3, f"mins={hit and hit[2]}")
+
+        # ---- ② 清单为空 + 有近期确认 ⇒ 不调设备，直接说"已经记上了" ----
+        called: list[tuple] = []
+
+        def must_not_call(name, args, timeout):
+            called.append((name, args, timeout))
+            raise AssertionError("不该调设备：刚刚已经确认过了")
+
+        r = _confirm_reminder(db, pk, must_not_call, {"medicine": ""})
+        check("清单为空时不再调设备", called == [], f"called={called}")
+        check("结果标成 already=True", r.get("already") is True, f"{r!r}")
+        check("结果标成 confirmed=True", r.get("confirmed") is True, f"{r!r}")
+        check("话术里说「已经确认」，不再让老人按键",
+              "已经确认" in str(r.get("message", ""))
+              and "按一下设备上的按键" not in str(r.get("message", "")),
+              f"{r.get('message')!r}")
+        check("话术里带上确认方式（按键）",
+              "按键" in str(r.get("message", "")), f"{r.get('message')!r}")
+
+        # ---- ③ 负向对照：40 分钟前的旧确认不许被当成"刚刚" ----
+        db.query(models.ReminderEvent).delete()
+        db.commit()
+        add_event(40, int(models.ConfirmMethod.BUTTON))
+        check("40 分钟前的确认不算「刚刚」",
+              _recently_confirmed_medicine(db, pk) is None)
+
+        # 这条旧确认存在时，清单为空仍要走设备旧路径（不能吞掉真正的确认）
+        called2: list[tuple] = []
+
+        def fake_ok(name, args, timeout):
+            called2.append((name, args, timeout))
+            return {"jsonrpc": "2.0", "id": 1,
+                    "result": {"content": [{"type": "text", "text": "true"}],
+                               "isError": False}}
+
+        r2 = _confirm_reminder(db, pk, fake_ok, {"medicine": ""})
+        check("旧确认不算数时仍然会调设备", len(called2) == 1, f"called={called2}")
+        check("走设备路径时不带 already 标记", not r2.get("already"), f"{r2!r}")
+
+        # ---- ④ 设备超时 + 回执在等待期间落库 ⇒ 按成功处理 ----
+        #
+        # ⚠️ 这里的假设备**必须先写库再超时**，不能只是 raise TimeoutError。
+        # 只 raise 的话，``_confirm_reminder`` 上面那次回查就已经命中并 return 了，
+        # 根本走不到 ``_confirm_device_pending`` 的超时分支 —— 用例看起来是绿的，
+        # 实际一条断言都没覆盖到（2026-11-04 用 M3 变异实测确认过这一点）。
+        # 真实场景也正是这样：设备侧 POST 回执会自己把库改成 CONFIRMED，
+        # 而 tools/call 的回包没赶上（net.c 的同步 POST 实测 3.5 秒）。
+        db.query(models.ReminderEvent).delete()
+        db.commit()
+
+        def timeout_but_receipt_lands(name, args, timeout):
+            add_event(0, int(models.ConfirmMethod.BUTTON))
+            raise TimeoutError("设备 8 秒没回包")
+
+        r3 = _confirm_reminder(db, pk, timeout_but_receipt_lands, {"medicine": ""})
+        check("设备超时但回执已落库 ⇒ ok=True", r3.get("ok") is True, f"{r3!r}")
+        check("设备超时但回执已落库 ⇒ confirmed=True",
+              r3.get("confirmed") is True, f"{r3!r}")
+        check("设备超时但回执已落库 ⇒ 不让老人重按",
+              "按一下设备上的按键" not in str(r3.get("message", "")),
+              f"{r3.get('message')!r}")
+        check("设备超时但回执已落库 ⇒ 带上 already 标记",
+              r3.get("already") is True, f"{r3!r}")
+
+        # ---- ⑤ 负向对照：超时 + 没有近期确认 ⇒ 仍然要说"设备没响应" ----
+        db.query(models.ReminderEvent).delete()
+        db.commit()
+
+        def timeout_call(name, args, timeout):
+            raise TimeoutError("设备 8 秒没回包")
+
+        r4 = _confirm_reminder(db, pk, timeout_call, {"medicine": ""})
+        check("超时且没有近期确认 ⇒ ok=False", r4.get("ok") is False, f"{r4!r}")
+        check("超时且没有近期确认 ⇒ 提示设备没响应",
+              "没有响应" in str(r4.get("message", "")), f"{r4.get('message')!r}")
+
+        # ---- ⑥ 窗口常量必须短：太长会把"真的还没吃药"静默吞掉 ----
+        check("回看窗口 <= 30 分钟（再长就会吞掉真正需要再确认的场景）",
+              0 < _RECENT_CONFIRM_MIN <= 30, f"_RECENT_CONFIRM_MIN={_RECENT_CONFIRM_MIN}")
+    finally:
+        db.close()
+
+
 def t_device_controls() -> None:
     print("\n[7] 音量 / 亮度 / 设备状态：服务端工具 → 设备 MCP 工具")
     from app.voice.tools import TOOL_DEFS, execute_tool
@@ -467,6 +623,7 @@ async def main() -> int:
     t_tool_mapping()
     t_execute_tool_wiring()
     t_device_controls()
+    t_recent_confirm()
 
     print(f"\n=== {_g_pass} 通过 / {_g_fail} 失败 ===")
     if _failures:
