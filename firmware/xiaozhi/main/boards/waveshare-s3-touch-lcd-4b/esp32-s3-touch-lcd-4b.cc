@@ -320,7 +320,11 @@ private:
                 ESP_LOGD(TAG, "Button pressed, start time recorded");
             } else {
                 uint64_t press_duration = (esp_timer_get_time() / 1000) - press_start_time_ms;
-                ESP_LOGI(TAG, "Button released after %llums", press_duration);
+                /* ⚠️ `%lu` + `(unsigned long)` 而不是 `%llu`：本工程开了
+                 * CONFIG_NEWLIB_NANO_FORMAT=y，nano-printf 不支持 %ll*，
+                 * va_arg 会错位（2026-11-04 因此在字幕日志里崩过一次）。
+                 * 按键时长按毫秒算，32 位够用到 49 天，转 unsigned long 无损。 */
+                ESP_LOGI(TAG, "Button released after %lums", (unsigned long)press_duration);
 
                 if (press_duration < 1000) {
                     ESP_LOGI(TAG, "Short press detected, switching to factory partition");

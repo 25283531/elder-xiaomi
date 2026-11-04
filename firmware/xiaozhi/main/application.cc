@@ -225,13 +225,25 @@ void Application::FlushSubtitles(bool force) {
             /* 走到这里只有两种可能：本句没有音频（TTS 失败/丢帧/打断），
              * 或者这一轮被强制收尾。两者都说明「等声音」这条路走不通了，
              * 必须让字先出来 —— 但要在日志里留下证据，否则下次调参时
-             * 又只能靠猜。 */
-            ESP_LOGW(TAG, "subtitle shown without audio: mark=%d played=%d waited=%lldms%s",
-                     p.frame_mark, played, (long long)(waited_us / 1000),
+             * 又只能靠猜。
+             *
+             * ⚠️⚠️ 2026-11-04 真机崩溃：这里原来写的是 `%lld` + `(long long)`，
+             * 本工程开了 CONFIG_NEWLIB_NANO_FORMAT=y，**nano-printf 不支持
+             * `%lld`** ⇒ va_arg 错位 ⇒ 把某个整数当成指针去读 ⇒
+             * LoadProhibited（EXCVADDR=0），崩在 _printf_i 里。
+             * 用 map 解 backtrace 得到的调用链：
+             *   _printf_i ← _vfprintf_r ← vprintf ← esp_log ←
+             *   Application::FlushSubtitles ← MainEventLoop
+             * 触发时刻：一句 TTS 字幕正好上屏（09:22:46）。
+             * 同一个坑 ota.cc:251 早就写过一遍（那里用的是 `%ld`），
+             * 字幕代码是后来加的，又踩回来了 —— 所以现在有静态门禁
+             * `tools/smoke_fw_printf_fmt.py` 兜住。 */
+            ESP_LOGW(TAG, "subtitle shown without audio: mark=%d played=%d waited=%dms%s",
+                     p.frame_mark, played, (int)(waited_us / 1000),
                      force ? " (forced)" : " (timeout)");
         } else {
-            ESP_LOGI(TAG, "subtitle synced: waited=%lldms mark=%d played=%d",
-                     (long long)(waited_us / 1000), p.frame_mark, played);
+            ESP_LOGI(TAG, "subtitle synced: waited=%dms mark=%d played=%d",
+                     (int)(waited_us / 1000), p.frame_mark, played);
         }
         display->SetChatMessage("assistant", p.text.c_str());
         pending_subtitles_.pop_front();
