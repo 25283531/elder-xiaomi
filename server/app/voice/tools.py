@@ -58,7 +58,8 @@ from .. import reminder_audit
 from ..memory.textutil import sanitize_for_prompt
 from ..persona.med_categories import match_medicine
 from ..schedule import (ScheduleKind, clear_pending_events, event_due_utc,
-                        local_now, materialize_events, next_occurrence)
+                        event_instant, local_now, materialize_events,
+                        next_occurrence)
 
 log = logging.getLogger(__name__)
 
@@ -1150,6 +1151,102 @@ def _sole_confirmable_event(db: Any, device_pk: int) -> Any:
     return alive[0] if alive else None
 
 
+#: 「刚刚已经确认过」的回看窗口（分钟）。
+#:
+#: 存在的唯一理由 —— 2026-11-04 09:14/09:15 的现场（生产日志逐行核对过）：
+#:   09:14:07  老人说「确认。」，服务端注入的待确认清单里**有**「新的服药提醒」
+#:   09:14:08  大模型开始生成 —— 然后首字卡了 **65.4 秒**（ttft=65393ms）
+#:   09:15:12  这 65 秒里老人自己长按了按键，设备把那条写成 CONFIRMED
+#:   09:15:13  服务端终于执行 confirm_reminder，待确认清单当然是空的
+#:   09:15:16  退回设备旧路径，设备正忙着同步 POST 回执 ⇒ 超时
+#:   09:15:18  模型照工具失败话术说「您按一下设备上的按键」—— 他刚刚按过
+#: 老人看到的结论是「按键不能确认」，其实**已经确认成功了**。
+#:
+#: 窗口不能长：确认过 20 分钟以上还拿它当"刚刚"，会让真正需要再确认一次
+#: 的场景（老人又没吃药）被静默吞掉。15 分钟足够覆盖一次首字卡顿 + 追问。
+_RECENT_CONFIRM_MIN = 15
+
+
+def _confirm_method_word(method: Any) -> str:
+    """确认方式 → 说给大模型听的中文（它只用来组织话术，不上屏）。"""
+    try:
+        m = int(method or 0)
+    except (TypeError, ValueError):
+        return "未知"
+    return {
+        int(models.ConfirmMethod.VOICE): "语音",
+        int(models.ConfirmMethod.BUTTON): "按键",
+        int(models.ConfirmMethod.APP): "手机端",
+        int(models.ConfirmMethod.VOICE_AND_BUTTON): "语音 + 按键",
+    }.get(m, "未知")
+
+
+def _recently_confirmed_medicine(
+    db: Any, device_pk: int,
+) -> tuple[Any, Any, int] | None:
+    """该设备最近 ``_RECENT_CONFIRM_MIN`` 分钟内刚确认过的**服药**提醒。
+
+    返回 ``(event, rule, 几分钟前)``；没有就 ``None``。
+
+    为什么按 ``confirmed_at`` 判、不按 ``state`` 判：这两列是同一次回执写下去
+    的，分不出先后；而这里要回答的问题是"是不是**刚刚**"，只有时间戳能答。
+
+    为什么要给 ``+2 分钟`` 的上界：设备回执里的 ``confirmed_at`` 用的是设备自己
+    的时钟，会略微超前服务端。超前太多（脏时间）就跳过，不能拿它冒充"刚刚"。
+    """
+    now = local_now()
+    floor = now - timedelta(minutes=_RECENT_CONFIRM_MIN)
+    ceil = now + timedelta(minutes=2)
+    try:
+        rows = db.execute(
+            select(models.ReminderEvent, models.Reminder)
+            .join(models.Reminder,
+                  models.Reminder.id == models.ReminderEvent.reminder_id)
+            .where(
+                models.ReminderEvent.device_id == device_pk,
+                models.ReminderEvent.state == int(models.EventState.CONFIRMED),
+                models.ReminderEvent.confirmed_at.isnot(None),
+                models.Reminder.rtype == int(models.ReminderType.MEDICINE),
+            )
+            .order_by(models.ReminderEvent.confirmed_at.desc())
+            .limit(5)
+        ).all()
+    except Exception as exc:  # noqa: BLE001  查库失败只该让"回查"失效，不该崩对话
+        log.warning("回查最近确认失败 %s: %s", type(exc).__name__, exc)
+        return None
+
+    for ev, rule in rows:
+        try:
+            at = event_instant(ev.confirmed_at, getattr(ev, "tz", ""),
+                               int(getattr(ev, "tz_offset_min", 0) or 0))
+        except Exception:  # noqa: BLE001  脏 tz，跳过这一行
+            continue
+        if floor <= at <= ceil:
+            mins = max(0, int((now - at).total_seconds() // 60))
+            return ev, rule, mins
+    return None
+
+
+def _already_confirmed_reply(ev: Any, rule: Any, mins: int) -> dict[str, Any]:
+    """「已经确认过了」的统一话术。
+
+    两个调用点（服药清单为空 / 设备超时）必须说同一句话，否则老人听到的
+    结论取决于服务端走了哪条分支 —— 而他只关心"到底记上了没有"。
+    """
+    title = getattr(rule, "title", "") or "这条提醒"
+    return {
+        "ok": True,
+        "confirmed": True,
+        "already": True,
+        "message": (
+            f"「{title}」{mins} 分钟前就已经确认成功了"
+            f"（确认方式：{_confirm_method_word(getattr(ev, 'confirm_method', 0))}）。"
+            "请用一句话告诉老人已经记上了，"
+            "**不要**再让他去按设备上的按键，也不要再问一遍吃没吃药。"
+        ),
+    }
+
+
 def _arm_voice(db: Any, ev: Any) -> int | None:
     """把这条实例的确认方式**先**写成 VOICE，返回原值（供回滚）。
 
@@ -1315,6 +1412,25 @@ def _confirm_device_pending(db: Any, device_pk: int,
 
     out = _device_pending_call(device_call)
 
+    # 设备侧"失败"要**回查一次库**再下结论。
+    #
+    # 为什么不能信 ``ok=False``：设备处理 ``elder.confirm_reminder`` 是同步
+    # 阻塞的 —— elder_bridge.cc:1576 → reminder.c:1484 → sync.c:943 里
+    # ``if (online) flush_queue();`` → net.c:206 ``esp_http_client_perform()``
+    # （keep_alive 关着，每次重做 TLS 握手，实测 3.5 秒）。也就是说"它到底
+    # 办没办成"取决于它自己那条 POST，而**那条 POST 会自己把库里的 state
+    # 改成 CONFIRMED**。所以"超时"完全可能是"它已经办成了、只是回包慢"。
+    # 09:15:13 那一次就是这样：设备 09:15:12 已经确认，服务端 09:15:16 判超时，
+    # 然后对老人说「请按一下按键」—— 他 4 秒前刚按完。
+    if not out.get("confirmed") and not out.get("ok") and db is not None:
+        recent = _recently_confirmed_medicine(db, device_pk)
+        if recent is not None:
+            ev0, rule0, mins = recent
+            log.info("confirm_reminder：设备没回包，但 %d 分钟前刚确认过「%s」"
+                     "（ev=%s）⇒ 按成功处理，不再让老人重按",
+                     mins, getattr(rule0, "title", ""), getattr(ev0, "id", "?"))
+            out = _already_confirmed_reply(ev0, rule0, mins)
+
     # 只有设备**明确说确认了**才留着那个 VOICE；其余一切结局（答 false、
     # 超时、报错、看不懂）都说明这次对话没有落地任何确认，必须恢复原值 ——
     # 否则家属端会看到一条老人根本没做过的"语音确认"。
@@ -1360,6 +1476,19 @@ def _confirm_reminder(db: Any, device_pk: int, device_call: Any,
         return {"ok": False, "message": "记录没查出来，请老人稍后再说一次"}
 
     if not cands:
+        # 先问一句"是不是刚刚已经确认过了"。这一条是 2026-11-04 用户实报
+        # 「服药提醒按键按了又是不能确认」的真正来源：大模型首字卡了 65 秒，
+        # 这期间老人自己按了键，等他听到回应时提醒已经 CONFIRMED，清单当然是
+        # 空的 —— 此时再说「请让老人按一下按键」就是让他对着已经办完的事再按一遍。
+        recent = _recently_confirmed_medicine(db, device_pk)
+        if recent is not None:
+            ev0, rule0, mins = recent
+            log.info("confirm_reminder：清单为空，但 %d 分钟前刚确认过「%s」"
+                     "（ev=%s，方式=%s）⇒ 直接回「已经记上了」，不再调设备",
+                     mins, getattr(rule0, "title", ""), getattr(ev0, "id", "?"),
+                     _confirm_method_word(getattr(ev0, "confirm_method", 0)))
+            return _already_confirmed_reply(ev0, rule0, mins)
+
         # 没有待确认的**服药**提醒 ⇒ 交还给设备（喝水/日程/运动提醒走这里，
         # 它们没有"哪一味药"的问题）。见 ``_confirm_device_pending`` 的注释。
         log.info("confirm_reminder：没有待确认的服药提醒（device_pk=%s），走设备旧路径",
