@@ -15,6 +15,11 @@
 
 对应需求（2026-11-03 用户原话）：
   「对话状态下字幕与语音时间差距在2秒以上，要尽量做到同步显示。」
+对应需求（2026-11-04 用户原话）：
+  「多行的时候显示不完整，也没有把用户说的字幕和设备的字幕分到不同页面，
+    字幕刷新率很低，完全跟不上语音。」
+  第 4 组断言覆盖后三条：分页判据、追加落点、翻页不再被 follow 挡住、
+  兜底超时 ≤ 1 秒。
 """
 from __future__ import annotations
 
@@ -112,6 +117,33 @@ def branch(src: str, key: str, end_key: str) -> str:
     return src[i:j]
 
 
+def last_func_body(src: str, signature: str) -> str:
+    """取**最后**一个 `signature` 的函数体（花括号配对），找不到返回 ""。
+
+    为什么不能复用 func_body：`lcd_display.cc` 里有两份 `SetChatMessage`
+    —— 前面那份在 `#ifdef CONFIG_USE_WECHAT_MESSAGE_STYLE` 下、本板不编译，
+    后面 `#else` 那份才是真正跑在屏上的。`find()` 取到的是不编译的那份，
+    断言就变成"改坏了也绿"的假信号。取最后一个 = 取 `#else` 分支。
+    """
+    i = src.rfind(signature)
+    if i < 0:
+        return ""
+    j = src.find("{", i)
+    if j < 0:
+        return ""
+    depth = 0
+    k = j
+    while k < len(src):
+        if src[k] == "{":
+            depth += 1
+        elif src[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[j : k + 1]
+        k += 1
+    return ""
+
+
 def t1_frame_counters() -> None:
     print("\n── 1. 两个帧计数必须在正确的函数里 ──")
     h = strip_comments(AUDIO_H.read_text(encoding="utf-8"))
@@ -195,6 +227,12 @@ def t3_gate_and_teardown() -> None:
     check("kSubtitleMaxWaitUs" in flush,
           "有兜底超时（本句没有音频时不至于永不上屏）",
           "TTS 失败/丢帧时字幕会永久卡在队列里")
+    # 兜底值必须 ≤ 1 秒
+    m = re.search(r"kSubtitleMaxWaitUs\s*=\s*([\d.]+)\s*LL\s*\*\s*1000\s*\*\s*1000", cc)
+    check(m is not None and float(m.group(1)) <= 1.0,
+          "兜底超时 ≤ 1 秒（2026-11-04 从 6 秒收紧）",
+          f"实际 {m.group(1) if m else '找不到'} 秒 —— 解码+播放队列积压 3.36 秒时，"
+          "6 秒兜底会把字幕拖到 3 秒以上，老人看到的就是「字追不上声音」")
     check("SetChatMessage(\"assistant\"" in flush,
           "真正上屏只在 FlushSubtitles 里发生（单一出口）", "")
 
@@ -224,35 +262,135 @@ def t3_gate_and_teardown() -> None:
           "不丢 ⇒ 老人按停之后屏幕上又冒出一句上一轮的话")
 
 
-def t4_follow_newest_page() -> None:
-    print("\n── 4. 长回答分页要跟着最新一句（否则屏停在第一页）──")
+def t4_paging_anchor_and_rate() -> None:
+    """2026-11-04 重做：分页判据、追加落点、翻页不再被 follow 挡住。
+
+    每条断言都做过「改坏 → 变红」验证（临时改坏、跑本脚本、确认红、还原）：
+      · split 判据改回 `(user_h + bot_h + gap) > page_h`  ⇒ 第 2 条红
+      · `chat_page_index_ = idx;` 改回 `= pages - 1;`      ⇒ 第 4、5 条红
+      · ChatPageStep 开头插 `if (chat_page_index_ >= 0) return;` ⇒ 第 6、8 条红
+      · `kSubtitleMaxWaitUs` 改回 6 秒                    ⇒ 第 3 组红
+      · `ChatPageLayout(anchor_px)` 改回 `ChatPageLayout()` ⇒ 第 10 条红
+    """
+    print("\n── 4. 分页：两段必分页 + 落点跟语音 + 翻页不被挡住 ──")
     src = strip_comments((MAIN / "display" / "lcd_display.cc").read_text(encoding="utf-8"))
     hdr = strip_comments((MAIN / "display" / "lcd_display.h").read_text(encoding="utf-8"))
 
-    check("ChatPageLayout(!is_user && !is_system)" in src,
-          "assistant 追加时传 follow_newest=true",
-          "传默认 false ⇒ 每来一句都弹回第一页，屏永远停在开头")
-    check("chat_follow_tail_ = follow_newest && (pages > 1);" in src,
-          "follow 状态只在多页时成立", "")
-    check("chat_page_index_ = chat_follow_tail_ ? (pages - 1) : 0;" in src,
-          "起始页 = 最后一页（多页且 follow 时）",
-          "回到 0 就是老行为：声音念第三页、屏显示第一页")
+    # ⚠️ 必须取**最后**一份：文件里有两份 SetChatMessage，前一份在
+    # CONFIG_USE_WECHAT_MESSAGE_STYLE 下、本板不编译。
+    layout = last_func_body(src, "void LcdDisplay::ChatPageLayout")
+    step = last_func_body(src, "void LcdDisplay::ChatPageStep")
+    scm = last_func_body(src, "void LcdDisplay::SetChatMessage")
 
-    step = func_body(src, "void LcdDisplay::ChatPageStep")
-    check("chat_follow_tail_" in step,
-          "ChatPageStep 里判 follow 状态",
-          "不判 ⇒ 6 秒后照样翻页，把正在念的字翻走")
-    m = re.search(r"#define\s+CHAT_PAGE_LIVE_MS\s+(\d+)", src)
-    check(m is not None and int(m.group(1)) >= 5000,
-          "静默窗口 CHAT_PAGE_LIVE_MS ≥ 5 秒（容得下一次 TTS 抖动）",
-          f"实际 {m.group(1) if m else '找不到'} —— 太短会把'换气'当成'说完'")
-    check("lv_obj_scroll_to_y(bottom_bar_, 0, LV_ANIM_ON);" in step,
-          "说完后回到第一页（让老人从头读）",
-          "不回 ⇒ 前面的内容再也看不到")
+    check(bool(layout) and bool(step) and bool(scm),
+          "找到生效的 ChatPageLayout / ChatPageStep / SetChatMessage（#else 分支）",
+          "函数被改名，或只剩 WECHAT 分支那一份（那份本板不编译）")
 
-    check("bool chat_follow_tail_ = false;" in hdr and
-          "uint32_t chat_last_append_tick_ = 0;" in hdr,
-          "两个状态成员都在头文件里", "")
+    # 1) 两段都有内容就分页 —— 不再看"合起来放不放得下"
+    m = re.search(r"const bool split = \(([^\n]*)\);", layout)
+    cond = m.group(1) if m else ""
+    check(m is not None and "user_h > 0" in cond and "bot_h > 0" in cond
+          and "page_h" not in cond,
+          "split 判据只看「两段都有内容」（不再看合起来放不放得下）",
+          "回到 (user_h + bot_h + gap) > page_h 就是老行为："
+          "「今天几号 / 11 月 3 号」这种短问答仍然同页，老人分不清哪句是自己说的")
+
+    # 2) 用户话被撑成整页 ⇒ 设备字幕必然落到下一页
+    check(re.search(r"lv_obj_set_height\(chat_user_label_,\s*user_block - gap\)",
+                    layout) is not None
+          and "user_block = user_pages * page_h;" in layout,
+          "用户话撑成整页（user_block = user_pages * page_h）",
+          "不撑 ⇒ 设备字幕从用户话下面接着排，两段仍在同一页")
+    check("lv_obj_update_layout(bottom_bar_);" in layout,
+          "撑高后重新 update_layout 再算页数",
+          "不重算 ⇒ 页数按旧布局算，落点和页数都对不上")
+    check(re.search(r"lv_obj_set_height\(chat_message_label_,\s*bot_h \+ \(pad_target - natural\)\)",
+                    layout) is not None,
+          "给最后一段补足尾部留白（pad_target），保证每个页起点都能精确滚到",
+          "不补 ⇒ 内容比 (pages-1)*page_h + 视口高 少一截，滚动位置被夹住，"
+          "第 2 页顶端露出上一段最后一行的半截，两段又出现在同一屏")
+    check("const int excess = (avail > page_h) ? (avail - page_h) : 0;" in layout,
+          "页数与留白按同一个 excess（视口高 - 页高）口径算",
+          "两套口径会漂移：页数说 2 页、实际只能滚到 1.5 页")
+
+    # 3) 落点 = 本句起始页，不是最后一页
+    check("chat_page_index_ = idx;" in layout and "anchor_px" in layout,
+          "chat_page_index_ 由 anchor_px 换算的 idx 决定",
+          "回到 pages - 1 ⇒ 屏跳到句子末尾，声音才念第一句")
+    check("chat_page_index_ = pages - 1" not in layout and
+          "chat_page_index_ = chat_follow_tail_" not in layout,
+          "不再有「追加即跳最后一页」",
+          "追加跳末尾 = 前面几行永远轮不到，正是「多行显示不完整」")
+    check("chat_follow_tail_" not in layout and "chat_follow_tail_" not in hdr,
+          "follow_tail 状态已彻底删除（源码与头文件都没有）",
+          "留着这个成员，下一个人会以为它还在生效")
+
+    # 4) ChatPageStep 不再"有字幕就早退"
+    check("chat_follow_tail_" not in step,
+          "ChatPageStep 里没有「有字幕就不翻页」的早退",
+          "早退 + 屏停在末页 = 老人永远只看到句子尾巴")
+    # ⚠️ 只查 `chat_follow_tail_` 不够：换一种写法的早退（例如
+    # `if (chat_page_index_ >= 0) return;`）照样能让翻页彻底停摆，而上面那条
+    # 断言看不见。所以按**结构**查：整个函数体只允许两个 return，且每个
+    # return 前面必须是那两条合法守卫（页数 ≤ 1 / 已到最后一页）。
+    returns = [m.start() for m in re.finditer(r"\breturn\s*;", step)]
+    stray = []
+    for pos in returns:
+        head = step[max(0, pos - 260):pos]
+        if ("chat_page_count_ <= 1" in head or
+                "chat_page_index_ + 1 >= chat_page_count_" in head):
+            continue
+        stray.append(" ".join(head[-70:].split()))
+    check(len(returns) == 2 and not stray,
+          "ChatPageStep 只有两个 return（页数≤1 / 已到最后一页），没有别的早退",
+          f"发现 {len(returns)} 个 return，其中无守卫的：{stray} —— "
+          "任何多余早退都会让长回答后面的页永远翻不到")
+    check(re.search(r"lv_obj_scroll_to_y\(bottom_bar_,\s*0\s*,", step) is None,
+          "翻完不回第 1 页（最后一页停住）",
+          "回第 1 页会把老人正在读的结论翻走，且循环重置防烧屏计时")
+    check("chat_page_index_++" in step,
+          "每 CHAT_PAGE_DWELL_MS 前进一页",
+          "不前进 ⇒ 长回答后面的页永远看不到")
+    check("lv_timer_pause(chat_page_timer_);" in step,
+          "到最后一页停住定时器",
+          "不停 ⇒ 空转烧 CPU")
+
+    # 5) 语音同步：先量本句起始行，再追加，再按落点上屏
+    i_anchor = scm.find("anchor_px = prev_lines * line_h")
+    i_set = scm.find("lv_label_set_text(target, merged.c_str())")
+    check(i_anchor >= 0 and i_set >= 0 and i_anchor < i_set,
+          "先量「本句第一行」再追加文本",
+          "先追加再量 ⇒ 量到的是本句之后的高度，落点永远差一句")
+    check("ChatPageLayout(anchor_px)" in scm,
+          "SetChatMessage 把 anchor_px 传给 ChatPageLayout",
+          "传默认值 ⇒ 每句都弹回第 1 页，屏和声音分家")
+
+    # 6) 两份字幕仍是两个独立控件（分页才谈得上"分到不同页"）
+    check("chat_user_label_ = lv_label_create(bottom_bar_);" in src and
+          "chat_message_label_ = lv_label_create(bottom_bar_);" in src,
+          "用户字幕与设备字幕是两个独立 lv_obj_t（各自 create）",
+          "合并成一个控件 ⇒ 颜色/清空逻辑互相踩，也无法分页")
+    check("target = is_user ? chat_user_label_ : chat_message_label_;" in scm,
+          "写入目标是二选一（不会同时写两个）",
+          "同时写两个 ⇒ 两段文字挤在同一页")
+
+    # 7) 头文件签名
+    check("void ChatPageLayout(int anchor_px = -1);" in hdr,
+          "头文件签名是 ChatPageLayout(int anchor_px = -1)",
+          "还是 bool follow_newest ⇒ 落点逻辑没接上")
+
+    # 8) 不再有 8 秒静默窗口
+    check("#define CHAT_PAGE_LIVE_MS" not in src,
+          "CHAT_PAGE_LIVE_MS 已删除（翻页不再等静默窗口）",
+          "留着它就是「有字幕期间不翻页」那套旧行为")
+
+    # 9) 扩容量：列宽从 183 提到 242（8 字/行），且没动字号
+    check("ChatAvatarSize()" in src and "ChatPadX()" in src,
+          "对话态用专用的头像/边距（列宽 242 ⇒ 8 字/行）",
+          "回到 AvatarSize() 的 90px ⇒ 列宽 183，一行只有 6 个汉字")
+    check("chat_font" in src,
+          "字号仍是 30px 的 chat_font（不许降到 20px）",
+          "20px 汉字只有 2mm 高，老人看不清")
 
 
 def t5_workflow_registered() -> None:
@@ -267,7 +405,7 @@ def main() -> int:
     t1_frame_counters()
     t2_sentence_start_deferred()
     t3_gate_and_teardown()
-    t4_follow_newest_page()
+    t4_paging_anchor_and_rate()
     t5_workflow_registered()
 
     passed = sum(1 for ok, _, _ in results if ok)
