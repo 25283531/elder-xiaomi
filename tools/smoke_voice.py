@@ -3489,7 +3489,8 @@ def t_dismiss_and_watchdog() -> None:
     import time
     import types
 
-    from app.config import VOICE_MAX_LISTEN_MS, VOICE_MIN_SPEECH_MS
+    from app.config import (VOICE_MAX_LISTEN_MS, VOICE_MIN_SPEECH_MS,
+                            VOICE_MIN_SPEECH_RUN_MS)
     from app.voice import session as S
 
     # ---- ① 告别词识别 ----
@@ -3560,6 +3561,7 @@ def t_dismiss_and_watchdog() -> None:
         s.session_id = "SMOKE-WD"
         s.state = "listening"
         s._speech_ms = 0
+        s._max_speech_run_ms = 0
         s._silence_ms = 0
         s._t0 = 0.0
         s._abort = False
@@ -3578,6 +3580,8 @@ def t_dismiss_and_watchdog() -> None:
         # 否则测的只是一个同名的 lambda（假绿）。
         s._silence_watchdog = types.MethodType(
             S.VoiceSession._silence_watchdog, s)
+        s._has_real_speech = types.MethodType(
+            S.VoiceSession._has_real_speech, s)
         # 2026-11-03 加埋点：这个分支现在要留音频指纹，同样必须是**真方法**
         # （假对象没有 _pcm 的话它会被自己的 except 兜住，测出来的就不是
         # "重新武装"而是"诊断失败后仍然重新武装"——两件事，都得测）。
@@ -3608,6 +3612,7 @@ def t_dismiss_and_watchdog() -> None:
         s3.session_id = "SMOKE-WD3"
         s3.state = "listening"
         s3._speech_ms = 0
+        s3._max_speech_run_ms = 0
         s3._silence_ms = 0
         s3._t0 = 0.0
         s3._abort = False
@@ -3619,6 +3624,8 @@ def t_dismiss_and_watchdog() -> None:
         s3._pcm = []
         s3._silence_watchdog = types.MethodType(
             S.VoiceSession._silence_watchdog, s3)
+        s3._has_real_speech = types.MethodType(
+            S.VoiceSession._has_real_speech, s3)
         s3._listen_timeout_fingerprint = types.MethodType(
             S.VoiceSession._listen_timeout_fingerprint, s3)
 
@@ -3642,6 +3649,7 @@ def t_dismiss_and_watchdog() -> None:
         s2.session_id = "SMOKE-WD2"
         s2.state = "listening"
         s2._speech_ms = VOICE_MIN_SPEECH_MS + 500
+        s2._max_speech_run_ms = VOICE_MIN_SPEECH_RUN_MS + 500
         s2._silence_ms = 0
         s2._t0 = 0.0
         s2._abort = False
@@ -3653,12 +3661,49 @@ def t_dismiss_and_watchdog() -> None:
         s2._last_active_at = time.monotonic()
         s2._silence_watchdog = types.MethodType(
             S.VoiceSession._silence_watchdog, s2)
+        s2._has_real_speech = types.MethodType(
+            S.VoiceSession._has_real_speech, s2)
         try:
             await asyncio.wait_for(s2._silence_watchdog(), timeout=5)
         finally:
             S.config.VOICE_MAX_LISTEN_MS = real_max
         check("12i · 确实说过话时，超时兜底照旧 finalize（不能修成永不识别）",
               turned2 and not armed2, f"armed={len(armed2)} turned={len(turned2)}")
+
+        # ---- ③b 噪声：累计够长、但**没有一段连续** ⇒ 必须重新武装，不许送 ASR ----
+        # 2026-11-04 现场：09:13:57 那轮累计语音 7800ms 全是房间噪声
+        # （wav 实测 HNR 0.22，真语音 ≥0.7；噪声爆发平均 204ms，最长 180ms）。
+        # 旧判据只看累计值 ⇒ 纯噪声送 ASR ⇒ 五家 ASR 一致返回空 ⇒
+        # 老人听到「抱歉，我没听清」。判据就是 config 里 2026-10-22 就写好的
+        # VOICE_MIN_SPEECH_RUN_MS，只是**从来没接线**（只写不读）。
+        s5 = types.SimpleNamespace()
+        s5.session_id = "SMOKE-WD5"
+        s5.state = "listening"
+        s5._speech_ms = 5000                        # 累计够长（噪声堆出来的）
+        s5._max_speech_run_ms = 120                 # 但没有一段连续（噪声）
+        s5._silence_ms = 0
+        s5._t0 = 0.0
+        s5._abort = False
+        s5._last_active_at = time.monotonic()
+        armed5, turned5 = [], []
+        s5._rearm_listening = lambda: armed5.append(1)
+        s5._start_turn = lambda: (turned5.append(1), True)[1]
+        s5._silence_threshold_ms = lambda: 10 ** 9
+        s5._pcm = []
+        s5._listen_timeout_fingerprint = types.MethodType(
+            S.VoiceSession._listen_timeout_fingerprint, s5)
+        s5._silence_watchdog = types.MethodType(
+            S.VoiceSession._silence_watchdog, s5)
+        s5._has_real_speech = types.MethodType(
+            S.VoiceSession._has_real_speech, s5)
+        S.config.VOICE_MAX_LISTEN_MS = 400
+        try:
+            await asyncio.wait_for(s5._silence_watchdog(), timeout=5)
+        finally:
+            S.config.VOICE_MAX_LISTEN_MS = real_max
+        check("12i ★ 只有噪声（累计 5000ms、最长连续 120ms）时必须重新武装，"
+              "不许送 ASR（否则就是「抱歉我没听清」无限循环）",
+              armed5 and not turned5, f"armed={len(armed5)} turned={len(turned5)}")
 
         # ---- ④ 旧轮还在收尾（_start_turn 返回 False）：看门狗必须继续等 ----
         # barge 打断后轮次任务还在飞（TTS 分片在途），此时静音条件已
@@ -3668,6 +3713,7 @@ def t_dismiss_and_watchdog() -> None:
         s3.session_id = "SMOKE-WD3"
         s3.state = "listening"
         s3._speech_ms = VOICE_MIN_SPEECH_MS + 500
+        s3._max_speech_run_ms = VOICE_MIN_SPEECH_RUN_MS + 500
         s3._silence_ms = 10 ** 6          # 静音分支立刻满足
         s3._t0 = 0.0
         s3._abort = False
@@ -3686,6 +3732,8 @@ def t_dismiss_and_watchdog() -> None:
         s3._last_active_at = time.monotonic()
         s3._silence_watchdog = types.MethodType(
             S.VoiceSession._silence_watchdog, s3)
+        s3._has_real_speech = types.MethodType(
+            S.VoiceSession._has_real_speech, s3)
         await asyncio.wait_for(s3._silence_watchdog(), timeout=5)
         check("12i ★ 旧轮收尾中（_start_turn=False）看门狗继续等而不退出"
               "（barge 交接轮靠它收尾；若改成 return，本断言 1≠3 会红）",
@@ -3699,6 +3747,7 @@ def t_dismiss_and_watchdog() -> None:
         s4.session_id = "SMOKE-WD4"
         s4.state = "listening"
         s4._speech_ms = 0                 # 一句都没说
+        s4._max_speech_run_ms = 0
         s4._silence_ms = 0
         s4._t0 = time.monotonic()
         s4._abort = False
@@ -3714,6 +3763,8 @@ def t_dismiss_and_watchdog() -> None:
         s4._enter_standby = _fake_standby
         s4._silence_watchdog = types.MethodType(
             S.VoiceSession._silence_watchdog, s4)
+        s4._has_real_speech = types.MethodType(
+            S.VoiceSession._has_real_speech, s4)
         await asyncio.wait_for(s4._silence_watchdog(), timeout=5)
         check("12i ★ 会话空闲超时（VOICE_IDLE_STANDBY_SEC）必须进待机，"
               "不得无限重新武装（原先只 rearm ⇒ 设备永远在监听）",
