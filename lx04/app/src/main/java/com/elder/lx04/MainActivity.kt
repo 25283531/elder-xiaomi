@@ -1,0 +1,2170 @@
+package com.elder.lx04
+
+import android.Manifest
+import android.app.Activity
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import android.os.BatteryManager
+import android.os.Bundle
+import android.os.SystemClock
+import android.util.Log
+import android.view.KeyEvent
+import android.view.View
+import android.view.WindowManager
+import android.widget.FrameLayout
+import com.elder.lx04.audio.AudioCapture
+import com.elder.lx04.audio.AudioPreProcess
+import com.elder.lx04.audio.AudioPlayer
+import com.elder.lx04.audio.OpusCodec
+import com.elder.lx04.input.ConfirmKeyDetector
+import com.elder.lx04.input.TopKeys
+import com.elder.lx04.light.Led
+import com.elder.lx04.light.LedBandView
+import com.elder.lx04.light.LedEngine
+import com.elder.lx04.net.DeviceIdentity
+import com.elder.lx04.net.OtaClient
+import com.elder.lx04.audio.TonePlayer
+import com.elder.lx04.net.VoiceClient
+import com.elder.lx04.runtime.DeviceRuntime
+import com.elder.lx04.store.DeviceStore
+import com.elder.lx04.wake.WakeWordEngine
+import com.elder.lx04.ui.MainScreen
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+/**
+ * LX04 设备端主界面 —— 与服务端对接的完整客户端。
+ *
+ * ## 一屏之内要完成的事
+ *
+ * 1. **和服务端对接**：OTA 拿 token → WebSocket → 语音上行/下行
+ * 2. **界面与固件一致**：状态栏 / 表情 / 字幕 / 提醒页 / 激活页
+ * 3. **顶部三键**：音量± 保留，中间键 = 按住说话（也兼服药确认）
+ * 4. **两侧色带**：状态灯与事件灯搬到屏幕上（[LedEngine] 1:1 移植自固件）
+ *
+ * ## 一轮对话的完整时序（这是整份代码的主线）
+ *
+ * ```
+ * 按下中间键
+ *   → voice.listenStart()         服务端进入 listening，起静音看门狗
+ *   → capture.start()             AudioRecord 16k + 前处理（降噪/增益/VAD）
+ *   → opus.encode() 每 60ms 一帧 → WS 二进制帧（4 字节头 + Opus）
+ * 松手 / VAD 判到静音 1.2 秒
+ *   → voice.listenStop()          服务端开始 ASR → LLM → TTS
+ *   → capture.stop()
+ * 服务端回：
+ *   → {"type":"stt"}                          显示"老人说了什么"
+ *   → {"type":"tts","state":"sentence_start"} 显示字幕 + 表情切 happy
+ *   → 二进制 Opus 帧                          opus.decode() → AudioTrack
+ *   → {"type":"tts","state":"stop"}           回到待机
+ * ```
+ *
+ * ## 为什么是"按一下说话"而不是一直听
+ *
+ * 唤醒词（sherpa-onnx，已确认有 armeabi-v7a 的 .so）还没接。
+ * 在它接上之前，用中间键触发是最稳的 —— 而且对老人来说
+ * "按一下再说"比"记住一句唤醒词"更不容易失败。
+ * 唤醒词接上之后这条路径仍然保留：按键永远可用，不依赖模型。
+ */
+class MainActivity : Activity() {
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    // ---- 界面与灯效 ----
+    private lateinit var screen: MainScreen
+    private lateinit var bandView: LedBandView
+    private lateinit var ledEngine: LedEngine
+
+    // ---- 语音链路 ----
+    private var voice: VoiceClient? = null
+    private val opus = OpusCodec()
+    private var capture: AudioCapture? = null
+    private val player = AudioPlayer()
+
+    /** 正在把麦克风数据往上送。 */
+    @Volatile
+    private var sending = false
+
+    /** 连续静音帧数（60ms 一帧）。 */
+    @Volatile
+    private var silentFrames = 0
+
+    /** 上行编码失败累计丢帧（诊断 Concentus OpusAssert 静默吞帧）。 */
+    @Volatile
+    private var encodeDropFrames = 0
+
+    /** 上行电平观测计数（每 25 帧打一条）。 */
+    @Volatile
+    private var upFrames = 0
+    @Volatile
+    private var upSumRms = 0.0
+    @Volatile
+    private var upSpeechFrames = 0
+
+
+
+    /**
+     * 本轮是"按住说话"（PTT）。
+     *
+     * PTT 下**不用** VAD 自动收尾 —— 按多久说多久，松手才结束。
+     * 唤醒词/自由聆听那种场景才靠静音判"说完了"。
+     */
+    @Volatile
+    private var pttMode = false
+
+    /** 正在播报（此时不开麦克风，半双工）。 */
+    @Volatile
+    private var speaking = false
+
+    /**
+     * **对话态**：唤醒后持续推流，播报完自动回听，直到服务端 standby 或本地超时。
+     *
+     * ## 为什么需要它（2026-11-06 真机实测）
+     *
+     * 固件 realtime 模式下，唤醒一次就能连续聊：播报完 Speaking→Listening
+     * 自动回听、**不关上行采集**、WakeNet 保持关闭。服务端为此写了两条兜底：
+     * `idle 态仍收到上行音频 → 重新武装监听`（session.py:1680）和
+     * `speaking 态上行帧 → _feed_barge_in`（抢话打断，session.py:1690）。
+     *
+     * 而 Android 原来的 `endListening()` / `onTtsState("stop")` 两条出口都只
+     * `wakeEngine.resume()` —— 把麦克风交回**只认「你好小智」的常驻 KWS**。
+     * 结果：老人唤醒、听到「你好，要聊点什么？」之后再说话，设备一帧都不发，
+     * 服务端日志干干净净、界面显示 idle，看起来像「设备坏了」，实际是状态机
+     * 缺了一次跃迁。生产日志 01:10:41 播报完成后到 01:22 零事件就是证据。
+     *
+     * ⚠️ 对话态期间 KWS 必须**全程 PAUSED**：LX04 的 HAL 不允许两个
+     * AudioRecord 同时打开（实测 `startInputDevice(), input device already
+     * opened`）。只有 [endConversation] 才把麦克风交回唤醒词监听。
+     */
+    @Volatile
+    private var inConversation = false
+
+    /** 对话态兜底截止时刻（elapsedRealtime），服务端 standby 失败时也不永久占麦。 */
+    @Volatile
+    private var conversationDeadlineMs = 0L
+
+
+    private val keyDetector = ConfirmKeyDetector()
+
+    /**
+     * 设备运行时（提醒引擎 + 心跳 + 回执 + MCP）。
+     *
+     * ⚠️ 提醒的"真相"只在 [DeviceRuntime] 里 —— 本 Activity 不再自己维护
+     * 「有没有待确认」「是不是已确认」。以前这里有个 `hasPendingReminder`
+     * 字段和一套 `confirmMedication()`，只改灯和屏、不上报服务端，
+     * 于是"设备显示已确认、家属端显示待确认"两边对不上，而且日志正常。
+     */
+    private lateinit var runtime: DeviceRuntime
+
+    /** 本地持久化（token / 提醒表 / 回执队列）。 */
+    private lateinit var deviceStore: DeviceStore
+
+    /**
+     * 本轮按压是否已经落地。
+     *
+     * 一步式确认：**跨过 3 秒那一刻就确认，不等松手**（生产固件
+     * `elder_bridge.cc:1166-1461`）。这个标志用来保证「松手时不再重复处理」，
+     * 也保证「已确认的按压不会在松手时被判成中途放弃」。
+     */
+    private var pressResolved = false
+
+    /** 本轮按压是「确认机」（有待确认项，不录音）还是「PTT 机」。 */
+    private var pressIsConfirm = false
+
+    /** 是否已经绑定（OTA 拿到 websocket 段）。 */
+    @Volatile
+    private var bound = false
+
+    private var batteryPercent = 0
+    private var batteryCharging = false
+
+    /** 是否有电池。LX04 无电池，`ACTION_BATTERY_CHANGED` 的 present 会是 false。 */
+    private var hasBattery = false
+    private var wifiOk = false
+
+    /**
+     * WebSocket 是否连着。
+     *
+     * ⚠️ 这是 [DeviceRuntime.Ui.isOnline] 的判据，**不能用**
+     * [DeviceIdentity.wifiConnected]：Wi-Fi 连着但服务端不可达（服务端重启、
+     * 证书过期、DNS 挂了）时，用 Wi-Fi 判据会让设备反复调用在线 TTS，
+     * 每次都要等一个超时，老人听到的是"长时间没声音"。
+     */
+    @Volatile
+    private var wsOnline = false
+
+    /** 本地提示音（提醒必须有声，不能只靠屏幕）。 */
+    private val tones = TonePlayer()
+
+    /**
+     * 离线唤醒词引擎（「你好小智」，对齐 ESP32-S3 固件的 ESP-SR）。
+     *
+     * ⚠️ 必须是 `lateinit var` 而不是 `val ... = WakeWordEngine(this) {...}`：
+     *    回调里要引用 wakeEngine 自己（未连上时恢复监听），Kotlin 不允许
+     *    在字段初始化器里自引用（"variable must be initialized"）。
+     */
+    private lateinit var wakeEngine: WakeWordEngine
+
+
+    /**
+     * 运行时与界面的交界。
+     *
+     * 只做"把引擎的结论画到屏上/响出来"，**不做任何判断** ——
+     * 判断全在 [DeviceRuntime] 里，这样 UI 和引擎不会各存一份真相。
+     */
+    private val uiBridge = object : DeviceRuntime.Ui {
+        override fun showReminder(text: String?) {
+            runOnUiThread {
+                if (text == null) {
+                    screen.hideReminder()
+                } else {
+                    // 文案契约：首行标题、其余为提示+明细（引擎保证这个结构）
+                    val lines = text.split('\n')
+                    screen.showReminder(lines.firstOrNull().orEmpty(),
+                        lines.drop(1).joinToString("\n"))
+                }
+            }
+        }
+
+        override fun tone(tone: Int) {
+            runOnUiThread { tones.play(tone) }
+        }
+
+        override fun announce(text: String) {
+            // 走服务端认可的播报信封（见 VoiceClient.sendAnnounce 的说明）
+            voice?.sendAnnounce(text)
+        }
+
+        override fun playClip(clipId: Int): Boolean {
+            // LX04 上没有固件那套预录片段资源 ⇒ 明确返回 false，
+            // 让引擎回落到 tone()。返回 true 但不出声，会让"提醒没声音"
+            // 变成无法追查的现象。
+            return false
+        }
+
+        override fun setUiState(state: String) {
+            runOnUiThread { this@MainActivity.setUiState(state) }
+        }
+
+        override fun setBrightness(percent: Int): Boolean = runCatching {
+            // 落在当前窗口上（不改系统设置，不需要 WRITE_SETTINGS 权限）。
+            // ⚠️ 必须走 setAttributes()：`window.attributes = ...` 在 Kotlin 里
+            //    要求 setter，而 Android 的 Window 只有 `setAttributes(LayoutParams)`。
+            val lp = window.attributes
+            lp.screenBrightness = percent.coerceIn(1, 100) / 100f
+            window.setAttributes(lp)
+            true
+        }.getOrDefault(false)
+
+        override fun isOnline(): Boolean = wsOnline
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        // ⚠️ 必须全屏：色带画在屏幕最边缘，系统 UI 会压住它
+        window.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        hideSystemUi()
+
+        // ⚠️ 顺序不能动：ledEngine 必须在 setContentView 之前建好。
+        //    buildRoot() 里那个 scope.launch 跑在 Dispatchers.Main.immediate 上，
+        //    也就是**当场同步执行**，第一句就是 ledEngine.render(now)。
+        //    如果还按"先 setContentView 再 new LedEngine"的顺序，
+        //    这里会抛 UninitializedPropertyAccessException，一开机就崩。
+        ledEngine = LedEngine()
+        ledEngine.defaultConfig()
+        ledEngine.setUiState(Led.UiState.IDLE)
+
+        screen = MainScreen(this)
+        setContentView(buildRoot())
+
+        // 运行时必须在 setContentView 之后：Ui 实现要用到 screen/bandView。
+        // 也必须在 startClock/startConnect 之前 —— 提醒引擎要先读到本地表，
+        // 断网时那张表就是设备唯一的信息来源。
+        deviceStore = DeviceStore(this)
+        runtime = DeviceRuntime(
+            this,
+            deviceStore,
+            uiBridge,
+            SERVER_BASE_URL,
+            DeviceIdentity.mac(this),
+            DeviceIdentity.clientId(this)
+        )
+        runtime.onPendingChanged = { pending ->
+            ledEngine.buttonPending(pending)
+            if (pending) ledEngine.medPending()
+        }
+        // 服务端 _enter_standby 会调 self.elder.standby（3s best-effort）。
+        // 这里必须接线：否则服务端日志写「设备已切换待机」，设备其实还停在
+        // 对话态或 KWS 半死状态，两边状态永久不一致。
+        runtime.onStandbyRequested = { runOnUiThread { endConversation() } }
+        runtime.start()
+
+        wakeEngine = WakeWordEngine(this) { keyword ->
+        if (!bound || voice?.isConnected != true) {
+            // 没连上就别让麦克风空着：立刻恢复监听，不能静默降级成"哑了"
+            Log.w(TAG, "唤醒检出但未连上服务端，恢复监听")
+            wakeEngine.resume()
+            screen.setHint("还没连上服务器，稍等一下")
+            return@WakeWordEngine
+        }
+        // 唤醒词路径要带 greet=true（服务端据此播一句"我在"），
+        // 并且只发**一次** detect —— beginListening 内部统一发，避免重复。
+        startConversation(keyword)
+    }
+
+        registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        registerReceiver(debugReceiver, IntentFilter(DebugBridge.ACTION))
+
+        startClock()
+        requestMicPermission()
+    }
+
+    // ------------------------------------------------------------------ 视图
+
+    private fun buildRoot(): View {
+        val root = FrameLayout(this)
+        root.addView(
+            screen.root,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+
+        // 色带叠在最上层（左右各 5mm）
+        bandView = LedBandView(this)
+        root.addView(
+            bandView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+
+        // 每帧把引擎算出的结果交给色带
+        scope.launch {
+            while (true) {
+                val now = SystemClock.elapsedRealtime()
+                // ⚠️ render() 只能调一次：它内部推进过期清理与状态机
+                val frame = ledEngine.render(now)
+                bandView.leftBand = frame.left
+                bandView.rightBand = frame.right
+                delay(33)   // ≈30fps，对齐固件 rgb_task 的节奏
+            }
+        }
+        return root
+    }
+
+    private fun startClock() {
+        scope.launch {
+            val fmt = SimpleDateFormat("HH:mm", Locale.CHINA)
+            while (true) {
+                screen.setClock(fmt.format(Date()))
+                screen.setStatus(wifiOk, batteryPercent, batteryCharging)
+                delay(10_000)
+            }
+        }
+    }
+
+    private val batteryReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+            val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
+            if (level >= 0 && scale > 0) batteryPercent = level * 100 / scale
+            hasBattery = intent.getBooleanExtra(BatteryManager.EXTRA_PRESENT, false)
+            val st = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+            batteryCharging = st == BatteryManager.BATTERY_STATUS_CHARGING ||
+                st == BatteryManager.BATTERY_STATUS_FULL
+            wifiOk = DeviceIdentity.wifiConnected(this@MainActivity)
+            if (::runtime.isInitialized) {
+                // present=false 表示这台设备没有电池（LX04 插电音箱就是这种）
+                runtime.updateBattery(batteryPercent, batteryCharging, hasBattery)
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ 连接
+
+    /**
+     * OTA → WebSocket。
+     *
+     * 未绑定时不是错误：把激活码显示出来，每 5 秒重试一次 ——
+     * 家属在手机 App 里输完码，设备这边**自己**就接上了，不用重启。
+     */
+    private fun startConnect() {
+        val deviceId = DeviceIdentity.mac(this)
+        val clientId = DeviceIdentity.clientId(this)
+        val ota = OtaClient(SERVER_BASE_URL, deviceId, clientId)
+
+        scope.launch {
+            while (true) {
+                val result = withContext(Dispatchers.IO) { ota.check() }
+                when (result) {
+                    is OtaClient.Result.Bound -> {
+                        bound = true
+                        // ⚠️ token **必须落盘**。心跳 /api/device/sync 用 Bearer 鉴权，
+                        //    只把它当局部变量传给 connectWs 的话，HTTP 一律 401
+                        //    「缺少设备凭证」，而 WS 却是通的 —— 症状是"能说话、
+                        //    没有提醒"，UI 显示已连接，日志里一切正常。
+                        //    真机实测（2026-11-05）就是这条：WS hello 成功，
+                        //    心跳连续 401。固件的 token 落 NVS 正是为了避免它。
+                        deviceStore.saveCredentials(
+                            result.wsUrl,
+                            result.token,
+                            System.currentTimeMillis() / 1000L
+                        )
+                        screen.hideActivation()
+                        screen.setHint("")
+                        // 刚落盘的 token 立刻用上，别等下一轮 5 秒轮询
+                        runtime.requestSyncNow()
+                        connectWs(result.wsUrl, result.token, deviceId, clientId)
+                        return@launch
+                    }
+                    is OtaClient.Result.NeedActivation -> {
+                        bound = false
+                        setUiState("activating")
+                        screen.showActivation(result.code)
+                        delay(5_000)
+                    }
+                    is OtaClient.Result.Failed -> {
+                        // 盘里有上次成功拿到的凭据 ⇒ **这次 OTA 失败不该把整台
+                        // 设备打哑**。服务端重启、网络抖动、证书过期都只是暂时
+                        // 的；固件用 NVS 里的旧 token 照样心跳，我们同理。
+                        if (deviceStore.hasToken && deviceStore.wsUrl.isNotEmpty()) {
+                            Log.i(TAG, "OTA 失败，改用已落盘的设备凭据连接")
+                            bound = true
+                            screen.hideActivation()
+                            screen.setHint("")
+                            connectWs(deviceStore.wsUrl, deviceStore.token, deviceId, clientId)
+                            return@launch
+                        }
+                        bound = false
+                        setUiState("offline")
+                        screen.setHint("连不上服务器：${result.message}")
+                        delay(5_000)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun connectWs(wsUrl: String, token: String, deviceId: String, clientId: String) {
+        val client = VoiceClient(object : VoiceClient.Listener {
+
+            override fun onConnected() {
+                wsOnline = true
+                runOnUiThread {
+                    setUiState("idle")
+                    screen.setHint("已连接")
+                }
+            }
+
+            override fun onDisconnected(reason: String) {
+                wsOnline = false
+                // 断线后没人会再发 standby，若不主动结束，对话态会一直占着麦
+                // 到超时。这里直接交还，重连后重新喊唤醒词即可。
+                runOnUiThread {
+                    if (inConversation) endConversation()
+                    setUiState("offline")
+                    screen.setHint(reason)
+                }
+                // 断线自动重连：老人不会来点"重试"
+                scope.launch {
+                    delay(3_000)
+                    if (!isFinishing) startConnect()
+                }
+            }
+
+            override fun onHello(sampleRate: Int, frameMs: Int) {
+                // ⚠️ 播放采样率必须跟**解码器输出**走，不能直接用 hello 的 24k。
+                //    解码器固定 48k（规避 Concentus 24k SILK 噪声，见 OpusCodec），
+                //    若这里仍开 24k 的 AudioTrack，48k 的 PCM 会被慢放一半。
+                opus.init(sampleRate)
+                player.start(opus.outputSampleRate())
+            }
+
+            override fun onStt(text: String) {
+                runOnUiThread { screen.setUserSaid(text) }
+            }
+
+            override fun onTtsState(state: String, text: String?) {
+                runOnUiThread {
+                    when (state) {
+                        "start" -> {
+                            speaking = true
+                            // 半双工：播报时不跑唤醒，也别占着麦克风
+                            wakeEngine.pause()
+                            setUiState("speaking")
+                        }
+                        "sentence_start" -> {
+                            if (!text.isNullOrBlank()) screen.setDeviceSaid(text)
+                        }
+                        "stop" -> {
+                            speaking = false
+                            if (inConversation) {
+                                // 固件 Speaking→Listening：播完自动回听，
+                                // **不**重开唤醒词检测、**不**拆对话采集。
+                                // 重发 listen start 是为了让服务端
+                                // _rearm_listening 重启静音看门狗；即使这条
+                                // 丢了，持续推的上行帧也会在 idle 态兜底重新武装。
+                                silentFrames = 0
+                                conversationDeadlineMs =
+                                    SystemClock.elapsedRealtime() + CONVERSATION_MAX_MS
+                                voice?.listenStart()
+                                setUiState("listening")
+                                screen.setHint("")
+                                Log.i(TAG, "播报结束：对话态自动回听（重发 listen start）")
+                            } else {
+                                wakeEngine.resume()
+                                setUiState("idle")
+                            }
+                        }
+                    }
+                }
+            }
+
+            override fun onEmotion(emotion: String) {
+                runOnUiThread {
+                    // 表情与灯效是两条独立通道（固件也是这么分的）：
+                    // 表情走 21 个词，灯效只认四态。
+                    screen.setEmoji(emotion)
+                }
+            }
+
+            override fun onAlert(message: String) {
+                runOnUiThread { screen.setHint(message) }
+            }
+
+            override fun onAudio(opusPacket: ByteArray) {
+                val pcm = ShortArray(opus.decodeFrameSamples)
+                val n = opus.decode(opusPacket, pcm)
+                if (n > 0) player.enqueue(pcm.copyOf(n))
+            }
+
+            /**
+             * 服务端调设备工具 —— **必须 3 秒内回包**。
+             *
+             * 这里只做转发：真正的分派在 [DeviceRuntime] 里（它只改内存，
+             * 不发网络）。本类不参与判断，避免和引擎各存一份真相。
+             */
+            override fun onMcp(payload: org.json.JSONObject?): String? =
+                runtime.handleMcp(payload)
+        })
+
+        if (client.connect(wsUrl, token, deviceId, clientId)) {
+            voice = client
+        } else {
+            screen.setHint("WebSocket 建立失败")
+        }
+    }
+
+    // ------------------------------------------------------------------ 一轮对话
+
+    /** 开始说话（按下中间键 / 调试命令触发）。 */
+    /**
+     * 开始聆听。
+     *
+     * @param ptt true = 按住说话（松手才结束）。
+     *
+     * 为什么必须区分：VAD 的静音自动收尾是给"唤醒后自由说"用的。
+     * 按住说话时如果也套 1.2 秒静音判据，老人从按下键到真正开口
+     * （清嗓子、想说什么）稍慢一点，话还没出口就被切断了 ——
+     * 表现为"按了没反应"。PTT 语义就是"按多久说多久"。
+     */
+    /**
+     * **单轮**聆听（按键 PTT / 调试 talk / 提醒追问）。
+     *
+     * 这是冷路径：会 `wakeEngine.pause()` 停掉 KWS 采集、新建一路对话采集，
+     * 结束时 `resume()` 重新打开。一次会话只发生一两次，HAL 交接可接受。
+     *
+     * ⚠️ **唤醒词路径不走这里** —— 走 [startConversation]，复用 KWS 那一路
+     *    AudioRecord，不 stop/start（见那里的说明）。
+     */
+    /**
+     * **单轮**聆听（按键 PTT / 调试 talk / 提醒追问）。
+     *
+     * 这是冷路径：会 `wakeEngine.pause()` 停掉 KWS 采集、新建一路对话采集，
+     * 结束时 `resume()` 重新打开。一次会话只发生一两次，HAL 交接可接受。
+     *
+     * ⚠️ **唤醒词路径不走这里** —— 走 [startConversation]，复用 KWS 那一路
+     *    AudioRecord，不 stop/start（见那里的说明）。
+     */
+    private fun beginListening(
+        ptt: Boolean = false,
+        /** 这一轮是谁唤醒的：按键 or 唤醒词。会原样上报给服务端做日志区分。 */
+        wakeSource: String = "按键唤醒",
+        /** 唤醒词路径要播一句问候；按键路径不播（老人只是想说话）。 */
+        greet: Boolean = false
+    ) {
+        if (sending) return
+        if (!bound || voice?.isConnected != true) {
+            screen.setHint("还没连上服务器，稍等一下")
+            return
+        }
+        // 半双工：正在播报就先打断，否则麦克风会把 TTS 自己录进去
+        if (speaking) {
+            voice?.abort()
+            player.flush()
+            speaking = false
+        }
+
+        // ⚠️ 必须先让出麦克风：LX04 的 HAL 不允许两个 AudioRecord 同时打开。
+        //    ⚠️ 只能调一次：重复 stop/start 会让 HAL 报
+        //    `startInputDevice(), input device already opened`。
+        wakeEngine.pause()
+
+        sending = true
+        pttMode = ptt
+        silentFrames = 0
+        screen.setUserSaid("")
+        screen.setDeviceSaid("")
+        setUiState("listening")
+
+        // ⚠️⚠️ 必须**先发 detect 再发 listen start** —— 服务端 `_on_listen`
+        //    detect 分支清 `_dismissed_until`（解除 180 秒待机冷却）并刷新
+        //    `_last_active_at`；start 分支若在冷却里就直接 return。顺序反了
+        //    等于没发。固件 application.cc:1007-1013 同一处理。
+        voice?.listenDetect(wakeSource, greet = greet)
+        voice?.listenStart()
+
+        val cap = AudioCapture { pcm, info ->
+            if (!sending) return@AudioCapture
+            val enc = opus.encode(pcm)
+            if (enc == null) {
+                noteEncodeDrop(info.rms)
+                return@AudioCapture
+            }
+            voice?.sendAudio(enc)
+
+            // 单轮模式才用设备 VAD 收尾；播报期间不收尾（listen stop 会被丢）
+            if (!pttMode && !speaking) {
+                if (info.isSpeech) silentFrames = 0 else silentFrames++
+                if (silentFrames * AudioCapture.FRAME_MS >= SILENCE_STOP_MS) {
+                    endListening()
+                }
+            }
+        }
+        capture = cap
+        if (!cap.start()) {
+            sending = false
+            setUiState("idle")
+            screen.setHint("麦克风打不开（可能被小爱占用）")
+        }
+    }
+
+    /**
+     * 唤醒词路径：进入**对话态**，复用 KWS 那一路 AudioRecord 持续推流。
+     *
+     * ## 为什么不能直接复用 beginListening()
+     *
+     * 旧实现 `WakeWordEngine.fire()` 先 `stopCaptureOnly()` 释放麦克风，
+     * `beginListening()` 再新建一路采集。MTK HAL 释放有延迟，实测每次唤醒：
+     * ```
+     * W/AudioALSAHardwareResourceManager: startInputDevice(), input device already opened
+     * E/AudioALSACaptureDataProviderNormal: [readThread] failed, errno: 1
+     * ```
+     * ⇒ 新采集读到全零 ⇒ 服务端 `21 帧 → 3 帧 / 语音=60ms / ASR 空`。
+     * 让老人唤醒后等 1.5 秒才开麦又不可接受，所以**根本不切换 AudioRecord**。
+     *
+     * ## 与固件 realtime 的语义对齐
+     *
+     * 唤醒一次就能连续聊：播报完 Speaking→Listening 自动回听、**不关上行
+     * 采集**、WakeNet 保持关闭。服务端为此写了 `idle 态收到上行帧自动
+     * _rearm_listening`（session.py:1652-1680）和 `speaking 态上行帧喂
+     * _feed_barge_in`（session.py:1690）两条兜底 —— 设备只管持续推流。
+     *
+     * ⚠️ 协议顺序：detect / start 必须在**第一批上行帧之前**发出，所以
+     *    先在主线程 sendJson，再 `takeOver()` 切消费者。
+     */
+    private fun startConversation(keyword: String) {
+        if (sending) return
+        if (!bound || voice?.isConnected != true) {
+            screen.setHint("还没连上服务器，稍等一下")
+            // fire() 已把 state 翻成 PAUSED；没连上必须把消费者交回去，
+            // 否则常驻唤醒监听会永久停摆。
+            wakeEngine.giveBack()
+            return
+        }
+
+        // ① 协议先行（采集线程此刻还在跑 feed()，但 state=PAUSED 会让它直接 return）
+        voice?.listenDetect(keyword, greet = true)
+        voice?.listenStart()
+
+        // ② 再切帧消费者：此后每 60ms 一帧走 [upstream]
+        sending = true
+        inConversation = true
+        pttMode = false
+        silentFrames = 0
+        conversationDeadlineMs = SystemClock.elapsedRealtime() + CONVERSATION_MAX_MS
+        screen.setUserSaid("")
+        screen.setDeviceSaid("")
+        setUiState("listening")
+
+        val ok = wakeEngine.takeOver { pcm, info -> upstream(pcm, info) }
+        if (!ok) {
+            // 极少数情形（KWS 采集刚好被 release）：降级到冷路径，
+            // 至少不让老人喊了完全没反应。
+            Log.e(TAG, "共享采集接管失败（KWS 采集不在），降级为单轮")
+            sending = false
+            inConversation = false
+            conversationDeadlineMs = 0L
+            beginListening(wakeSource = keyword, greet = true)
+            return
+        }
+        Log.i(TAG, "进入对话态：复用唤醒采集持续推流（零 HAL 切换）")
+    }
+
+    /** 对话态的上行帧消费者，跑在**采集线程**，不能碰 UI。 */
+    private fun upstream(pcm: ShortArray, info: AudioPreProcess.Frame) {
+        if (!sending) return
+
+        // ⚠️ 上行电平观测点（2026-11-06 真机）。
+        //
+        // 下行早就有「下行 PCM 电平」日志，上行一直没有 —— 而恰恰是上行出问题时
+        // 现场完全看不见：服务端只说「ASR 空」，设备侧日志全绿，两头都没数据。
+        //
+        // 现场（2026-11-06 09:25，用户连说 10 句）：
+        //   设备侧 rms=5，服务端 60 秒窗口指纹 rms=0.0003 peak=0.009（近乎全零）
+        //   而同一台设备 ALSA 直连能录到 rms 500+（扬声器 440Hz）
+        // ⇒ 必须能在设备侧看到「App 这一路到底采到多少」，才能把
+        //   「麦克风没声音」/「HAL 压制」/「前处理压成静音」三种可能分开。
+        //
+        // 正常说话应是 rms 500~1000；< 20 就是近零。
+        upFrames++
+        upSumRms += info.rms.toDouble()
+        if (info.isSpeech) upSpeechFrames++
+        if (upFrames >= 25) {
+            Log.i(
+                TAG,
+                "上行 PCM 电平：帧=$upFrames 平均rms=${"%.1f".format(upSumRms / upFrames)} " +
+                    "语音帧=$upSpeechFrames 增益=${"%.2f".format(info.gain)} " +
+                    "底噪=${"%.0f".format(info.noiseFloor)} " +
+                    "（${if (upSumRms / upFrames < 20) "疑似静音 ⚠️" else "有信号"}）"
+            )
+            upFrames = 0
+            upSumRms = 0.0
+            upSpeechFrames = 0
+        }
+
+        val enc = opus.encode(pcm)
+        if (enc == null) {
+            // ⚠️ 不能静默吞掉：Concentus 对某些真实帧会抛 OpusAssert，
+            //    encode() 返回 null ⇒ 这一帧凭空消失，服务端只看到静音。
+            noteEncodeDrop(info.rms)
+            return
+        }
+        voice?.sendAudio(enc)
+
+        // ⚠️ 对话态**不做设备本地 VAD 收尾**。端点检测交给服务端
+        //    `_silence_watchdog`（VOICE_SILENCE_MS=2000 + _has_real_speech），
+        //    它自己会 `_start_turn()` → ASR → TTS → 播完自动回 listening。
+        //    设备本地 1.2s 会在老人换气时把句子切断；更致命的是每轮
+        //    listen stop 都会累加一次「连续空识别」，3 次就把会话推进
+        //    180 秒待机冷却 —— 正是「唤醒后说话没响应」的自我复制机制。
+        if (inConversation && SystemClock.elapsedRealtime() > conversationDeadlineMs) {
+            Log.w(TAG, "对话态空闲超时，交还麦克风给唤醒词")
+            runOnUiThread { endConversation() }
+        }
+    }
+
+    /** 上行编码失败计数（诊断 Concentus OpusAssert 静默吞帧）。 */
+    private fun noteEncodeDrop(rms: Float) {
+        encodeDropFrames++
+        if (encodeDropFrames % 10 == 1) {
+            Log.w(TAG, "上行编码失败已丢 $encodeDropFrames 帧（rms=${"%.0f".format(rms)}）")
+        }
+    }
+
+    /**
+     * 结束**整个对话态**：只把帧消费者切回 KWS，**不** stop/start AudioRecord。
+     *
+     * 出口只有三个：服务端 `self.elder.standby`、本地空闲超时、调试命令。
+     * 这是全会话唯一重新打开唤醒词检测的地方，与固件 standby 里
+     * `EnableWakeWordDetection(true)` 是同一个动作。
+     */
+    private fun endConversation() {
+        if (!inConversation) return
+        inConversation = false
+        sending = false
+        pttMode = false
+        conversationDeadlineMs = 0L
+        wakeEngine.giveBack()
+        setUiState("idle")
+        screen.setHint("")
+        Log.i(TAG, "对话结束：帧消费者已切回唤醒词（AudioRecord 未重启）")
+    }
+
+    /** 说完了（单轮模式）。对话态不允许这里把采集拆掉。 */
+    private fun endListening() {
+        if (!sending) return
+        if (inConversation) {
+            Log.w(TAG, "对话态忽略单轮 endListening（只有 standby/超时才结束对话）")
+            return
+        }
+        sending = false
+        pttMode = false
+        capture?.stop()
+        capture = null
+        voice?.listenStop()
+        setUiState("idle")
+        screen.setHint("")
+        if (!speaking) wakeEngine.resume()
+    }
+
+    // ------------------------------------------------------------------ 按键
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val now = SystemClock.elapsedRealtime()
+
+        // 调试模式下把**每一个**按下的键原样打出来。
+        //
+        // 为什么需要这个：实机排查"按住中间键没反应"时，RecentQueue 里只有
+        // 音量减（scanCode=114），完全没有中间键的记录。可能是键没上报、
+        // 也可能是上报成了别的 keyCode。只打"确认键"的日志在那种情况下
+        // 永远是空的，分不清"没按到"还是"映射错了"。
+        if (event.action == KeyEvent.ACTION_DOWN && DebugBridge.enabled(this)) {
+            Log.i(
+                TAG,
+                "按键 code=${event.keyCode} scan=${event.scanCode} " +
+                    "dev=${event.deviceId} repeat=${event.repeatCount}"
+            )
+        }
+
+        when (event.keyCode) {
+            TopKeys.VOLUME_UP, TopKeys.VOLUME_DOWN -> {
+                // 交给系统处理音量（返回 false = 不消费）
+                return super.dispatchKeyEvent(event)
+            }
+        }
+
+        if (!TopKeys.isConfirmKey(event.keyCode)) {
+            return super.dispatchKeyEvent(event)
+        }
+
+        when (event.action) {
+            KeyEvent.ACTION_DOWN -> {
+                if (event.repeatCount == 0) {
+                    onPressStart(now)
+                } else {
+                    onPressRepeat(now)
+                }
+                return true
+            }
+
+            KeyEvent.ACTION_UP -> {
+                onPressEnd(now)
+                return true
+            }
+        }
+        return true
+    }
+
+    // -------------------------------------------------------------- 按键仲裁
+    //
+    // 一个物理键要承担三件事，靠"按下那一刻的状态"分流（见
+    // deliverables/gstack 的按键裁决表）：
+    //
+    //   有待确认 + 服药 → 确认机（**不录音**）：短按静默提示、满 3 秒追问哪味药
+    //   有待确认 + 日程 → 确认机（**不录音**）：短按或长按都直接确认
+    //   无待确认        → PTT 机：按下即开麦，松手结束（Android 特有）
+    //
+    // ⚠️ 为什么必须分流而不是"补一行 onRepeat 让长按生效"：
+    //    那样长按会变成"直接确认服药" —— 多药提醒分不清吃了哪几味，
+    //    等于替老人谎报服药。这是医疗场景下最不能接受的一类失真。
+
+    /** 按下（新的一次按压）。 */
+    private fun onPressStart(now: Long) {
+        pressResolved = false
+        keyDetector.onDown(now)
+        ledEngine.buttonPress(now)
+
+        // 有待确认项 ⇒ 确认机，**不开麦**。
+        // 老人在响铃期间按这个键是想"确认"，不是为了说话；
+        // 一按下就开麦会把他按下时的环境音当成一句话送上去。
+        pressIsConfirm = runtime.hasPendingConfirm()
+
+        if (!pressIsConfirm) {
+            // PTT：按下即说话（Android 没有离线唤醒词，这是唯一的起话入口）
+            beginListening(ptt = true)
+        }
+    }
+
+    /**
+     * 按住期间系统重复回调。
+     *
+     * **跨过 3 秒门槛的那一刻就执行确认**，不等松手 —— 这是生产固件的语义
+     * （`elder_bridge.cc` 的 `LONG_HOLD` 分支），与自测固件 `app_main.c` 的
+     * 两步式（长按挂起 → 30 秒内短按才算）**相反**。之前这里抄的是两步式，
+     * 而且 `onRepeat` 根本没有调用点，导致「长按确认」从来没生效过。
+     */
+    private fun onPressRepeat(now: Long) {
+        if (pressResolved) return
+        if (!keyDetector.onRepeat(now)) return
+
+        // 刚跨过 3 秒
+        pressResolved = true
+
+        if (!pressIsConfirm) {
+            // PTT 机：按住超过 3 秒是正常说话，什么都不做
+            return
+        }
+
+        val item = runtime.firstRingingItem()
+        val ok = runtime.onHoldConfirm()
+
+        if (!ok) {
+            // 没有可确认项（理论上有待确认才会进确认机，这里是兜底）
+            ledEngine.buttonRelease(now)
+            return
+        }
+
+        // 灯反馈：按够 3 秒就该有回执，不能让老人以为没按上。
+        // 固件里粉红闪从未真正上屏（emit 同步直调 + 优先级抢占，下一帧已被
+        // 天蓝覆盖），所以这里**不退粉红**，直接给天蓝。
+        ledEngine.buttonAcknowledged(now)
+
+        if (item != null && item.isMedicine) {
+            // 服药类：已置"按键发起"标记，接下来追问哪一味药并开麦。
+            askWhichMedicine(item)
+        }
+    }
+
+    /** 松手。 */
+    private fun onPressEnd(now: Long) {
+        val result = keyDetector.onUp(now)
+
+        if (pressResolved) {
+            // 本轮已经落地（3 秒确认过），松手不再产生任何判定或反馈 ——
+            // 再开一次窗就等于给老人两次确认机会，多药场景下会记错。
+            keyDetector.reset()
+            pressResolved = false
+            pressIsConfirm = false
+            return
+        }
+
+        if (!pressIsConfirm) {
+            // PTT 机：松手即结束说话
+            endListening()
+            ledEngine.buttonRelease(now)
+            pressIsConfirm = false
+            return
+        }
+
+        // 确认机 + 未满 3 秒 = 短按
+        val item = runtime.firstRingingItem()
+        if (item != null && !item.isMedicine) {
+            // 日程/待办：短按直接确认，天蓝 3 次。
+            // 这里**不走 buttonRelease**（那会先闪失败色），因为日程类是
+            // 短按确认、不是"按不够" —— 同样的 <3 秒松手，两类提醒的判据相反。
+            if (runtime.onShortPress()) {
+                ledEngine.buttonConfirmed(now)
+            } else {
+                ledEngine.buttonRelease(now)
+            }
+        } else {
+            // 服药类短按：什么都不做（防误触），灯给一次"按不够"的提示。
+            ledEngine.buttonRelease(now)
+            screen.setHint("请长按 3 秒确认已服药")
+        }
+        pressIsConfirm = false
+    }
+
+    /**
+     * 服药类长按后的追问：问清是哪一味药，再进对话让服务端判定。
+     *
+     * 固件是"播预录片段 MED_CONFIRM 后开麦"。LX04 没有预录片段资源
+     * （`playClip` 返回 false），所以这里用**屏显 + 直接开麦**：
+     * 服务端在这一轮会话里知道有待确认提醒，会把老人的回答映射成
+     * `confirm_reminder` 工具调用。
+     */
+    private fun askWhichMedicine(item: com.elder.lx04.reminder.ReminderItem) {
+        val ask = if (item.medicines.size >= 2) {
+            "您吃的是哪种药？" + item.medicines.joinToString("、")
+        } else {
+            "我帮您确认一下，您刚才已经服用过${item.label}了吗？"
+        }
+        screen.showReminder("请告诉我吃了哪种药", ask)
+        setUiState("listening")
+        beginListening(ptt = false)
+    }
+
+    // ------------------------------------------------------------------ 状态
+
+    /** 切界面状态。名字与固件 `elder_ui_state_t` 对齐。 */
+    private fun setUiState(state: String) {
+        screen.setEmoji(MainScreen.STATE_EMOJI[state] ?: "neutral")
+
+        // 灯效只认四态，与表情是两套独立枚举（固件也是分开的）
+        val ledState = when (state) {
+            "listening" -> Led.UiState.LISTENING
+            "speaking" -> Led.UiState.SPEAKING
+            "offline" -> Led.UiState.CONNECTING
+            else -> Led.UiState.IDLE
+        }
+        ledEngine.setUiState(ledState)
+    }
+
+    // ------------------------------------------------------------------ 权限
+
+    private fun requestMicPermission() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            startConnect()
+            startWakeWord()
+            return
+        }
+        requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQ_MIC)
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_MIC) {
+            val granted = grantResults.isNotEmpty() &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                screen.setHint("没有麦克风权限，无法对话")
+            }
+            // 没麦克风也把连接建起来 —— 至少能收到提醒、能显示字幕
+            startConnect()
+            if (granted) startWakeWord()
+        }
+    }
+
+    /**
+     * 启动常驻唤醒监听。
+     *
+     * ⚠️ 失败**必须可见**：so / 模型缺失时若静默跳过，真机上表现就是
+     * 「没有语音唤醒」，而日志里一切正常，排查时只会去查权限和 WS。
+     * 所以这里屏显 + ERROR 日志，设备退化为按键唤醒但明确告诉使用者。
+     */
+    private fun startWakeWord() {
+        if (!wakeEngine.start()) {
+            val why = wakeEngine.lastError
+            Log.e(TAG, "语音唤醒未就绪：$why")
+            screen.setHint("语音唤醒未就绪，请按中间键说话")
+        } else {
+            Log.i(TAG, "语音唤醒已启动：${WakeWordEngine.WAKE_WORD}")
+        }
+    }
+
+
+    // ------------------------------------------------------------------ 麦克风自检
+
+    /**
+     * 麦克风自检 —— 不开 WebSocket，纯本地验证"能不能录到声音"。
+     *
+     * ## 为什么需要它
+     *
+     * LX04 上常驻着 `MiVpmService`（小爱唤醒，init 服务 `mivpm`），
+     * 它一直挂在 `AudioIn_1E` 上录音（`dumpsys media.audio_flinger` 里
+     * `Standby: no`）。我们的 AudioRecord 能不能和它**同时**打开，
+     * 取决于 MTK HAL 允不允许同源共享 —— 这是整条语音链路上
+     * 唯一一个"猜不出来、只能试"的点。
+     *
+     * 如果打不开，表现为 `AudioRecord` state 不是 INITIALIZED、
+     * 或 `startRecording` 后读回来的全是 0。这两种情况在这里都能看出来。
+     *
+     * ## 怎么读日志
+     *
+     * 每 10 帧（0.6 秒）打一行：
+     *   · `rms` 恒为 0        → 录到的是静音，麦克风没真给我们
+     *   · `rms` 有值但很小     → 通路通了，只是环境安静（正常）
+     *   · `floor` 跟着 `rms` 走 → 噪声底跟踪在工作
+     *   · `speech=true`        → VAD 判到人声（对着音箱说话时）
+     *
+     * 用法：`adb shell am broadcast -a com.elder.lx04.DEBUG --es cmd mic_test`
+     */
+    /**
+     * Opus 编码器自检 —— 完全不碰麦克风和网络。
+     *
+     * ## 为什么需要它
+     *
+     * 实机上"按住说话"没反应，抓到的日志是 `编码失败: null`，打堆栈后
+     * 看到是 Concentus 内部的 `OpusAssert`。但同样的代码在 JVM 单测里
+     * 连编 10 帧毫无问题 —— 说明不是库本身，是**设备上的运行时状态**。
+     *
+     * 分叉只有两种，修法完全不同：
+     *
+     * ```
+     * 正弦也能编出来  → 编码器是好的，坏的是喂进去的麦克风数据
+     *                    （数组长度、并发踩踏、采集线程提前退出）
+     * 正弦也编不出来  → 编码器实例本身坏了
+     *                    （初始化没生效 / 被并发重置 / 参数没设进去）
+     * ```
+     *
+     * 用固定正弦而不是麦克风，就是把"输入"这个变量钉死。
+     *
+     * 用法：`adb shell am broadcast -a com.elder.lx04.DEBUG --es cmd opus_selftest`
+     */
+    private fun runOpusSelfTest() {
+        if (sending) {
+            Log.w(TAG, "opus_selftest 忽略 —— 正在对话中")
+            return
+        }
+        screen.setHint("Opus 自检中…")
+        opus.resetDiag()
+
+        scope.launch(Dispatchers.Default) {
+            val sb = StringBuilder()
+            sb.append("参数 ").append(opus.describe()).append('\n')
+
+            // ---- 1. 固定 440Hz 正弦，连编 5 帧 ----
+            val tone = ShortArray(opus.encodeFrameSamples) { i ->
+                (8000 * Math.sin(2 * Math.PI * 440 * i / 16_000.0)).toInt().toShort()
+            }
+            var okTone = 0
+            var bytesTone = 0
+            repeat(5) {
+                val b = opus.encode(tone)
+                if (b != null) {
+                    okTone++
+                    bytesTone += b.size
+                }
+            }
+            sb.append("正弦 5 帧：成功 $okTone，共 $bytesTone 字节\n")
+            sb.append("计数：${opus.stats()}\n")
+
+            // ---- 2. 全静音 3 帧（按住键还没开口时就是这个） ----
+            var okSilent = 0
+            repeat(3) { if (opus.encode(ShortArray(opus.encodeFrameSamples)) != null) okSilent++ }
+            sb.append("静音 3 帧：成功 $okSilent\n")
+
+            val verdict = when {
+                okTone == 0 -> "编码器坏了（正弦都编不出）"
+                okTone < 5 -> "编码器不稳定（正弦 $okTone/5）"
+                okSilent < 3 -> "静音帧异常（$okSilent/3），可能是 DTX 相关"
+                else -> "编码器正常 —— 问题在麦克风数据"
+            }
+            sb.append("结论：").append(verdict)
+
+            Log.i(TAG, "opus_selftest\n$sb")
+            screen.setHint("Opus：正弦 $okTone/5 静音 $okSilent/3 → $verdict")
+        }
+    }
+
+    /**
+     * 语音链路自检 —— 判定"帧到底出没出客户端"。
+     *
+     * ## 为什么需要它
+     *
+     * 症状是"按了没反应"，但链路上有 6 个环节可能断：
+     *
+     * ```
+     * 麦克风 → 前处理 → Opus 编码 → WS 上行 → 服务端待机 → ASR/TTS
+     * ```
+     *
+     * 光看"没声音"分不清是哪一环断了。这个自检**不发网络包**，
+     * 只在本地跑完整条上行链：采集 → 前处理 → 编码 → 统计。
+     *
+     * 怎么读结果：
+     *
+     * ```
+     * 读到 0 帧          → 麦克风/采集这一环（多半被 mivpm 占着）
+     * 读到帧但编码 0 帧  → Opus 编码这一环（编码器坏了）
+     * 编码 0 帧但失败 0  → 编码器不可用（init 没生效）
+     * 全部正常          → 客户端没问题，断点在 WS 上行或服务端
+     * ```
+     *
+     * 用法：`adb shell am broadcast -a com.elder.lx04.DEBUG --es cmd link_test`
+     */
+    private fun runLinkTest() {
+        if (sending) {
+            Log.w(TAG, "link_test 忽略 —— 正在对话中")
+            return
+        }
+        screen.setHint("链路自检中（5 秒）…")
+
+        val frames = java.util.concurrent.atomic.AtomicInteger(0)
+        val speech = java.util.concurrent.atomic.AtomicInteger(0)
+        val encOk = java.util.concurrent.atomic.AtomicInteger(0)
+        val encNull = java.util.concurrent.atomic.AtomicInteger(0)
+        val encBytes = java.util.concurrent.atomic.AtomicInteger(0)
+
+        val cap = AudioCapture { pcm, _ ->
+            frames.incrementAndGet()
+            val enc = opus.encode(pcm)
+            if (enc == null) encNull.incrementAndGet()
+            else {
+                encOk.incrementAndGet()
+                encBytes.addAndGet(enc.size)
+            }
+        }
+        if (!cap.start()) {
+            Log.e(TAG, "link_test: 采集启动失败 —— 麦克风被占用（多半是 MiVpmService）")
+            screen.setHint("链路自检失败：麦克风打不开")
+            return
+        }
+
+        scope.launch {
+            delay(5_000)
+            cap.stop()
+
+            val f = frames.get()
+            val ok = encOk.get()
+            val bad = encNull.get()
+            val verdict = when {
+                f == 0 -> "一帧都没采到 —— 断点在麦克风/采集"
+                ok == 0 -> "采到 $f 帧但一帧都没编出来 —— 断点在 Opus 编码"
+                bad > 0 -> "编出 $ok/$f 帧，有 $bad 帧失败 —— 编码器不稳定"
+                else -> "客户端上行链完好：采 $f 帧 / 编 $ok 帧 / 共 ${encBytes.get()} 字节"
+            }
+            Log.i(TAG, "link_test：$verdict | ${opus.stats()}")
+            screen.setHint(verdict)
+        }
+    }
+
+    /**
+     * 注入一段 PCM 音频，走**完整上行链路**（端到端验收用）。
+     *
+     * ## 为什么需要它
+     *
+     * 实机有个绕不开的坑：**设备扬声器放出来的声音，麦克风采不到**
+     * （MTK 的 HAL 在 AudioFlinger 录音路径上做了回声消除；用 tinycap 直连
+     * ALSA 录是能录到的，rms 4589 vs App 侧近乎全零）。
+     * ⇒ 想在**没有人说话**的情况下验证「语音 → ASR → TTS」闭环，
+     *   只能把一段已知语音**直接注入**上行链路。
+     *
+     * 注入的是**真实语音**（服务端 Edge TTS 合成的中文），
+     * 所以服务端 ASR 能不能识别出来，是货真价实的判据。
+     *
+     * 用法：
+     * ```
+     * adb push say.wav /sdcard/Android/data/com.elder.lx04/files/say.wav
+     * adb shell am broadcast -a com.elder.lx04.DEBUG --es cmd inject
+     * ```
+     *
+     * ⚠️ **必须放在 App 专属目录**：本 App 没有申请 READ_EXTERNAL_STORAGE，
+     *    读 `/sdcard/say.wav` 会 Permission denied（Android 8.1 实测）。
+     *    而 `/sdcard/Android/data/<包名>/files/` 是 Android 4.4+ 授予每个
+     *    App 的专属目录，**不需要任何运行时权限**。
+     */
+    private fun runInject() {
+        if (sending) {
+            Log.w(TAG, "inject 忽略 —— 正在对话中")
+            return
+        }
+        // 候选路径：App 专属外部目录（免权限）→ App 私有目录 → /sdcard 根
+        val candidates = listOf(
+            java.io.File("/sdcard/Android/data/com.elder.lx04/files/say.wav"),
+            java.io.File(filesDir, "say.wav"),
+            java.io.File("/sdcard/say.wav"),
+        )
+        val f = candidates.firstOrNull { it.exists() && it.canRead() }
+        if (f == null) {
+            Log.e(TAG, "inject：找不到 say.wav，试过 ${candidates.joinToString { it.path }}")
+            screen.setHint("注入失败：设备上没有 say.wav")
+            return
+        }
+        screen.setHint("注入上行链路中…")
+
+        scope.launch(Dispatchers.Default) {
+            val pcm = readWav16k(f)
+            if (pcm == null || pcm.size < 960) {
+                Log.e(TAG, "inject：WAV 解析失败或太短")
+                screen.setHint("注入失败：WAV 解析失败")
+                return@launch
+            }
+            Log.i(TAG, "inject：读入 ${pcm.size} 样本（${pcm.size / 960} 帧） from ${f.path}")
+
+            voice?.listenDetect("按键唤醒", greet = false)
+            voice?.listenStart()
+
+            var sent = 0
+            var off = 0
+            while (off + 960 <= pcm.size) {
+                val frame = pcm.copyOfRange(off, off + 960)
+                val enc = opus.encode(frame)
+                if (enc != null) {
+                    voice?.sendAudio(enc)
+                    sent++
+                }
+                off += 960
+                // 按真实节奏送（60ms/帧），别把服务端静音看门狗压过去
+                delay(60)
+            }
+            Log.i(TAG, "inject：已发送 $sent 帧")
+            delay(800)
+            voice?.listenStop()
+            screen.setHint("注入完成：$sent 帧")
+        }
+    }
+
+    /** 读 16kHz / 单声道 / 16bit 的 PCM WAV，返回样本；解析不出来返回 null。 */
+    private fun readWav16k(f: java.io.File): ShortArray? {
+        return try {
+            val all = f.readBytes()
+            var off = 12
+            var dataOff = -1
+            var dataLen = 0
+            while (off + 8 <= all.size) {
+                val id = String(all, off, 4, Charsets.US_ASCII)
+                val len = java.nio.ByteBuffer.wrap(all, off + 4, 4)
+                    .order(java.nio.ByteOrder.LITTLE_ENDIAN).int
+                if (id == "data") {
+                    dataOff = off + 8
+                    dataLen = len
+                    break
+                }
+                off += 8 + len + (len and 1)
+            }
+            if (dataOff < 0) return null
+            val n = dataLen / 2
+            val out = ShortArray(n)
+            val bb = java.nio.ByteBuffer.wrap(all, dataOff, dataLen)
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            for (i in 0 until n) out[i] = bb.short
+            out
+        } catch (t: Throwable) {
+            Log.e(TAG, "inject：读 WAV 失败 ${t.javaClass.simpleName}: ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * Opus 编码探针 —— 在**真机**上把"为什么一帧都编不出来"钉死。
+     *
+     * ## 为什么需要它
+     *
+     * 2026-11-05 实机事实（三条互相矛盾，指向真机运行时）：
+     *
+     *   · `opus_selftest`：合成正弦 5/5、全零静音 3/3 **成功** ⇒ 编码器没坏
+     *   · `link_test` / `talk`：真实麦克风帧 **165/165 失败**（Inlines.OpusAssert）
+     *   · 本机 JVM 上用**同一份 Concentus** 编码真实录音（含各种电平、
+     *     削顶、双声道交错）**全部成功**
+     *
+     * 光看日志分不清是"效果链把数据改了"还是"ART 上的某种差异"，
+     * 所以这个探针把变量一个个拆开：
+     *
+     *   ① 平台效果链（NS/AGC/AEC）开 / 关 —— 同样的麦克风，两种处理
+     *   ② 真实帧 / 归一化后的真实帧 / 全零 / 合成正弦
+     *   ③ 直连 Concentus（拿得到真实断言位置）**和** 生产 OpusCodec
+     *      （拿得到生产路径的真实行为）
+     *
+     * 另外把真实帧落盘到 app 私有目录，可以拉回本机 JVM 复现。
+     *
+     * 用法：`adb shell am broadcast -a com.elder.lx04.DEBUG --es cmd enc_probe`
+     */
+    private fun runEncProbe() {
+        if (sending) {
+            Log.w(TAG, "enc_probe 忽略 —— 正在对话中")
+            return
+        }
+        screen.setHint("编码探针中…")
+
+        scope.launch(Dispatchers.Default) {
+            val sb = StringBuilder()
+            for (fx in listOf(true, false)) {
+                val frames = captureProbeFrames(enableEffects = fx, want = 40, timeoutMs = 4000)
+                sb.append("── 平台效果链 ${if (fx) "开" else "关"} ──\n")
+                if (frames.isEmpty()) {
+                    sb.append("  采不到帧（麦克风被占）\n")
+                    continue
+                }
+                val st = frameStats(frames)
+                sb.append("  帧数=${frames.size} min=${st.first} max=${st.second} rms=${st.third}\n")
+                sb.append(probeConcentus("真实帧", frames))
+                sb.append(probeConcentus("归一化×8", frames.map { scaleFrame(it, 8.0) }))
+                sb.append(probeConcentus("全零对照", frames.map { ShortArray(it.size) }))
+                sb.append(probeConcentus("正弦对照", frames.map { toneFrame(it.size) }))
+                sb.append(probeCodec("真实帧(生产 OpusCodec)", frames))
+                val name = if (fx) "elder_pcm_fx.bin" else "elder_pcm_nofx.bin"
+                sb.append("  落盘：${dumpFrames(frames, name)}\n")
+            }
+            Log.i(TAG, "enc_probe\n$sb")
+            screen.setHint("探针完成，见 logcat")
+        }
+    }
+
+    /** 采集若干帧真实数据（可选择是否挂平台效果链）。 */
+    private fun captureProbeFrames(
+        enableEffects: Boolean,
+        want: Int,
+        timeoutMs: Long
+    ): List<ShortArray> {
+        val frames = java.util.Collections.synchronizedList(ArrayList<ShortArray>())
+        // ⚠️ 第一个参数是 enablePlatformEffects，第二个才是回调 lambda ——
+        //    Kotlin 的尾随 lambda 只能绑最后一个参数。
+        val cap = AudioCapture(enableEffects) { pcm, _ ->
+            if (frames.size < want) frames.add(pcm.copyOf())
+        }
+        if (!cap.start()) return emptyList()
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        while (frames.size < want && SystemClock.elapsedRealtime() < deadline) {
+            Thread.sleep(50)
+        }
+        cap.stop()
+        return frames.toList()
+    }
+
+    /** 帧的数值特征：min、max、rms。 */
+    private fun frameStats(frames: List<ShortArray>): Triple<Int, Int, String> {
+        var mn = Int.MAX_VALUE
+        var mx = Int.MIN_VALUE
+        var sum = 0.0
+        var n = 0
+        for (f in frames) {
+            for (v in f) {
+                val iv = v.toInt()
+                if (iv < mn) mn = iv
+                if (iv > mx) mx = iv
+                sum += iv.toDouble() * iv
+                n++
+            }
+        }
+        return Triple(mn, mx, String.format(Locale.US, "%.1f", Math.sqrt(sum / n)))
+    }
+
+    /** 放大并饱和（模拟 AGC 拉满）。 */
+    private fun scaleFrame(f: ShortArray, k: Double): ShortArray {
+        val out = ShortArray(f.size)
+        for (i in f.indices) {
+            val v = f[i] * k
+            val clipped = if (v > 32767.0) 32767 else if (v < -32768.0) -32768 else v
+            out[i] = clipped.toInt().toShort()
+        }
+        return out
+    }
+
+    /** 合成 440Hz 正弦（对照用）。 */
+    private fun toneFrame(n: Int): ShortArray {
+        val out = ShortArray(n)
+        for (i in 0 until n) {
+            out[i] = (8000 * Math.sin(2 * Math.PI * 440 * i / 16_000.0)).toInt().toShort()
+        }
+        return out
+    }
+
+    /**
+     * 直连 Concentus 编码。
+     *
+     * 目的是拿到**真实异常**：生产 [OpusCodec] 会把异常兜住（重建 → 重试 →
+     * 返回 null），日志里只看得到"失败 165 帧"，看不到断言发生在哪一行。
+     */
+    private fun probeConcentus(label: String, frames: List<ShortArray>): String {
+        val encoder = try {
+            org.concentus.OpusEncoder(
+                16_000,
+                1,
+                org.concentus.OpusApplication.OPUS_APPLICATION_VOIP
+            ).apply {
+                setBitrate(24_000)
+                setUseVBR(true)
+                setUseDTX(false)
+                setComplexity(5)
+            }
+        } catch (e: Throwable) {
+            return "  $label：编码器构造失败 ${e.javaClass.simpleName}: ${e.message}\n"
+        }
+        val buf = ByteArray(1275)
+        var ok = 0
+        for (f in frames) {
+            try {
+                val n = encoder.encode(f, 0, f.size, buf, 0, buf.size)
+                if (n > 0) ok++
+            } catch (t: Throwable) {
+                val top = t.stackTrace.take(3).joinToString(" | ") { it.toString() }
+                return "  $label：成功 $ok/${frames.size} 后失败 ${t.javaClass.simpleName}: ${t.message}\n" +
+                    "      $top\n"
+            }
+        }
+        return "  $label：成功 $ok/${frames.size}\n"
+    }
+
+    /** 走生产 [OpusCodec] —— 看生产路径的真实行为（成功/失败计数）。 */
+    private fun probeCodec(label: String, frames: List<ShortArray>): String {
+        val codec = OpusCodec()
+        codec.init(24_000)
+        var ok = 0
+        for (f in frames) {
+            if (codec.encode(f) != null) ok++
+        }
+        return "  $label：成功 $ok/${frames.size} | ${codec.stats()}\n"
+    }
+
+    /** 把真实帧落盘（app 私有目录），便于拉回本机 JVM 复现。 */
+    private fun dumpFrames(frames: List<ShortArray>, name: String): String {
+        return try {
+            val f = java.io.File(filesDir, name)
+            java.io.FileOutputStream(f).use { os ->
+                for (fr in frames) {
+                    val b = ByteArray(fr.size * 2)
+                    for (i in fr.indices) {
+                        val v = fr[i].toInt()
+                        b[i * 2] = (v and 0xff).toByte()
+                        b[i * 2 + 1] = ((v shr 8) and 0xff).toByte()
+                    }
+                    os.write(b)
+                }
+            }
+            "${f.absolutePath}（${frames.size} 帧）"
+        } catch (e: Throwable) {
+            "落盘失败：${e.javaClass.simpleName}: ${e.message}"
+        }
+    }
+
+    /**
+     * 麦克风参数矩阵 —— 找出这台设备上**真的能拿到数据**的采集参数。
+     *
+     * ## 为什么需要它
+     *
+     * 2026-11-05 实机事实（三条互相咬合的证据）：
+     *
+     *   · `tinycap` 直连 ALSA（pcm1c）：rms 2270，**有真实信号**
+     *   · App 走 AudioFlinger：ALSA `state: PREPARED`（**流没跑起来**），
+     *     读到的帧**全是 0**，4 秒只有 4 帧
+     *   · AudioFlinger 日志：`startInputDevice(), input device already opened`
+     *
+     * ⇒ 问题不在 ALSA 层，而在「AudioFlinger 用什么参数打开设备」。
+     *   所以把 (音频源 × 采样率 × 通道数) 全试一遍，
+     *   看哪一组能拿到**非零**数据；拿到的原始样本会落盘，
+     *   拉回本机 JVM 就能复现 Opus 断言。
+     *
+     * 每组之间**必须等设备释放**（MTK 的 HAL 释放有延迟，
+     * 下一组立刻开会撞上 "input device already opened"）。
+     *
+     * 用法：`adb shell am broadcast -a com.elder.lx04.DEBUG --es cmd mic_matrix`
+     */
+    private fun runMicMatrix() {
+        if (sending) {
+            Log.w(TAG, "mic_matrix 忽略 —— 正在对话中")
+            return
+        }
+        screen.setHint("麦克风参数矩阵…")
+
+        scope.launch(Dispatchers.Default) {
+            val sb = StringBuilder()
+            for (c in MIC_CASES) {
+                val r = tryMicCase(c)
+                sb.append(
+                    String.format(
+                        Locale.US,
+                        "%-40s frames=%-5d min=%-7d max=%-7d rms=%-10.1f %s%n",
+                        c.label, r.frames, r.min, r.max, r.rms, r.note,
+                    )
+                )
+                if (r.rms > 1.0 && r.samples != null) {
+                    sb.append("    落盘：${dumpSamples(r.samples, "mic_matrix_${c.label.replace(' ', '_')}.bin")}\n")
+                }
+            }
+            Log.i(TAG, "mic_matrix\n$sb")
+            screen.setHint("矩阵完成，见 logcat")
+        }
+    }
+
+    /** 矩阵里的一组参数。 */
+    private data class MicCase(
+        val label: String,
+        val source: Int,
+        val rate: Int,
+        val channels: Int,
+    )
+
+    /** 矩阵里一组的测量结果。 */
+    private data class MicResult(
+        val frames: Int,
+        val min: Int,
+        val max: Int,
+        val rms: Double,
+        val note: String,
+        val samples: ShortArray?,
+    )
+
+    /** 直连 AudioRecord 试一组参数，采 2.5 秒。 */
+    private fun tryMicCase(c: MicCase): MicResult {
+        val mask =
+            if (c.channels == 2) AudioFormat.CHANNEL_IN_STEREO else AudioFormat.CHANNEL_IN_MONO
+        var rec: AudioRecord? = null
+        return try {
+            val minBuf = AudioRecord.getMinBufferSize(
+                c.rate, mask, AudioFormat.ENCODING_PCM_16BIT
+            )
+            if (minBuf <= 0) {
+                return MicResult(0, 0, 0, 0.0, "getMinBufferSize=$minBuf", null)
+            }
+            rec = AudioRecord(
+                c.source, c.rate, mask, AudioFormat.ENCODING_PCM_16BIT,
+                maxOf(minBuf, c.rate / 5 * 2 * c.channels),
+            )
+            if (rec.state != AudioRecord.STATE_INITIALIZED) {
+                return MicResult(0, 0, 0, 0.0, "未初始化 state=${rec.state}", null)
+            }
+            rec.startRecording()
+            if (rec.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                return MicResult(0, 0, 0, 0.0, "startRecording 失败", null)
+            }
+
+            val chunk = ShortArray(c.rate / 20)          // 50ms
+            val all = java.io.ByteArrayOutputStream()
+            var frames = 0
+            var mn = Int.MAX_VALUE
+            var mx = Int.MIN_VALUE
+            var sum = 0.0
+            var n = 0
+            val deadline = SystemClock.elapsedRealtime() + 2500
+            while (SystemClock.elapsedRealtime() < deadline) {
+                val got = rec.read(chunk, 0, chunk.size)
+                if (got > 0) {
+                    frames++
+                    val b = ByteArray(got * 2)
+                    for (i in 0 until got) {
+                        val v = chunk[i].toInt()
+                        b[i * 2] = (v and 0xff).toByte()
+                        b[i * 2 + 1] = ((v shr 8) and 0xff).toByte()
+                        if (v < mn) mn = v
+                        if (v > mx) mx = v
+                        sum += v.toDouble() * v
+                        n++
+                    }
+                    all.write(b)
+                } else {
+                    Thread.sleep(20)
+                }
+            }
+            val rms = if (n > 0) Math.sqrt(sum / n) else 0.0
+            val samples = ShortArray(n)
+            val raw = all.toByteArray()
+            for (i in 0 until n) {
+                samples[i] = ((raw[i * 2].toInt() and 0xff) or (raw[i * 2 + 1].toInt() shl 8)).toShort()
+            }
+            MicResult(
+                frames,
+                if (mn == Int.MAX_VALUE) 0 else mn,
+                if (mx == Int.MIN_VALUE) 0 else mx,
+                rms,
+                "readFrames=$frames",
+                samples,
+            )
+        } catch (t: Throwable) {
+            MicResult(0, 0, 0, 0.0, "异常 ${t.javaClass.simpleName}: ${t.message}", null)
+        } finally {
+            runCatching { rec?.stop() }
+            runCatching { rec?.release() }
+            // ⚠️ 必须等：MTK 的 HAL 释放有延迟，立刻开下一组会撞上
+            //    "input device already opened"，那一组就必然全零。
+            Thread.sleep(1500)
+        }
+    }
+
+    /** 落盘原始样本（app 私有目录），供拉回本机 JVM 复现。 */
+    private fun dumpSamples(samples: ShortArray, name: String): String {
+        return try {
+            val f = java.io.File(filesDir, name)
+            java.io.FileOutputStream(f).use { os ->
+                val b = ByteArray(samples.size * 2)
+                for (i in samples.indices) {
+                    val v = samples[i].toInt()
+                    b[i * 2] = (v and 0xff).toByte()
+                    b[i * 2 + 1] = ((v shr 8) and 0xff).toByte()
+                }
+                os.write(b)
+            }
+            "${f.absolutePath}（${samples.size} 样本）"
+        } catch (e: Throwable) {
+            "落盘失败：${e.javaClass.simpleName}: ${e.message}"
+        }
+    }
+
+    private fun runMicTest() {
+        if (sending) {
+            Log.w(TAG, "mic_test 忽略 —— 正在对话中")
+            return
+        }
+        screen.setHint("麦克风自检中（5 秒）…")
+        var frames = 0
+        var speechFrames = 0
+        var maxRms = 0f
+
+        val cap = AudioCapture { _, info ->
+            frames++
+            if (info.isSpeech) speechFrames++
+            // ⚠️ 前 10 帧（0.6 秒）不计入峰值：麦克风上电有一声爆音，
+            //    实测 rms 能到 5000+，会把"这台机器到底能不能录到人声"
+            //    这个问题糊成"能" —— 而实际上它只是电源瞬态。
+            if (frames > 10 && info.rms > maxRms) maxRms = info.rms
+            if (frames % 10 == 0) {
+                Log.i(
+                    TAG,
+                    "mic[$frames] rms=${"%.0f".format(info.rms)} " +
+                        "floor=${"%.0f".format(info.noiseFloor)} " +
+                        "gain=${"%.2f".format(info.gain)} speech=${info.isSpeech}"
+                )
+            }
+        }
+        if (!cap.start()) {
+            Log.e(TAG, "mic_test: 采集启动失败 —— 麦克风被占用（多半是 MiVpmService）")
+            screen.setHint("麦克风打不开：被小爱占用")
+            return
+        }
+        scope.launch {
+            delay(5_000)
+            cap.stop()
+            val verdict = when {
+                frames == 0 -> "一帧都没读到 —— 采集链路断了"
+                maxRms < 1f -> "读到了 $frames 帧但全是 0 —— 麦克风没真给我们"
+                else -> "正常：$frames 帧，语音帧 $speechFrames，峰值 rms=${"%.0f".format(maxRms)}"
+            }
+            Log.i(TAG, "mic_test 结果：$verdict")
+            screen.setHint("自检：$verdict")
+        }
+    }
+
+    /**
+     * 扬声器 → 麦克风 **回环自检**。
+     *
+     * ## 解决什么问题
+     *
+     * [runMicTest] 只能证明"能读到数据"。但实测稳态 rms 只有 6~12，
+     * 而峰值出现在开录的头 0.5 秒（7056）—— 这有两种完全不同的解释：
+     *
+     *   a) 房间真的安静，那点峰值是麦克风上电的爆音；
+     *   b) 平台的 NS（Noise Suppression）把一切非人声都压掉了。
+     *
+     * 两者对产品的影响天差地别：a 正常，b 意味着老人说话也可能被压没。
+     * 光看数字分不出来，**必须制造一个已知的声音**去听。
+     *
+     * ## 怎么造声音
+     *
+     * 用设备自己的扬声器放 1kHz 正弦（幅度 8000 ≈ -12dBFS），
+     * 同时用麦克风录。音箱的喇叭和麦克风在同一个腔体里，
+     * 耦合足够强，一定能收到。
+     *
+     * ⚠️ 这次**刻意不挂平台效果**（`enablePlatformEffects = false`）：
+     *    平台 AEC 的参考信号正是我们正在播的内容，它会把这段声音
+     *    当成回声消掉 —— 挂着 AEC 测回环，等于自己把答案抹掉。
+     *
+     * ## 怎么读结果
+     *
+     * ```
+     * 静默段 rms ≈ 10   放音段 rms ≈ 几百~几千   → 通路完好
+     * 静默段 rms ≈ 10   放音段 rms ≈ 10          → 麦克风通路有问题
+     * ```
+     *
+     * ⚠️ 第一版这里踩了个坑：静默段算的是"开录后第 0~1 秒"的峰值，
+     *    而麦克风上电时有一声爆音（实测 rms 5542），于是基线被抬到天上，
+     *    放音段的 1159 反而被判成"收不到"。现在分成三段，
+     *    **前 600ms 直接丢弃**（上电瞬态），再取基线。
+     *
+     * 用法：`adb shell am broadcast -a com.elder.lx04.DEBUG --es cmd tone_test`
+     */
+    /**
+     * 音轨 A/B 诊断 —— 把 `speaker_test` **完全相同**的 440Hz 正弦，
+     * 切成 60ms 帧送进 [player] 的队列，走与服务端 TTS **一模一样**的路径
+     * （同一个 AudioTrack / 同一套增益 / 同一个 playLoop）。
+     *
+     * 现场判据（这一条能排除所有混淆变量）：
+     *   · 很吵  ⇒ AudioPlayer 的音轨没问题，TTS 轻是 **PCM 内容**问题
+     *   · 很轻  ⇒ **音轨**问题（音量/路由/状态），与音频数据无关
+     *
+     * 之所以必须做：ALSA 下行回采、PCM 电平、audio_flinger 写入量、
+     * tinymix 功放增益、AudioFocus 全都测过且「看起来正常」，但用户听到
+     * 的是「一个很吵、一个贴耳朵才一点点」—— 数字域判据不等于扬声器输出。
+     */
+    private fun runPlayerTone() {
+        if (sending) {
+            Log.w(TAG, "player_tone 忽略 —— 正在对话中")
+            return
+        }
+        screen.setHint("音轨 A/B：同一段正弦走 TTS 播放路径…")
+        val tone = buildTone(SAMPLE_RATE_OUT, ms = 3_000, freqHz = 440.0, amp = 10_000)
+        scope.launch {
+            withContext(Dispatchers.IO) {
+                var off = 0
+                while (off < tone.size) {
+                    val n = minOf(1_440, tone.size - off)
+                    player.enqueue(tone.copyOfRange(off, off + n))
+                    off += n
+                    Thread.sleep(60)   // 模拟服务端 60ms/帧的下发节奏
+                }
+            }
+            Log.i(TAG, "player_tone：已送入 ${tone.size / 1_440} 帧")
+            screen.setHint("音轨 A/B 完成（3 秒 440Hz 走播放器队列）")
+        }
+    }
+
+    /**
+     * 扬声器自检 —— **不依赖网络、不依赖麦克风**，播 3 秒 440Hz 正弦。
+     *
+     * 与 `tone_test` 的区别很重要：tone_test 是回环自检，靠麦克风听扬声器，
+     * 而 LX04 的 HAL 在录音路径上做回声消除，**设备扬声器的声音麦克风采不到**
+     * ⇒ 那个自检必然报「通路有问题」，不能用来判断扬声器有没有出声。
+     *
+     * 这条命令只做一件事：用与 TTS 完全相同配置的 AudioTrack
+     * （STREAM_MUSIC / 24kHz / mono / PCM16）写一段已知非静音的 PCM。
+     * 现场判据：
+     *   · 能听到「嘀——」 ⇒ 扬声器/音量/路由都正常，问题在下行数据或播放时序
+     *   · 听不到         ⇒ 输出侧（HAL、音量策略、被别的 app 抢占）有问题
+     */
+    private fun runSpeakerTest() {
+        if (sending) {
+            Log.w(TAG, "speaker_test 忽略 —— 正在对话中")
+            return
+        }
+        screen.setHint("扬声器自检：播放 3 秒 440Hz…")
+        val tone = buildTone(SAMPLE_RATE_OUT, ms = 3_000, freqHz = 440.0, amp = 10_000)
+        val track = createTrack(SAMPLE_RATE_OUT)
+        if (track == null) {
+            Log.e(TAG, "speaker_test：AudioTrack 打不开")
+            screen.setHint("扬声器自检失败：AudioTrack 打不开")
+            return
+        }
+        scope.launch {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    track.play()
+                    val written = track.write(tone, 0, tone.size)
+                    Log.i(TAG, "speaker_test：写入 $written / ${tone.size} 采样")
+                    // MODE_STREAM 的 write 是阻塞的，返回时只剩尾缓冲没放完
+                    Thread.sleep(400)
+                }.onFailure {
+                    Log.e(TAG, "speaker_test 播放异常: ${it.javaClass.name}: ${it.message}")
+                }
+            }
+            runCatching { track.stop() }
+            runCatching { track.release() }
+            Log.i(TAG, "speaker_test：播放结束")
+            screen.setHint("扬声器自检完成（3 秒 440Hz）")
+        }
+    }
+
+    private fun runToneTest() {
+        if (sending) {
+            Log.w(TAG, "tone_test 忽略 —— 正在对话中")
+            return
+        }
+        screen.setHint("回环自检：上电 0.6s → 静音 0.6s → 放音 1.5s…")
+
+        // ⚠️ 不能用 `@Volatile var`：Kotlin 的 @Volatile 只作用于属性（有 backing
+        //    field 的），局部变量上写它会直接编译报错。这里跨线程读，用原子量。
+        val phase = java.util.concurrent.atomic.AtomicInteger(PHASE_WARMUP)
+        var peakQuiet = 0f
+        var peakTone = 0f
+        var framesQuiet = 0
+        var framesTone = 0
+
+        val cap = AudioCapture(
+            onFrame = { _, info ->
+                when (phase.get()) {
+                    PHASE_QUIET -> {
+                        framesQuiet++
+                        if (info.rms > peakQuiet) peakQuiet = info.rms
+                    }
+                    PHASE_TONE -> {
+                        framesTone++
+                        if (info.rms > peakTone) peakTone = info.rms
+                    }
+                    // PHASE_WARMUP：上电瞬态，**不计入任何统计**
+                }
+            },
+            enablePlatformEffects = false
+        )
+
+        if (!cap.start()) {
+            screen.setHint("回环自检失败：麦克风打不开")
+            return
+        }
+
+        scope.launch {
+            // ---- 1. 上电瞬态，丢弃 ----
+            delay(WARMUP_MS)
+            phase.set(PHASE_QUIET)
+
+            // ---- 2. 静音基线 ----
+            delay(QUIET_MS)
+            val baseline = peakQuiet
+            phase.set(PHASE_TONE)
+
+            // ---- 3. 放 1.5 秒 1kHz 正弦，同时录 ----
+            val tone = buildTone(SAMPLE_RATE_OUT, ms = TONE_MS, freqHz = 1000.0, amp = 8000)
+            val track = createTrack(SAMPLE_RATE_OUT)
+            if (track == null) {
+                cap.stop()
+                screen.setHint("回环自检失败：AudioTrack 打不开")
+                return@launch
+            }
+
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    track.play()
+                    track.write(tone, 0, tone.size)
+                    // 等缓冲放完，否则立刻 release 会截断
+                    Thread.sleep(300)
+                }
+            }
+            phase.set(PHASE_DONE)
+            runCatching { track.stop() }
+            runCatching { track.release() }
+
+            delay(300)
+            cap.stop()
+
+            val verdict = when {
+                framesQuiet == 0 || framesTone == 0 ->
+                    "没读到帧（静音段 $framesQuiet / 放音段 $framesTone）"
+                peakTone < baseline * 3 ->
+                    "麦克风收不到扬声器 —— 通路有问题（静默峰值 ${f(baseline)}，" +
+                        "放音峰值 ${f(peakTone)}）"
+                else -> "通路完好：静默峰值 ${f(baseline)} → 放音峰值 ${f(peakTone)}" +
+                    "（提升 ${"%.0f".format(peakTone / maxOf(baseline, 1f))} 倍）"
+            }
+            Log.i(TAG, "tone_test 结果：$verdict")
+            screen.setHint("回环：$verdict")
+        }
+    }
+
+    /** 生成一段正弦 PCM16。 */
+    private fun buildTone(sampleRate: Int, ms: Int, freqHz: Double, amp: Int): ShortArray {
+        val n = sampleRate * ms / 1000
+        val out = ShortArray(n)
+        val w = 2.0 * Math.PI * freqHz / sampleRate
+        for (i in 0 until n) {
+            out[i] = (Math.sin(w * i) * amp).toInt().toShort()
+        }
+        return out
+    }
+
+    /** 建一个 24kHz 单声道流式 AudioTrack（与 TTS 播放同参数）。 */
+    private fun createTrack(sampleRate: Int): android.media.AudioTrack? {
+        val minBuf = android.media.AudioTrack.getMinBufferSize(
+            sampleRate,
+            android.media.AudioFormat.CHANNEL_OUT_MONO,
+            android.media.AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (minBuf <= 0) return null
+        val t = runCatching {
+            @Suppress("DEPRECATION")
+            android.media.AudioTrack(
+                android.media.AudioManager.STREAM_MUSIC,
+                sampleRate,
+                android.media.AudioFormat.CHANNEL_OUT_MONO,
+                android.media.AudioFormat.ENCODING_PCM_16BIT,
+                maxOf(minBuf, sampleRate), // 1 秒缓冲，够放 1.5 秒的余量
+                android.media.AudioTrack.MODE_STREAM
+            )
+        }.getOrNull()
+        return t?.takeIf { it.state == android.media.AudioTrack.STATE_INITIALIZED }
+    }
+
+    private fun f(v: Float): String = "%.0f".format(v)
+
+    // ------------------------------------------------------------------ 调试入口
+
+    private val debugReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (!DebugBridge.enabled(this@MainActivity)) {
+                Log.w(TAG, "调试命令被忽略 —— 先执行 settings put global elder_debug 1")
+                return
+            }
+            val cmd = intent.getStringExtra("cmd").orEmpty()
+            Log.i(TAG, "调试命令: $cmd")
+            handleDebugCommand(cmd)
+        }
+    }
+
+    private fun handleDebugCommand(cmd: String) {
+        when (cmd) {
+            "talk" -> beginListening()
+            "stop_talk" -> if (inConversation) endConversation() else endListening()
+            "end_conversation" -> endConversation()
+            // 不走麦克风（自动化验收用）：模拟一次唤醒检出，直接进入对话态。
+            // 真机判据：触发后服务端应出现 listen start + 唤醒应答，
+            // 播报完设备仍持续推流、录音轨数量不变（零 HAL 切换）。
+            "conv_start" -> startConversation("你好小智")
+            "mic_test" -> runMicTest()
+            "link_test" -> runLinkTest()
+            "enc_probe" -> runEncProbe()
+            "mic_matrix" -> runMicMatrix()
+            "inject" -> runInject()
+            "tone_test" -> runToneTest()
+            "speaker_test" -> runSpeakerTest()
+            "player_tone" -> runPlayerTone()
+            "opus_selftest" -> runOpusSelfTest()
+
+            // 提醒相关的调试命令现在**只能通过运行时**触发：
+            // 旧路径（自己造一个"待确认"、自己闪灯）会绕过引擎，
+            // 造出"设备显示已确认、服务端没有记录"的假状态 ——
+            // 那正是这次要消灭的东西。
+            "med_pending", "med_done", "clear", "escalate" -> {
+                screen.setHint("该命令已废弃：提醒由服务端下发，请用 sync_now 拉取")
+                Log.w(TAG, "调试命令 $cmd 已废弃：提醒状态只由引擎驱动，不许本地伪造")
+            }
+            "sync_now" -> runtime.requestSyncNow()
+            "dump_start" -> {
+                val f = java.io.File(getExternalFilesDir(null), "downlink.bin")
+                runCatching { f.writeBytes(ByteArray(0)) }
+                voice?.dumpFile = f
+                screen.setHint("落盘已开：${f.absolutePath}")
+                Log.i(TAG, "dump_start: ${f.absolutePath}")
+            }
+            "dump_stop" -> {
+                voice?.dumpFile = null
+                val f = java.io.File(getExternalFilesDir(null), "downlink.bin")
+                screen.setHint("落盘已停：${if (f.exists()) f.length() else 0} 字节")
+                Log.i(TAG, "dump_stop: ${if (f.exists()) f.length() else 0} 字节")
+            }
+            "wake_start" -> {
+                screen.setHint(if (wakeEngine.resume()) "唤醒已启动" else "唤醒未就绪：${wakeEngine.lastError}")
+            }
+            "wake_stop" -> {
+                wakeEngine.pause()
+                screen.setHint("唤醒已暂停（可用 wake_start 恢复）")
+            }
+            "wake_start" -> {
+                screen.setHint(if (wakeEngine.resume()) "唤醒已启动" else "唤醒未就绪：${wakeEngine.lastError}")
+            }
+            "wake_stop" -> {
+                wakeEngine.pause()
+                screen.setHint("唤醒已暂停（可用 wake_start 恢复）")
+            }
+
+            "press" -> {
+                ledEngine.buttonPending(true)
+                ledEngine.buttonPress()
+            }
+            "confirmed" -> {
+                ledEngine.buttonPending(true)
+                ledEngine.buttonConfirmed()
+            }
+            "fail" -> {
+                val t = SystemClock.elapsedRealtime()
+                ledEngine.buttonPending(true)
+                ledEngine.buttonPress(t)
+                ledEngine.buttonRelease(t + 1500L)
+            }
+            "ack" -> ledEngine.buttonAcknowledged()
+
+            "nag_start" -> ledEngine.nagStart()
+            "nag_stop" -> ledEngine.nagStop()
+            "status_off" -> ledEngine.setStatusLight(false)
+            "status_on" -> ledEngine.setStatusLight(true)
+
+            "idle" -> setUiState("idle")
+            "listening" -> setUiState("listening")
+            "speaking" -> setUiState("speaking")
+            "happy" -> screen.setEmoji("happy")
+            "sad" -> screen.setEmoji("sad")
+            "angry" -> screen.setEmoji("angry")
+
+            "reconnect" -> startConnect()
+
+            else -> Log.w(TAG, "未知调试命令: $cmd")
+        }
+    }
+
+    // ------------------------------------------------------------------ 生命周期
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) hideSystemUi()
+    }
+
+    private fun hideSystemUi() {
+        @Suppress("DEPRECATION")
+        window.decorView.systemUiVisibility = (
+            View.SYSTEM_UI_FLAG_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            )
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        runCatching { unregisterReceiver(debugReceiver) }
+        runCatching { unregisterReceiver(batteryReceiver) }
+        capture?.stop()
+        player.stop()
+        opus.release()
+        runCatching { runtime.stop() }
+        runCatching { tones.release() }
+        runCatching { wakeEngine.release() }
+        voice?.disconnect()
+        scope.cancel()
+    }
+
+    companion object {
+        private const val TAG = "ElderLX04"
+        private const val REQ_MIC = 1001
+
+        /**
+         * 麦克风参数矩阵 —— (音频源 × 采样率 × 通道数) 全扫一遍。
+         *
+         * 见 [runMicMatrix] 的说明：ALSA 层是好的（tinycap 直连有信号），
+         * 坏的是 AudioFlinger 打开设备后的启动过程。
+         */
+        private val MIC_CASES = listOf(
+            MicCase("VOICE_RECOGNITION 16000 2ch", MediaRecorder.AudioSource.VOICE_RECOGNITION, 16000, 2),
+            MicCase("VOICE_RECOGNITION 16000 1ch", MediaRecorder.AudioSource.VOICE_RECOGNITION, 16000, 1),
+            MicCase("VOICE_RECOGNITION 48000 2ch", MediaRecorder.AudioSource.VOICE_RECOGNITION, 48000, 2),
+            MicCase("VOICE_RECOGNITION 48000 1ch", MediaRecorder.AudioSource.VOICE_RECOGNITION, 48000, 1),
+            MicCase("MIC 16000 1ch", MediaRecorder.AudioSource.MIC, 16000, 1),
+            MicCase("MIC 16000 2ch", MediaRecorder.AudioSource.MIC, 16000, 2),
+            MicCase("MIC 48000 2ch", MediaRecorder.AudioSource.MIC, 48000, 2),
+            MicCase("DEFAULT 48000 2ch", MediaRecorder.AudioSource.DEFAULT, 48000, 2),
+            MicCase("VOICE_COMMUNICATION 16000 1ch", MediaRecorder.AudioSource.VOICE_COMMUNICATION, 16000, 1),
+            MicCase("CAMCORDER 48000 2ch", MediaRecorder.AudioSource.CAMCORDER, 48000, 2),
+        )
+
+        /** 服务端根地址（生产环境，IP 直连）。 */
+        const val SERVER_BASE_URL = "https://152.136.230.132"
+
+        /**
+         * 静音多久算"说完了"。
+         *
+         * 1.2 秒是权衡：太短会把老人换气的停顿当成说完了（一句话被切成两半，
+         * ASR 两半都识别不出来）；太长则每轮都要多等一截，交互变迟钝。
+         */
+        const val SILENCE_STOP_MS = 1200L
+
+        /**
+         * 对话态最长持续时间（本地兜底）。
+         *
+         * 服务端 `VOICE_IDLE_STANDBY_SEC=120` 空闲会主动 standby；这里留 60s
+         * 余量，覆盖「standby 的 3s 设备调用超时 / 网络抖动」而设备收不到
+         * 的情况。到期一律交还麦克风，绝不永久占麦。
+         */
+        const val CONVERSATION_MAX_MS = 180_000L
+
+
+        /**
+         * 下行播放采样率（自检用）。
+         *
+         * 正常对话里这个值由服务端 hello 下发（`opus.init(sampleRate)`），
+         * 不能写死；这里只是回环自检没有服务端可问，用一个与 TTS 同参数的默认值。
+         */
+        private const val SAMPLE_RATE_OUT = 24_000
+
+        /** 回环自检的三段时间。 */
+        private const val WARMUP_MS = 600L
+        private const val QUIET_MS = 600L
+        private const val TONE_MS = 1_500
+
+        /** 回环自检的阶段标记。 */
+        private const val PHASE_WARMUP = 0
+        private const val PHASE_QUIET = 1
+        private const val PHASE_TONE = 2
+        private const val PHASE_DONE = 3
+    }
+}

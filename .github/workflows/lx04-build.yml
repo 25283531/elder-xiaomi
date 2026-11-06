@@ -1,0 +1,250 @@
+name: lx04-build
+
+# LX04 设备端 APK（小米小爱触屏音箱客户端）。
+#
+# 与 android-build.yml 的关系：两个**独立**的应用，不共享产物。
+#   · android-build.yml → 家属端手机 App（uni-app H5 + WebView 壳）
+#   · lx04-build.yml    → 音箱端设备 App（纯原生：AudioRecord / 按键 / 自绘色带）
+#
+# 触发：改动 lx04/ 时自动跑，也可手动 / 发 Release 时跑。
+on:
+  push:
+    paths:
+      - 'lx04/**'
+      - 'docs/lx04/**'
+      - 'tools/smoke_lx04_facts.py'
+      - 'tools/kcompile.py'
+      - 'tools/ktest.py'
+      - 'tools/ktlint_struct.py'
+      - 'tools/fetch_kws_assets.py'
+      - 'tools/smoke_lx04_wake.py'
+      - 'lx04/app/src/main/java/com/elder/lx04/wake/**'
+      - 'lx04/app/src/main/java/com/k2fsa/**'
+      - 'tools/androidstub/**'
+      - '.github/workflows/lx04-build.yml'
+  pull_request:
+    paths:
+      - 'lx04/**'
+      - 'docs/lx04/**'
+      - 'tools/smoke_lx04_facts.py'
+      - 'tools/kcompile.py'
+      - 'tools/ktest.py'
+      - 'tools/ktlint_struct.py'
+      - 'tools/fetch_kws_assets.py'
+      - 'tools/smoke_lx04_wake.py'
+      - 'lx04/app/src/main/java/com/elder/lx04/wake/**'
+      - 'lx04/app/src/main/java/com/k2fsa/**'
+      - 'tools/androidstub/**'
+      - '.github/workflows/lx04-build.yml'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version_name:
+        # ⚠️ **刻意不给 default**。
+        #   workflow_dispatch 的 input 一旦带 default，dispatch 时即使人不填也会
+        #   拿到那个值 —— 于是 `inputs.default` 本身就是**版本号的第二份真源**，
+        #   且会在无人察觉的情况下把 gradle 里的真值盖掉。
+        #   留空 = 沿用 lx04/app/build.gradle.kts 里的唯一真源。
+        description: 版本名（留空则用 build.gradle.kts 里的值：0.1.0）
+        type: string
+        required: false
+      version_code:
+        description: 版本号（留空则用 build.gradle.kts 里的值：1）
+        type: string
+        required: false
+
+jobs:
+  apk:
+    name: 构建 LX04 APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 设置 Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 校验图标
+        # 图标已由 lx04/scripts/gen_icons.py 生成并入库，这里只做存在性校验。
+        #
+        # 之前这段是「在 CI 里现写现跑」的 heredoc，结果 YAML 的 `run: |`
+        # 给结束标记 `PY` 加上了缩进，bash 匹配不到 → `syntax error:
+        # unexpected end of file`，整个 job 在第 5 步就挂了（run 41804175633）。
+        # 生成逻辑挪进脚本后，同一份图标本地与 CI 完全一致，也不会再被缩进坑到。
+        #
+        # 重新生成：python3 lx04/scripts/gen_icons.py
+        run: |
+          set -e
+          missing=0
+          for d in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+            f="lx04/app/src/main/res/mipmap-$d/ic_launcher.png"
+            if [ ! -f "$f" ]; then
+              echo "缺图标: $f"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "!!! 图标缺失 —— 跑 python3 lx04/scripts/gen_icons.py 重新生成"
+            exit 1
+          fi
+          echo "图标齐全：5 个密度档位"
+
+      - name: 校验实机结论一致（防回归）
+        # 2026-11-04 实机推翻了调研里的屏幕方向 / 色带像素 / 中间键 KeyCode，
+        # 但当时结论只写进文档，代码、README、方案文档各留了一份旧数字。
+        # 判据在 tools/smoke_lx04_facts.py —— **必须真的执行**：
+        # 断言写了不跑 = 没有门禁，本仓 2026-10-30 真实踩过（CI 一路绿灯）。
+        run: python3 tools/smoke_lx04_facts.py
+
+      - name: 校验 Kotlin 结构（层次）
+        # 本机没有 Android SDK、编译不了 Kotlin，而 CI 跑一轮要 1.5 分钟。
+        # 2026-11-05 连续三次推送被 CI 编译打回，其中一次是「多留了一个
+        # 右花括号，把 companion object 挤出了类体」——
+        # **括号总数是配平的**，所以"数括号"这种检查根本抓不住。
+        # 这个脚本按大括号**深度**判断顶层声明是否真的落在类体里。
+        run: python3 tools/ktlint_struct.py
+
+      - name: 本地单测（不需要 Android SDK）
+        # 同上：gradle 那轮 1.5 分钟，单测失败时最费时间的是"改完再等一次 CI"。
+        # 这层用 kotlin-compiler + JUnit 本地跑，10 秒出结果。
+        run: python3 tools/ktest.py
+
+      - name: 本地编译检查（不需要 Android SDK）
+        # ⚠️ 这一步的价值：静态门禁绿 ≠ 编译得过。
+        # 2026-11-05 连续三次推送被下面的 gradle 步骤打回，三次都是纯
+        # Kotlin 语义错误（Thread.join 返回 void / synchronized 块的返回
+        # 结构 / 多一个右花括号），而当时的静态门禁全绿。
+        #
+        # 这层用 kotlin-compiler 1.9.24 + tools/androidstub 下的最小
+        # Android stub 做**类型检查**，比等 gradle 快得多，而且错误信息
+        # 直指源码行。它不能替代 gradle（不打 APK），所以两个都跑。
+        run: python3 tools/kcompile.py
+
+      - name: 校验离线唤醒词接线（防假绿）
+        # 唤醒链路有四个编译期看不出来的失败点：so/模型缺失、Kotlin API 与
+        # so 版本错开、keywords 用了官方默认、检出后没释放麦克风。
+        # kcompile/ktest/ktlint 全绿也拦不住，必须跑这份判据。
+        run: python3 tools/smoke_lx04_wake.py
+
+      - name: 跑单元测试
+        working-directory: lx04
+        # ⚠️ 灯效与按键的时序逻辑是移植里最容易出错的部分 ——
+        # 固件上这些判定被反复修过四轮（10-20 / 10-28 / 11-03 / 11-04），
+        # 每次都是踩坑改出来的。测试锁住它们，移植才不会把语义改漂。
+        run: |
+          # gradlew 是在 Windows 上入的库，git 曾把可执行位记成 644，
+          # 导致 CI 里 `./gradlew` 直接 exit 126 (Permission denied)。
+          # 已在仓库里改成 100755，这里再兜一次底，换环境也不会再挂。
+          chmod +x gradlew
+          ./gradlew --no-daemon testReleaseUnitTest
+
+      - name: 准备离线唤醒词资源（so + 中文 KWS 模型）
+        # ⚠️ 必须在 assembleRelease 之前：这两个 .so 和 assets 是**运行时**
+        #    资源，编译期完全不检查。漏了会产出一个"能装、能连、就是唤不醒"
+        #    的 APK，而 CI 全绿。
+        # 版本与 app/src/main/java/com/k2fsa/sherpa/onnx/ 的 Kotlin API 锁定
+        # 同为 1.12.22，见 tools/fetch_kws_assets.py 的说明。
+        run: |
+          set -e
+          python3 tools/fetch_kws_assets.py
+          python3 tools/smoke_lx04_wake.py --check-assets
+
+      - name: 准备签名密钥
+        # 设备端 APK **必须签名**才能 adb install（未签名 = INSTALL_PARSE_FAILED_NO_CERTIFICATES）。
+        # 密钥不进仓库：配了 LX04_KEYSTORE_BASE64 就解出来用，
+        # 没配就退回 debug 签名 —— APK 能装、能验证功能，
+        # 代价是换构建机签名就变，升级前得先卸载。
+        env:
+          KS_B64: ${{ secrets.LX04_KEYSTORE_BASE64 }}
+        run: |
+          set -e
+          if [ -n "$KS_B64" ]; then
+            printf '%s' "$KS_B64" | base64 -d > "$RUNNER_TEMP/lx04.jks"
+            echo "使用仓库密钥签名（$(stat -c%s "$RUNNER_TEMP/lx04.jks") 字节）"
+          else
+            echo "::warning::未配置 LX04_KEYSTORE_BASE64，退回 debug 签名 —— APK 可安装，但换构建机后升级需先卸载"
+          fi
+
+      - name: 构建 APK
+        working-directory: lx04
+        env:
+          VERSION_NAME: ${{ inputs.version_name }}
+          VERSION_CODE: ${{ inputs.version_code }}
+          KS_FILE: ${{ runner.temp }}/lx04.jks
+          KS_PASS: ${{ secrets.LX04_STORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.LX04_KEY_ALIAS }}
+          KS_KEYPASS: ${{ secrets.LX04_KEY_PASSWORD }}
+        run: |
+          set -e
+          # ⚠️ 只在密钥文件真的存在时才传 -P，否则 build.gradle.kts 会去
+          #    创建一个 storeFile 为空的 signingConfig，AGP 直接报错。
+          SIGN_ARGS=""
+          if [ -f "$KS_FILE" ]; then
+            SIGN_ARGS="-PLX04_STORE_FILE=$KS_FILE -PLX04_STORE_PASSWORD=$KS_PASS"
+            SIGN_ARGS="$SIGN_ARGS -PLX04_KEY_ALIAS=${KS_ALIAS:-lx04} -PLX04_KEY_PASSWORD=$KS_KEYPASS"
+          fi
+          ./gradlew --no-daemon assembleRelease $SIGN_ARGS
+          ls -lh app/build/outputs/apk/release/
+
+      - name: 校验产物
+        run: |
+          # ⚠️ 必须开 pipefail：下面几处都要 `... | head`，
+          #    默认的管道退出码是最后一个命令的（head 永远 0），
+          #    于是校验命令本身失败也会被判成成功 —— 这就是"假绿灯"。
+          set -eo pipefail
+
+          # 用通配而不是写死文件名：签名配置不同，产物名会在
+          # app-release.apk / app-release-unsigned.apk 之间变。
+          APK=$(ls lx04/app/build/outputs/apk/release/*.apk | head -1)
+          echo "产物: $APK"
+          test -f "$APK"
+
+          # ⚠️ build-tools 目录可能有多个版本（34/35/...），
+          #    `"$ANDROID_HOME"/build-tools/*/apksigner` 会被展开成多个路径，
+          #    结果第一个路径被当命令、第二个被当参数 —— apksigner 报
+          #    "Unsupported command: .../apksigner"，校验形同虚设。
+          #    这里显式选版本号最高的那个。
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)
+          echo "build-tools: $BT"
+
+          # ⚠️ 必须验签：未签名的包在 CI 里"构建成功"，装到音箱上却直接失败。
+          #    这一步就是拦这种"绿灯但没用"的产物。
+          echo "--- 签名 ---"
+          "${BT}apksigner" verify --print-certs "$APK" | head -5
+
+          # ⚠️ 必须校验 ABI：LX04 是 32 位 armeabi-v7a 用户空间，
+          # 混入 arm64 的 .so 会在设备上加载失败（UnsatisfiedLinkError）。
+          echo "--- 产物里的 so 架构 ---"
+          unzip -l "$APK" | grep -E "\.so$" || echo "(本次无 so)"
+
+          # ⚠️ 唤醒资源是运行时的，编译期不检查 —— 必须在产物里亲眼看到。
+          #    漏了 .so：真机加载抛 UnsatisfiedLinkError；
+          #    漏了 keywords.txt：引擎正常加载但永远唤不醒。
+          echo "--- 唤醒资源 ---"
+          unzip -l "$APK" | grep -F "lib/armeabi-v7a/libsherpa-onnx-jni.so" \
+            || { echo "缺少唤醒 .so"; exit 1; }
+          unzip -l "$APK" | grep -E "assets/kws/.*/keywords\.txt" \
+            || { echo "缺少自定义 keywords.txt"; exit 1; }
+          if unzip -l "$APK" | grep -qE "lib/arm64"; then
+            echo "!!! 产物里混进了 arm64 —— LX04 是 32 位，会加载失败"
+            exit 1
+          fi
+
+          # 开机直达依赖 HOME intent-filter，缺了等于功能没做
+          echo "--- manifest 里的 HOME 声明 ---"
+          "${BT}aapt2" dump xmltree "$APK" --file AndroidManifest.xml \
+            | grep -iE "category|HOME" | head -20
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: elder-lx04-apk
+          path: lx04/app/build/outputs/apk/release/*.apk
+          retention-days: 30
